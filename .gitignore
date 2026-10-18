@@ -1,0 +1,26 @@
+# Build output (build.ps1 makes all of these)
+x64/
+**/x64/
+CT_MirrorsEdge/Cinematic Tools/
+dist/
+minhook/lib/range_*.txt
+minhook/build/VC15/lib/
+*.lib
+*.obj
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.exp
+*.tlog/
+
+# Visual Studio
+.vs/
+*.user
+*.aps
+*.VC.db
+*.VC.opendb
+
+# Python helpers
+__pycache__/
+*.pkl

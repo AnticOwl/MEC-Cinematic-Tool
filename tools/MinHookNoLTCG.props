@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Imported into MinHook's libMinHook.vcxproj by build.ps1.
+     MinHook compiles with /GL, and linking those objects into CT_MirrorsEdge.dll
+     hits an internal compiler error in hde64.c (MSVC 14.42). Plain objects avoid it. -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

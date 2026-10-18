@@ -183,8 +183,8 @@ when each streamer gets or loses the camera focus. If it doesn't help somewhere,
 still works (*Faith keeps control* lets you run with a track playing).
 
 Props popping in while flying are zones that only start loading once the camera gets near them.
-*Stream distance* (0 - 400 m, off by default) loads the city that far around the camera too: the
-tools add rings of foci about 200 m apart around it (up to 20), and each loads its zone and the
+*Stream distance* (0 - 600 m, off by default) loads the city that far around the camera too: the
+tools add rings of foci about 200 m apart around it (up to 39), and each loads its zone and the
 zones next to it. More distance means less pop-in around the camera, but more memory and loading.
 
 Each zone streamer only has room for 128 loaded zones, and the game breaks when it runs out (it

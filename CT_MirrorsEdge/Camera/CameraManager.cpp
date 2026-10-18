@@ -55,7 +55,7 @@ namespace
   const int MaxRingFoci = 40;             // enough for 600 m
   const int FocusTrackFirst = FocusRingFirst + MaxRingFoci;
   const float RingSpacing = 200.f;        // between the rings, and between the points on one
-  const float MaxStreamDistance = 400.f;  // more asks for more zones than the game handles
+  const float MaxStreamDistance = 600.f;  // the zone slot and mesh limits hold back what doesn't fit
   const float LookAheadSeconds = 2.5f;     // how far ahead the camera's movement is loaded
   const float LookAheadMaxDistance = 400.f;
 
@@ -1923,9 +1923,9 @@ void CameraManager::DrawUI()
           "camera is in and the zones next to it; with a distance, the zones out to that far are loaded "
           "too, so less pops in around the camera. Further means more memory and more loading, so keep "
           "it as low as works for the shot.\n\nThe game can only have 128 zones loaded per streamer and "
-          "breaks when it runs out, so the tools add zones slowly and stop well before that. With Fix LOD "
-          "on, every far model is loaded in full detail too, and a big distance can still be more than "
-          "the game copes with: keep it lower (or Fix LOD off) if the game crashes.");
+          "breaks when it runs out, so the tools add zones slowly and stop well before that. They also "
+          "hold zones back when the game's room for meshes fills up (Fix LOD on brings in more), so in a "
+          "busy area the full distance may not all load.");
         if (m_CameraEnabled && m_StreamAroundCamera)
         {
           float fill = m_InstanceFill;

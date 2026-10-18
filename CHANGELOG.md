@@ -7,7 +7,6 @@
   The tools now add the camera's extra zones one at a time and only while there's room: no more
   from 96 zone slots or 3300 meshes, and they take zones away again from 104 slots or 3500 meshes
   (all of the camera's extra zones from 3700).
-- Stream distance goes up to 400 m (was 600 m), with up to 20 rings of foci (was 40).
 - The Camera tab shows *Meshes loaded: N of 4096* and *Zones loaded: N of 128*, in yellow while
   the camera's extra zones are held back.
 - Crash notes in `CT.log` include the zone slots and meshes in use.

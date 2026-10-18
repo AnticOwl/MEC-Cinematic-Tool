@@ -221,6 +221,44 @@ bool ImGui::ConfirmButton(const char* label, const ImVec2& size)
   return false;
 }
 
+bool ImGui::MoveArrowButton(const char* str_id, ImGuiDir dir, bool enabled)
+{
+  ImGuiWindow* window = GetCurrentWindow();
+  if (window->SkipItems)
+    return false;
+
+  ImGuiContext& g = *GImGui;
+  const ImGuiID id = window->GetID(str_id);
+  float size = GetFrameHeight();
+  const ImRect bb(window->DC.CursorPos, window->DC.CursorPos + ImVec2(size, size));
+  ItemSize(bb);
+  if (!ItemAdd(bb, id))
+    return false;
+
+  bool hovered = false, held = false, pressed = false;
+  if (enabled)
+    pressed = ButtonBehavior(bb, id, &hovered, &held);
+
+  // A bit smaller than the row so it doesn't fill it edge to edge
+  float inset = ImFloor(size * 0.12f);
+  ImVec2 frameMin = bb.Min + ImVec2(inset, inset), frameMax = bb.Max - ImVec2(inset, inset);
+  if (hovered)
+    RenderFrame(frameMin, frameMax, GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered), false, g.Style.FrameRounding);
+  else if (enabled)
+    RenderFrame(frameMin, frameMax, GetColorU32(ImGuiCol_Button, 0.5f), false, g.Style.FrameRounding);
+
+  // The same triangle ImGui draws, but centred in the square whatever the frame padding
+  float r = size * 0.22f;
+  if (dir == ImGuiDir_Up) r = -r;
+  ImVec2 center = bb.GetCenter();
+  center.y -= r * 0.25f;
+  ImU32 col = enabled ? GetColorU32(ImGuiCol_Text) : GetColorU32(ImGuiCol_TextDisabled, 0.35f);
+  window->DrawList->AddTriangleFilled(center + ImVec2(0.f, 1.f) * r, center + ImVec2(-0.866f, -0.5f) * r,
+    center + ImVec2(0.866f, -0.5f) * r, col);
+
+  return pressed;
+}
+
 void ImGui::SubHeading(const char* text)
 {
   Dummy(ImVec2(0, GetStyle().ItemSpacing.y * 0.5f));

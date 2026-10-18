@@ -24,3 +24,6 @@ minhook/build/VC15/lib/
 # Python helpers
 __pycache__/
 *.pkl
+
+# Private research notes, kept outside the repository
+MEC_Reverse_Notes.md

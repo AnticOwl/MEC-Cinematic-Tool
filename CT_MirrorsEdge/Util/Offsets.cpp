@@ -40,6 +40,8 @@ namespace
     // Not from the original tools: the static pointer MEC-TC (Mirror's Edge Catalyst
     // Time Changer) reads the time of day through, [[[p] + 0x8] + 0x28] + 0x30. No signature yet.
     { "OFFSET_TIMEOFDAY",           0x255C2F8 },
+    // Pointer to the mesh streaming manager
+    { "OFFSET_MESHSTREAMING",       0x2563410 },
     // Not from the original tools: the city's zone streamer
     { "OFFSET_ZONESTREAMERUPDATE",  0x3C81900 },
     { "OFFSET_ZONEFOCUSADD",        0x3C7E7C0 },

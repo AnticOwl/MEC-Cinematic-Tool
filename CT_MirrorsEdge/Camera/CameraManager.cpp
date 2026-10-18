@@ -55,7 +55,7 @@ namespace
   const int MaxRingFoci = 40;             // enough for 600 m
   const int FocusTrackFirst = FocusRingFirst + MaxRingFoci;
   const float RingSpacing = 200.f;        // between the rings, and between the points on one
-  const float MaxStreamDistance = 600.f;
+  const float MaxStreamDistance = 400.f;  // more asks for more zones than the game handles
   const float LookAheadSeconds = 2.5f;     // how far ahead the camera's movement is loaded
   const float LookAheadMaxDistance = 400.f;
 
@@ -113,9 +113,173 @@ namespace
   // wanted[]. Gives how many were in the list before and after. The game's
   // remove function writes out of bounds for a focus that isn't there, so
   // it's only called for ones found in the list.
-  void SyncStreamingFoci(__int64 pZoneStreamer, bool const wanted[], __int64 pAdd, __int64 pRemove, int& before, int& after)
+  // How full a streamer's zone slots are. Each ZoneStreamerEntity has 128
+  // slots for loaded zones (streamer + 0x2F8). The game's slot search
+  // (0x143C80180) doesn't handle running out: it writes past the table into
+  // other memory, which crashes the game sooner or later. The tools only add
+  // their foci while there's plenty of room, and take some away when it fills.
+  const int ZoneSlotsOffset = 0x2F8;
+  const int ZoneSlotCount = 128;
+  const int ZoneSlotsAddBelow = 96;     // add one more focus only below this many in use
+  const int ZoneSlotsRemoveAbove = 104; // take the least important ones away above this
+  // Zones only get their slots once they load, so the count runs behind what
+  // was asked for. A new focus is added only once the count has stood still
+  // this long, and never sooner than this after the last one.
+  const ULONGLONG ZoneSlotsSettleMs = 750;
+
+  // Per streamer: the slot count last seen, when it last changed, when a focus was last added
+  struct StreamerGate
   {
-    before = after = 0;
+    __int64 Streamer;
+    int LastUsed;
+    ULONGLONG LastChange;
+    ULONGLONG LastAdd;
+  };
+  StreamerGate g_Gates[8]{};
+  SRWLOCK g_GateLock = SRWLOCK_INIT;
+
+  // Settled and room for one more?
+  bool MayAddFocus(__int64 pZoneStreamer, int used)
+  {
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_GateLock);
+    StreamerGate* pGate = nullptr;
+    for (StreamerGate& gate : g_Gates)
+      if (gate.Streamer == pZoneStreamer) { pGate = &gate; break; }
+    if (!pGate)
+    {
+      // A new streamer (or one that came back after a level load) takes the oldest entry
+      pGate = &g_Gates[0];
+      for (StreamerGate& gate : g_Gates)
+        if (gate.LastChange < pGate->LastChange) pGate = &gate;
+      *pGate = { pZoneStreamer, used, now, 0 };
+    }
+    if (used != pGate->LastUsed)
+    {
+      pGate->LastUsed = used;
+      pGate->LastChange = now;
+    }
+    bool settled = now - pGate->LastChange >= ZoneSlotsSettleMs && now - pGate->LastAdd >= ZoneSlotsSettleMs;
+    bool allowed = settled && used < ZoneSlotsAddBelow;
+    if (allowed)
+      pGate->LastAdd = now;
+    ReleaseSRWLockExclusive(&g_GateLock);
+    return allowed;
+  }
+
+  // The mesh streaming manager keeps two lists of model instances (positioned
+  // and distanced) that background jobs read through pointers copied at the
+  // start of each job. The game sets aside room for them when a level loads
+  // (MeshStreamingSettings ReservedPositionedInstanceCount / ...Distanced...);
+  // when more instances register than that, a list is moved to new memory and
+  // a job still reading the old one crashes. Extra zones around the camera
+  // bring in a lot of instances, so the tools keep an eye on how full they are.
+  const int InstanceListsOffset = 0x350070;   // two vectors, 0x20 apart: begin, end, capacity, allocator
+  const int InstanceRecordSize = 0x20;
+  const int StreamingSettingsOffset = 0x386480; // MeshStreamingSettings*
+  const int ReservedCountOffset = 0x58;         // positioned at +0x58, distanced at +0x5C
+
+  // The mesh table: a vector at +0x50 (begin, end, capacity) with room for
+  // 4096 meshes of 0x350 bytes inside the manager (+0x70 up to the instance
+  // lists at +0x350070). Past 4096 it moves out to new memory, and the jobs
+  // reading the old place crash. That's the limit that matters: extra zones
+  // bring in a lot of different meshes.
+  const int MeshTableOffset = 0x50;
+  const int MeshTableInline = 0x70;
+  const int MeshRecordSize = 0x350;
+  const int MeshTableCapacity = 4096;
+  // One zone can bring in a few hundred meshes at once, so the limits leave
+  // that much room below 4096 (4000 still went over it)
+  const int MeshesStopAdding = 3300; // no more zones around the camera from here
+  const int MeshesTakeAway = 3500;   // two of the camera's extra zones go
+  const int MeshesTakeAll = 3700;    // all of them go, the camera's own too
+
+  struct InstanceLists
+  {
+    int Count[2];
+    int Capacity[2];
+    int Reserved[2];
+    __int64 Begin[2];
+    __int64 pSettings;
+    int Meshes;
+    bool MeshesInline; // still in the manager's own room for 4096
+  };
+
+  bool ReadInstanceLists(__int64 ppManager, InstanceLists& lists)
+  {
+    __try
+    {
+      __int64 pManager = ppManager ? *(__int64*)ppManager : 0;
+      if (!pManager) return false;
+      for (int k = 0; k < 2; ++k)
+      {
+        __int64* pVector = (__int64*)(pManager + InstanceListsOffset + k * 0x20);
+        __int64 begin = pVector[0], end = pVector[1], capacity = pVector[2];
+        // An empty list can have no memory at all
+        if (end < begin || capacity < end) return false;
+        lists.Begin[k] = begin;
+        lists.Count[k] = begin ? (int)((end - begin) / InstanceRecordSize) : 0;
+        lists.Capacity[k] = begin ? (int)((capacity - begin) / InstanceRecordSize) : 0;
+      }
+
+      __int64* pMeshes = (__int64*)(pManager + MeshTableOffset);
+      __int64 meshBegin = pMeshes[0], meshEnd = pMeshes[1];
+      if (meshEnd < meshBegin) return false;
+      lists.Meshes = meshBegin ? (int)((meshEnd - meshBegin) / MeshRecordSize) : 0;
+      lists.MeshesInline = meshBegin == pManager + MeshTableInline || !meshBegin;
+      lists.pSettings = *(__int64*)(pManager + StreamingSettingsOffset);
+      for (int k = 0; k < 2; ++k)
+        lists.Reserved[k] = lists.pSettings ? *(int*)(lists.pSettings + ReservedCountOffset + k * 4) : 0;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+
+  // Asks for room for this many when the next level loads
+  void RaiseInstanceReserve(__int64 pSettings, int k, int count)
+  {
+    __try
+    {
+      *(int*)(pSettings + ReservedCountOffset + k * 4) = count;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  int CountUsedZoneSlots(__int64 pZoneStreamer)
+  {
+    __int64* pSlots = (__int64*)(pZoneStreamer + ZoneSlotsOffset);
+    int used = 0;
+    for (int i = 0; i < ZoneSlotCount; ++i)
+      used += pSlots[i] ? 1 : 0;
+    return used;
+  }
+
+  // The order foci are added in, most important first: the camera, ahead of
+  // it, the track's points, then the rings from the inside out. They're taken
+  // away in the opposite order.
+  int FocusPriority(int rank)
+  {
+    if (rank < FocusRingFirst)
+      return rank;
+    int trackCount = MaxStreamingFoci - FocusTrackFirst;
+    if (rank < FocusRingFirst + trackCount)
+      return FocusTrackFirst + (rank - FocusRingFirst);
+    return FocusRingFirst + (rank - FocusRingFirst - trackCount);
+  }
+
+  // Adds and removes the tools' foci in one streamer's list to match
+  // wanted[], within the zone slot budget above. Gives how many were in the
+  // list before and after, and how many slots were in use. The game's remove
+  // function writes out of bounds for a focus that isn't there, so it's only
+  // called for ones found in the list.
+  void SyncStreamingFoci(__int64 pZoneStreamer, bool const wanted[], __int64 pAdd, __int64 pRemove,
+    int instancePressure, int& before, int& after, int& usedSlots, bool& limited)
+  {
+    before = after = usedSlots = 0;
+    limited = false;
     __try
     {
       __int64 pFocusList = pZoneStreamer + ZoneFocusListOffset;
@@ -131,20 +295,67 @@ namespace
         if (pFocus >= &g_Foci[0] && pFocus < &g_Foci[MaxStreamingFoci] && !(pRecords[i].Flags & ZoneFocusRemoved))
           present[pFocus - &g_Foci[0]] = true;
       }
-
-      // Removing first keeps the list from growing past what it needs
       for (int i = 0; i < MaxStreamingFoci; ++i)
-      {
         before += present[i] ? 1 : 0;
-        if (present[i] && !wanted[i])
-          ((tZoneFocusChange)pRemove)(pFocusList, 0, &g_Foci[i]);
-      }
+
+      usedSlots = CountUsedZoneSlots(pZoneStreamer);
+
+      // Foci that aren't wanted any more go straight away
       for (int i = 0; i < MaxStreamingFoci; ++i)
       {
-        if (wanted[i] && !present[i])
-          ((tZoneFocusChange)pAdd)(pFocusList, 0, &g_Foci[i]);
-        after += wanted[i] ? 1 : 0;
+        if (present[i] && !wanted[i])
+        {
+          ((tZoneFocusChange)pRemove)(pFocusList, 0, &g_Foci[i]);
+          present[i] = false;
+        }
       }
+
+      if (usedSlots > ZoneSlotsRemoveAbove || instancePressure >= 2)
+      {
+        // Too full: the two least important go (the camera's own only when the
+        // game is already out of room for meshes)
+        int removed = 0;
+        int lastRank = instancePressure >= 3 ? 0 : 1;
+        for (int rank = MaxStreamingFoci - 1; rank >= lastRank && removed < 2; --rank)
+        {
+          int i = FocusPriority(rank);
+          if (present[i])
+          {
+            ((tZoneFocusChange)pRemove)(pFocusList, 0, &g_Foci[i]);
+            present[i] = false;
+            removed++;
+          }
+        }
+        limited = true;
+      }
+      else
+      {
+        // One at a time, so the slots it fills show up before the next is added
+        for (int rank = 0; rank < MaxStreamingFoci; ++rank)
+        {
+          int i = FocusPriority(rank);
+          if (!wanted[i] || present[i])
+            continue;
+          // The camera's own focus goes in unless the game is out of room,
+          // the rest only with room, once the slots have caught up with the last one
+          if (i == FocusCamera && instancePressure >= 2)
+          {
+            limited = true;
+            break;
+          }
+          if (i != FocusCamera && (instancePressure >= 1 || !MayAddFocus(pZoneStreamer, usedSlots)))
+          {
+            limited = usedSlots >= ZoneSlotsAddBelow || instancePressure >= 1;
+            break;
+          }
+          ((tZoneFocusChange)pAdd)(pFocusList, 0, &g_Foci[i]);
+          present[i] = true;
+          break;
+        }
+      }
+
+      for (int i = 0; i < MaxStreamingFoci; ++i)
+        after += present[i] ? 1 : 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -184,6 +395,7 @@ CameraManager::CameraManager() :
   for (int i = 0; i < MaxStreamingFoci; ++i)
     g_Foci[i] = { g_FocusVTable, i };
 
+  m_ppMeshStreaming = util::offsets::GetOffset("OFFSET_MESHSTREAMING");
   m_pAddZoneFocus = util::offsets::GetOffset("OFFSET_ZONEFOCUSADD");
   m_pRemoveZoneFocus = util::offsets::GetOffset("OFFSET_ZONEFOCUSREMOVE");
 }
@@ -266,6 +478,7 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
     ApplyLodSettings();
   ApplyCulling();
   ApplyShadowDistance();
+  WatchInstanceLists();
 
   // A track stopped setting the time of day: the clock carries on from there
   if (m_TrackTimeOfDayApplied && !(m_CameraEnabled && m_TrackPlayer.IsPlaying() && m_TrackPlayer.IsTimeOfDayLocked()))
@@ -355,6 +568,12 @@ void CameraManager::PublishStreamingFocus(double dt)
   {
     float distance = m_StreamDistance > MaxStreamDistance ? MaxStreamDistance : m_StreamDistance;
     int rings = (int)ceilf(distance / RingSpacing);
+    // Centred on a point that moves in 100 m steps: rings that followed the
+    // camera exactly would load and unload zones at their edges all the time
+    XMFLOAT3 cameraPosition;
+    XMStoreFloat3(&cameraPosition, position);
+    XMVECTOR centre = XMVectorSet(floorf(cameraPosition.x / 100.f + 0.5f) * 100.f, cameraPosition.y,
+      floorf(cameraPosition.z / 100.f + 0.5f) * 100.f, 0);
     int slot = FocusRingFirst;
     for (int ring = 1; ring <= rings; ++ring)
     {
@@ -366,7 +585,7 @@ void CameraManager::PublishStreamingFocus(double dt)
       for (int k = 0; k < count; ++k)
       {
         float angle = XM_2PI * k / count + ring * 0.5f; // rings turned against each other
-        XMVECTOR point = position + XMVectorSet(cosf(angle) * radius, 0, sinf(angle) * radius, 0);
+        XMVECTOR point = centre + XMVectorSet(cosf(angle) * radius, 0, sinf(angle) * radius, 0);
         XMStoreFloat3((XMFLOAT3*)results[slot].Position, point);
         wanted[slot++] = true;
       }
@@ -408,12 +627,33 @@ void CameraManager::OnZoneStreamerUpdate(__int64 pZoneStreamer)
     ReleaseSRWLockShared(&g_FocusLock);
   }
 
-  int before = 0, after = 0;
-  SyncStreamingFoci(pZoneStreamer, wanted, m_pAddZoneFocus, m_pRemoveZoneFocus, before, after);
+  int before = 0, after = 0, usedSlots = 0;
+  bool limited = false;
+  SyncStreamingFoci(pZoneStreamer, wanted, m_pAddZoneFocus, m_pRemoveZoneFocus, m_InstancePressure,
+    before, after, usedSlots, limited);
   if (before == 0 && after > 0)
     util::log::Write("Zone streamer 0x%I64X now also loads the city around the camera", pZoneStreamer);
   else if (before > 0 && after == 0)
     util::log::Write("Zone streamer 0x%I64X is back to loading around Faith only", pZoneStreamer);
+
+  // For the menu: the fullest streamer over the last second, and when foci were held back
+  ULONGLONG now = GetTickCount64();
+  static ULONGLONG s_peakTick = 0;
+  if (now - s_peakTick > 1000)
+  {
+    s_peakTick = now;
+    m_StreamSlotsPeak = usedSlots;
+  }
+  else if (usedSlots > m_StreamSlotsPeak)
+    m_StreamSlotsPeak = usedSlots;
+  if (limited) m_StreamLimitedTick = now;
+  static ULONGLONG s_lastLimitLog = 0;
+  if (limited && GetTickCount64() - s_lastLimitLog > 30000)
+  {
+    s_lastLimitLog = GetTickCount64();
+    util::log::Write("Zone streamer 0x%I64X has %d of its 128 zone slots in use, the camera's extra zones are held back so it can't overflow",
+      pZoneStreamer, usedSlots);
+  }
 }
 
 
@@ -1330,6 +1570,79 @@ void CameraManager::DrawFollowUI()
     g_mainHandle->OnConfigChanged();
 }
 
+void CameraManager::WatchInstanceLists()
+{
+  InstanceLists lists{};
+  if (!ReadInstanceLists(m_ppMeshStreaming, lists))
+  {
+    m_InstancePressure = 0;
+    m_InstanceFill = -1.f;
+    return;
+  }
+
+  float fill = 0.f;
+  for (int k = 0; k < 2; ++k)
+  {
+    if (lists.Capacity[k] > 0)
+    {
+      float f = (float)lists.Count[k] / lists.Capacity[k];
+      if (f > fill) fill = f;
+    }
+
+    // The game had to move a list while it was in use: logged, since that's
+    // what crashes it. (It also moves them when a level loads, while empty.)
+    if (m_InstanceBegin[k] && lists.Begin[k] != m_InstanceBegin[k] && m_InstanceCount[k] > 0)
+      util::log::Warning("The game outgrew its %s model instance list (%d -> %d) while using it, it can crash after this",
+        k == 0 ? "positioned" : "distanced", m_InstanceCapacity[k], lists.Capacity[k]);
+    m_InstanceBegin[k] = lists.Begin[k];
+    m_InstanceCapacity[k] = lists.Capacity[k];
+    m_InstanceCount[k] = lists.Count[k];
+  }
+
+  // The instance lists by how full they are, the mesh table (what fills up
+  // first) by count, close to its 4096
+  int listPressure = fill >= 0.95f ? 3 : (fill >= 0.9f ? 2 : (fill >= 0.8f ? 1 : 0));
+  int meshPressure = (!lists.MeshesInline || lists.Meshes >= MeshesTakeAll) ? 3 :
+    (lists.Meshes >= MeshesTakeAway ? 2 : (lists.Meshes >= MeshesStopAdding ? 1 : 0));
+  float meshFill = (float)lists.Meshes / MeshTableCapacity;
+  if (meshFill > fill) fill = meshFill;
+  if (!lists.MeshesInline && m_MeshesInline)
+    util::log::Warning("The game has more than %d meshes loaded (%d) and had to move its mesh table, it can crash after this",
+      MeshTableCapacity, lists.Meshes);
+  m_MeshesInline = lists.MeshesInline;
+  m_MeshCount = lists.Meshes;
+  if (lists.Meshes > m_MeshPeak)
+    m_MeshPeak = lists.Meshes;
+
+  m_InstanceFill = fill;
+  // 1 hold back, 2 take two away, 3 at the edge of the room the game has:
+  // everything extra goes, the camera's own zones too
+  m_InstancePressure = meshPressure > listPressure ? meshPressure : listPressure;
+
+  // With the world loaded around the camera, ask for four times the game's
+  // room from the next level load on (each instance is 32 bytes, so even
+  // a lot of room is only a few MB)
+  if (m_StreamAroundCamera && lists.pSettings)
+  {
+    for (int k = 0; k < 2; ++k)
+    {
+      if (!m_InstanceReserveOriginal[k] && lists.Reserved[k] > 0)
+      {
+        m_InstanceReserveOriginal[k] = lists.Reserved[k];
+        util::log::Write("Model instance lists (%s): %d of %d in use, the game reserves %d per level",
+          k == 0 ? "positioned" : "distanced", lists.Count[k], lists.Capacity[k], lists.Reserved[k]);
+      }
+      int wanted = m_InstanceReserveOriginal[k] * 4;
+      if (m_InstanceReserveOriginal[k] > 0 && lists.Reserved[k] < wanted)
+      {
+        RaiseInstanceReserve(lists.pSettings, k, wanted);
+        util::log::Write("Asked the game for room for %d %s model instances from the next level load",
+          wanted, k == 0 ? "positioned" : "distanced");
+      }
+    }
+  }
+}
+
 void CameraManager::ApplyCulling()
 {
   __int64 pWorldRenderSettings = ReadPointer(m_ppWorldRenderSettings);
@@ -1432,11 +1745,12 @@ void CameraManager::ApplyMotionBlur()
 void CameraManager::DescribeState(char* buffer, size_t size)
 {
   // For the crash note: no lock, these are only read
-  sprintf_s(buffer, size, "camera %s, track %s, follow Faith %s, follow object %s 0x%I64X, world around camera %s, "
-    "Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, camera at %.1f %.1f %.1f",
+  sprintf_s(buffer, size, "camera %s, track %s, follow Faith %s, follow object %s 0x%I64X, world around camera %s "
+    "(distance %.0f, zone slots %d of 128, meshes %d of 4096, most %d), Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, "
+    "camera at %.1f %.1f %.1f",
     m_CameraEnabled ? "on" : "off", m_TrackPlayer.IsPlaying() ? "playing" : "stopped",
     m_AttachToFaith ? "on" : "off", m_AttachObject ? attach::ClassName(m_AttachTarget.Class) : "none", m_AttachObject ? m_AttachTarget.Entity : 0,
-    m_StreamAroundCamera ? "on" : "off", m_ThirdPersonApplied ? "switched" : "normal",
+    m_StreamAroundCamera ? "on" : "off", m_StreamDistance, (int)m_StreamSlotsPeak, (int)m_MeshCount, (int)m_MeshPeak, m_ThirdPersonApplied ? "switched" : "normal",
     m_LodFix ? "on" : "off", m_ShadowDistance, m_CullOverride ? "on" : "off", m_CullScale,
     m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
 }
@@ -1608,7 +1922,35 @@ void CameraManager::DrawUI()
         ImGui::HelpMarker("How far around the camera the city is loaded. The game loads the zone the "
           "camera is in and the zones next to it; with a distance, the zones out to that far are loaded "
           "too, so less pops in around the camera. Further means more memory and more loading, so keep "
-          "it as low as works for the shot.");
+          "it as low as works for the shot.\n\nThe game can only have 128 zones loaded per streamer and "
+          "breaks when it runs out, so the tools add zones slowly and stop well before that. With Fix LOD "
+          "on, every far model is loaded in full detail too, and a big distance can still be more than "
+          "the game copes with: keep it lower (or Fix LOD off) if the game crashes.");
+        if (m_CameraEnabled && m_StreamAroundCamera)
+        {
+          float fill = m_InstanceFill;
+          if (fill >= 0.f)
+          {
+            int k = m_InstanceCapacity[1] > 0 && (float)m_InstanceCount[1] / m_InstanceCapacity[1] >
+              (m_InstanceCapacity[0] > 0 ? (float)m_InstanceCount[0] / m_InstanceCapacity[0] : 0.f) ? 1 : 0;
+            (void)k;
+            (void)fill;
+            if (m_InstancePressure >= 1)
+              ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Meshes loaded: %d of 4096, at the limit: the camera's extra zones are held back",
+                (int)m_MeshCount);
+            else
+              ImGui::TextDisabled("Meshes loaded: %d of 4096 (most so far %d)", (int)m_MeshCount, (int)m_MeshPeak);
+            ImGui::HelpMarker("The game has room for 4096 different meshes and crashes when the loaded "
+              "zones need more. Extra zones around the camera bring in a lot, so the tools stop adding them "
+              "at 3300, take two away at 3500 and all of them at 3700. Whatever is loaded around Faith "
+              "counts too, so how far the camera can load depends on where she is.");
+          }
+          int slots = m_StreamSlotsPeak;
+          if (GetTickCount64() - m_StreamLimitedTick < 3000)
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Zones loaded: %d of 128, near the game's limit: the furthest are held back", slots);
+          else
+            ImGui::TextDisabled("Zones loaded: %d of 128", slots);
+        }
         configChanged |= ImGui::Checkbox("Load ahead of the camera", &m_StreamAhead);
         ImGui::HelpMarker("Also loads where the camera is heading (about 2.5 seconds ahead at its current "
           "speed), so zones are loading before it reaches them and less pops in while flying.");
@@ -1809,6 +2151,7 @@ void CameraManager::ReadConfig(INIReader* pReader)
   m_StreamTrack = pReader->GetBoolean("Misc", "StreamTrack", true);
   m_StreamDistance = (float)pReader->GetReal("Misc", "StreamDistance", 0.0);
   if (m_StreamDistance < 0) m_StreamDistance = 0;
+  if (m_StreamDistance > MaxStreamDistance) m_StreamDistance = MaxStreamDistance;
 
   m_MotionBlurOverride = pReader->GetBoolean("Misc", "MotionBlurOverride", false);
   m_MotionBlurEnable = pReader->GetBoolean("Misc", "MotionBlurEnable", true);

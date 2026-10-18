@@ -81,6 +81,7 @@ private:
   void ApplyFieldOfView(float fov);
   void ApplyMotionBlur();
   void ApplyCulling();
+  void WatchInstanceLists();
   void ApplyShadowDistance();
   void PublishStreamingFocus(double dt);
   void SetThirdPersonBody(bool enable);
@@ -181,6 +182,22 @@ private:
   bool m_StreamAhead{ true };  // also load where the camera is heading
   bool m_StreamTrack{ true };  // also load along the selected track
   float m_StreamDistance{ 0.f }; // also load this far around the camera, 0 = its own and neighbouring zones
+  // For the menu, from the zone streamer hook: its fullest zone slot count since the camera was
+  // turned on, and when it last held the camera's extra zones back
+  std::atomic<int> m_StreamSlotsPeak{ 0 };
+  std::atomic<unsigned long long> m_StreamLimitedTick{ 0 };
+
+  // The mesh streaming manager's model instance lists (see WatchInstanceLists)
+  __int64 m_ppMeshStreaming{ 0 };
+  std::atomic<int> m_InstancePressure{ 0 };  // 0 fine, 1 hold back, 2 take zones away, 3 take all away
+  std::atomic<float> m_InstanceFill{ -1.f }; // the fuller list, 0 - 1, -1 = unknown
+  int m_InstanceCount[2]{};
+  int m_InstanceCapacity[2]{};
+  __int64 m_InstanceBegin[2]{};
+  int m_InstanceReserveOriginal[2]{};
+  std::atomic<int> m_MeshCount{ 0 };   // meshes in the mesh table, the game has room for 4096
+  std::atomic<int> m_MeshPeak{ 0 };
+  bool m_MeshesInline{ true };
   DirectX::XMFLOAT3 m_StreamLastPosition{ 0, 0, 0 };
   DirectX::XMFLOAT3 m_StreamVelocity{ 0, 0, 0 };
   bool m_StreamHasLast{ false };

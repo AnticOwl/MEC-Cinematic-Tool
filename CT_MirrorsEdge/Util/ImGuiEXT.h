@@ -25,6 +25,9 @@ namespace ImGui
   // A button that has to be clicked twice (within 3 seconds) for things
   // that can't be undone. The second click returns true.
   bool ConfirmButton(const char* label, const ImVec2& size = ImVec2(0, 0));
+  // A small up/down arrow that sits inside a row, the arrow centred. A disabled
+  // one is drawn faint and can't be clicked, so arrows line up from row to row.
+  bool MoveArrowButton(const char* str_id, ImGuiDir dir, bool enabled);
   // Small heading text inside a section
   void SubHeading(const char* text);
 }

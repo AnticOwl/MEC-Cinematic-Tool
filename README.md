@@ -2,9 +2,8 @@
 
 A rebuild of the Mirror's Edge Catalyst cinematic tools on top of Hattiwatti's
 [CinematicTools template](https://github.com/Hattiwatti/CinematicTools) (template commit in
-`CT_MirrorsEdge/TEMPLATE_COMMIT.txt`), using the hooks and offsets reversed from the original
-2018 `CT_MirrorsEdge.dll`. It has the original tools' features in
-an in-game menu, and adds a lot on top:
+`CT_MirrorsEdge/TEMPLATE_COMMIT.txt`), using the hooks and offsets reversed from the original 2018
+`CT_MirrorsEdge.dll`. It has the original tools' features in an in-game menu, and adds a lot on top:
 
 - free camera with mouse look, gamepad and adjustable speeds (up to 200 m/s)
 - **keyframed camera tracks**: position, rotation, field of view, motion blur and **time of day**,
@@ -39,6 +38,7 @@ an in-game menu, and adds a lot on top:
 | `build.ps1` | Builds MinHook (first run only), the tools and the loader, and fills `dist/` |
 | `tools/MinHookNoLTCG.props` | Build workaround, see the comment inside |
 | `ctdis.py` | The script used to disassemble the original DLL |
+| `CHANGELOG.md` | What changed in each version |
 | `LICENSE` | MIT, for the tools themselves |
 | `THIRD_PARTY_NOTICES.md` | Licenses of MinHook, Dear ImGui and inih |
 
@@ -183,9 +183,27 @@ when each streamer gets or loses the camera focus. If it doesn't help somewhere,
 still works (*Faith keeps control* lets you run with a track playing).
 
 Props popping in while flying are zones that only start loading once the camera gets near them.
-*Stream distance* (0 - 600 m, off by default) loads the city that far around the camera too: the
-tools add rings of foci about 200 m apart around it (up to 40), and each loads its zone and the
+*Stream distance* (0 - 400 m, off by default) loads the city that far around the camera too: the
+tools add rings of foci about 200 m apart around it (up to 20), and each loads its zone and the
 zones next to it. More distance means less pop-in around the camera, but more memory and loading.
+
+Each zone streamer only has room for 128 loaded zones, and the game breaks when it runs out (it
+writes past the end of its table, which crashed the game with a high stream distance). The tools
+count the streamer's used slots before every update. Zones only get a slot once they load, so the
+count runs behind what was asked for: the tools add their extra foci one at a time, only once the
+count has stood still for 0.75 s and only while fewer than 96 are in use, and above 104 they take
+the two least important away (the camera's own focus always stays). With *Fix LOD* on, every far
+model is loaded in full detail as well, which brings in more meshes (see below).
+
+The tighter limit is meshes: the game has room for 4096 different meshes in its mesh streaming
+and crashes when the loaded zones need more (it moves its mesh table while background jobs are
+still reading it). Extra zones bring in a lot of meshes, and whatever is loaded around Faith
+counts too. The tools watch the count (*Meshes loaded: N of 4096* in the menu): they stop adding
+zones at 3300, take two away at 3500, and at 3700 take the camera's own zones away as well.
+How far around the camera can be loaded therefore depends on the area. (They also ask for more
+room for model instances from the next level load, which the game has plenty of already.) The
+menu shows *Zones loaded: N of 128*, in yellow when zones are being held back. The rings move in
+100 m steps rather than with every bit of camera movement.
 
 Two sub-options (both on by default) load more in advance:
 
@@ -281,8 +299,9 @@ listed. Each *Attach* pick writes to the log how many objects of each class ther
    *Go to* moves the camera to a keyframe, *Set from camera* overwrites it with the current camera.
    While you drag or type a keyframe's position, angles or field of view, the camera shows that
    keyframe live (and its time of day, when the track sets the time of day). The up / down arrows
-   at the end of a keyframe's row move it earlier or later: the two keyframes swap everything
-   except their times, so the shots change order and the track's timing stays the same.
+   at the end of a keyframe's row move it earlier or later (greyed out where it can't go any
+   further): the two keyframes swap everything except their times, so the shots change order and
+   the track's timing stays the same.
    Each keyframe also stores a motion blur strength. With *Control motion blur* on and *Motion
    blur* ticked in *Keyframe options*, it's interpolated along the track like the FOV. Frostbite
    works the blur out from how the camera moves between frames, so fast moves blur more by

@@ -532,35 +532,27 @@ void TrackPlayer::DrawUI(Camera& camera, bool cameraEnabled)
       node.TimeStamp, interpolationName, timeOfDay, sameView ? "    (same view as the one before)" : "");
     ImGui::PopStyleColor(3);
 
-    // Move up / down, at the right end of the row
+    // Move up / down, at the right end of the row. Both are always there (faint
+    // when there's nowhere to move) so they line up from row to row.
     if (!m_IsPlaying && nodes.size() > 1)
     {
       float arrowSize = ImGui::GetFrameHeight();
-      float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
-      ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - arrowSize * 2.f - spacing);
+      ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - arrowSize * 2.f);
+      if (ImGui::MoveArrowButton("##Up", ImGuiDir_Up, i > 0))
+      {
+        moveFrom = (int)i;
+        moveTo = (int)i - 1;
+      }
       if (i > 0)
-      {
-        if (ImGui::ArrowButton("##Up", ImGuiDir_Up))
-        {
-          moveFrom = (int)i;
-          moveTo = (int)i - 1;
-        }
         ImGui::ItemTooltip("Move this keyframe earlier (its time stays)");
-      }
-      else
-        ImGui::Dummy(ImVec2(arrowSize, arrowSize));
-      ImGui::SameLine(0.f, spacing);
-      if (i + 1 < nodes.size())
+      ImGui::SameLine(0.f, 0.f);
+      if (ImGui::MoveArrowButton("##Down", ImGuiDir_Down, i + 1 < nodes.size()))
       {
-        if (ImGui::ArrowButton("##Down", ImGuiDir_Down))
-        {
-          moveFrom = (int)i;
-          moveTo = (int)i + 1;
-        }
-        ImGui::ItemTooltip("Move this keyframe later (its time stays)");
+        moveFrom = (int)i;
+        moveTo = (int)i + 1;
       }
-      else
-        ImGui::Dummy(ImVec2(arrowSize, arrowSize));
+      if (i + 1 < nodes.size())
+        ImGui::ItemTooltip("Move this keyframe later (its time stays)");
     }
 
     if (open)

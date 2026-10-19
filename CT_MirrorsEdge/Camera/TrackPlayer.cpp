@@ -584,7 +584,9 @@ void TrackPlayer::DrawUI(Camera& camera, bool cameraEnabled)
         ImGui::HelpMarker("Motion blur strength at this keyframe. Used while \"Control motion blur\" is on "
           "and the track controls motion blur (Keyframe options).");
 
-        if (node.TimeOfDay >= 0)
+        if (node.TimeOfDay >= 0 && util::IsMecmpLoaded())
+          ImGui::TextDisabled("Time of day: disabled while MECMP is open (it syncs the time of day)");
+        else if (node.TimeOfDay >= 0)
         {
           char clock[16];
           FormatTimeOfDay(node.TimeOfDay, clock, sizeof(clock));
@@ -717,7 +719,10 @@ void TrackPlayer::DrawUI(Camera& camera, bool cameraEnabled)
     ImGui::SameLine();
     ImGui::Checkbox("Motion blur", &m_LockMotionBlur);
     ImGui::SameLine();
-    ImGui::Checkbox("Time of day", &m_LockTimeOfDay);
+    if (util::IsMecmpLoaded())
+      ImGui::TextDisabled("(Time of day: disabled, MECMP syncs it)");
+    else
+      ImGui::Checkbox("Time of day", &m_LockTimeOfDay);
     ImGui::HelpMarker("Untick one to control it yourself during playback, like turning the camera "
       "with the mouse while the track moves it.\n\nTime of day: every keyframe stores the time when it's "
       "added, and with this ticked the track sets the game's clock between them, so a track can go from "

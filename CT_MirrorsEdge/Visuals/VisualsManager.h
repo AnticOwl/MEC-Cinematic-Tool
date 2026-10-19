@@ -60,6 +60,9 @@ public:
   // While a track plays its time of day wins over the frozen clock and the fix
   void SetTrackTimeOfDay(float seconds);
   void StopTrackTimeOfDay();
+  // Camera hook, every rendered frame: the stopped clock (or a track's time)
+  // is written then too, so the clock can't creep on between visual updates
+  void KeepClock();
 
 private:
   __int64 GetStateManager();

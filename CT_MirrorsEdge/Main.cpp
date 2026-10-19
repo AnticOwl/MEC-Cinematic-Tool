@@ -358,6 +358,15 @@ LRESULT CALLBACK Main::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
   case WM_SYSKEYDOWN: // Alt and F10
     if (g_mainHandle->m_pInputSystem->HandleKeyMsg(wParam, lParam))
       return TRUE;
+    // F10 on its own would start Windows' keyboard menu mode (like Alt),
+    // which stalls the game's window. It's the camera key, and the game reads
+    // its keys another way, so it stops here.
+    if (uMsg == WM_SYSKEYDOWN && wParam == VK_F10)
+      return 0;
+    break;
+  case WM_SYSKEYUP:
+    if (wParam == VK_F10)
+      return 0;
     break;
   case WM_DESTROY:
     g_shutdown = true;

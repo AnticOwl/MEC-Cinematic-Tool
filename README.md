@@ -90,7 +90,7 @@ shadows). Windows also saves a crash dump in `%LOCALAPPDATA%\CrashDumps`.
 | Key | Action |
 |---|---|
 | F5 | Toggle the in-game UI (or the ✕ on its window) |
-| Insert | Toggle the free camera |
+| F10 | Toggle the free camera (not Insert like the original tools: that opens MECMP's menu) |
 | W A S D / Space / Left Ctrl | Move |
 | Mouse, arrow keys | Pitch / yaw (with the menu open: hold the right mouse button outside its window) |
 | Numpad 1 / 3 | Roll |
@@ -124,8 +124,9 @@ Reset all hotkeys need a second click.
     mouse and gamepad, so you can play as Faith while the camera follows the track) and fixed
     playback FPS.
   - *Time and HUD*: freeze time, show HUD, and the time of day slider (midnight - noon -
-    midnight) with *Stop the clock* and the *Stuck clock fix* (when the clock gets stuck at 65700
-    it's moved 15 s ahead, both editable).
+    midnight) with *- 10 min* / *+ 10 min* buttons, *Stop the clock* and the *Stuck clock fix*
+    (when the clock gets stuck at 65700 it's moved 15 s ahead, both editable). When MECMP, the
+    multiplayer mod, opens, these controls get disabled because MECMP syncs the time of day.
   - *Detail and draw distance*: *Fix LOD*, *Detail distance* (the game's LOD scale, default 5),
     *Show small objects far away* and *Load the world around the camera* (see below) and *Draw
     distance* (the camera's far plane, game default 25000 m).
@@ -142,7 +143,7 @@ Reset all hotkeys need a second click.
     stored in each keyframe.
   - *Camera settings*: movement, turn, roll and zoom speeds (in m/s and degrees per second), mouse
     sensitivity, field of view, *Start at the game camera*, *Freeze Faith*, *Gamepad moves the
-    camera*, *Show Faith's body*.
+    camera*, *Show Faith's body* (her third-person body, hair included).
   - *Keys*: every hotkey as it's currently bound.
 - **FOLLOW**: *Follow Faith* with *Turn with her*; following traffic, crowds, characters, drones
   and other moving things, picked from the *Nearby* list (with markers in the game view) or with
@@ -191,19 +192,28 @@ Each zone streamer only has room for 128 loaded zones, and the game breaks when 
 writes past the end of its table, which crashed the game with a high stream distance). The tools
 count the streamer's used slots before every update. Zones only get a slot once they load, so the
 count runs behind what was asked for: the tools add their extra foci one at a time, only once the
-count has stood still for 0.75 s and only while fewer than 96 are in use, and above 104 they take
+count has stood still for 0.75 s and only while fewer than 100 are in use, and above 108 they take
 the two least important away (the camera's own focus always stays). With *Fix LOD* on, every far
 model is loaded in full detail as well, which brings in more meshes (see below).
 
 The tighter limit is meshes: the game has room for 4096 different meshes in its mesh streaming
-and crashes when the loaded zones need more (it moves its mesh table while background jobs are
-still reading it). Extra zones bring in a lot of meshes, and whatever is loaded around Faith
-counts too. The tools watch the count (*Meshes loaded: N of 4096* in the menu): they stop adding
-zones at 3300, take two away at 3500, and at 3700 take the camera's own zones away as well.
+and crashes when the loaded zones need more (it adds them past the end of its table, over the
+model instance lists stored after it). A mesh that unloads leaves a free record the game uses
+again, so the table's end only shows the most there ever were; the tools count the records in
+use. Extra zones bring in a lot of meshes, and whatever is loaded around Faith counts too. The
+tools watch that count (*Meshes in use: N of 4096* in the menu): they stop adding
+zones at 3450, take two away at 3650, and at 3800 take the camera's own zones away as well. From
+2800 meshes on, another focus is only added once the count has stood still for a second, so the
+meshes of two foci's zones can't arrive at once.
 How far around the camera can be loaded therefore depends on the area. (They also ask for more
 room for model instances from the next level load, which the game has plenty of already.) The
 menu shows *Zones loaded: N of 128*, in yellow when zones are being held back. The rings move in
 100 m steps rather than with every bit of camera movement.
+
+*Only where the camera looks* (off by default) puts the rings' foci only in front of the camera:
+the width of the view plus 20 degrees each side. That's about a third of the zones and meshes,
+so with it the stream distance goes up to 1000 m. Behind the camera only the zones next to it stay
+loaded, so after turning around the new view loads over a few seconds.
 
 Two sub-options (both on by default) load more in advance:
 
@@ -222,7 +232,9 @@ objects far away*), and meshes and textures that the game streams separately ins
 Everything about following is in the **FOLLOW** tab (the free camera has to be on).
 
 *Follow Faith* attaches the camera to her: her movement since the last frame is added to the
-camera, so it travels with her and can still be flown around her. *Turn with her* adds her
+camera, so it travels with her. With *Freeze Faith* off, the movement keys (W A S D, Space, Ctrl)
+only move her and the camera keeps its place next to her (the arrow keys, the FOV keys and the
+gamepad still adjust it); with *Freeze Faith* on it can be flown around her. *Turn with her* adds her
 heading too (only the heading, so the camera stays level when she wall-runs or climbs). A track
 played while it's on moves with her from where she was when it started: freeze time, record a
 move around her, give her the controls (*Faith keeps control while a track plays*, CAMERA tab)
@@ -284,7 +296,7 @@ listed. Each *Attach* pick writes to the log how many objects of each class ther
 
 ### Making a camera move
 
-1. Press Insert, fly to the first shot and press Numpad +. Move the camera to the next shot and
+1. Press F10, fly to the first shot and press Numpad +. Move the camera to the next shot and
    repeat. A keyframe that's the same view as the one before it is marked *(same view as the one
    before)*, and the camera holds still between the two.
 2. Open the UI (F5). Each keyframe in *Camera tracks* can be expanded to edit its position,

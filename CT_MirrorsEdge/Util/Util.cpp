@@ -1,8 +1,25 @@
 #include "Util.h"
 #include "../Main.h"
 
+#include <atomic>
 #include <codecvt>
 #include <locale>
+
+bool util::IsMecmpLoaded()
+{
+  static std::atomic<ULONGLONG> s_checkedAt{ 0 };
+  static std::atomic<bool> s_loaded{ false };
+  ULONGLONG now = GetTickCount64();
+  if (now - s_checkedAt >= 1000)
+  {
+    s_checkedAt = now;
+    bool loaded = GetModuleHandleW(L"mecmp.dll") != nullptr;
+    if (loaded != s_loaded.exchange(loaded))
+      util::log::Write(loaded ? "MECMP is open: the time of day controls are disabled, MECMP syncs the time of day"
+        : "MECMP is closed: the time of day controls are back");
+  }
+  return s_loaded;
+}
 
 // Loads resource data from the .dll file based on resource IDs in resource.h
 bool util::GetResource(int ID, void* &pData, DWORD& size)

@@ -154,11 +154,12 @@ static const std::map<Action, std::string> ActionUIStringMap =
 
 
 // Defaults follow the original Mirror's Edge tools where they overlap
-// (Insert / Delete / Home / End / Page Up / Page Down / Numpad 1 & 3).
+// (Delete / Home / End / Page Up / Page Down / Numpad 1 & 3). The camera is
+// on F10, not the original Insert, which opens MECMP's menu.
 static const std::map<Action, int> DefaultKeyboardMap =
 {
   { ToggleUI, VK_F5 },
-  { ToggleCamera, VK_INSERT },
+  { ToggleCamera, VK_F10 },
   { ToggleHUD, VK_HOME },
   { ToggleFreezeTime, VK_DELETE },
   { ToggleGameInput, VK_END },

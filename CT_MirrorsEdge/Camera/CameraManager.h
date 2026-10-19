@@ -38,6 +38,9 @@ public:
   bool IsPlayerControllingFaith() { return m_PlayerControlDuringPlayback && m_TrackPlayer.IsPlaying(); }
   bool IsGamepadDisabled() { return m_CameraEnabled && m_GamepadDisabled && !IsPlayerControllingFaith(); };
   bool IsKbmDisabled() { return m_CameraEnabled && m_KbmDisabled && !IsPlayerControllingFaith(); };
+  // Following Faith while she isn't frozen: the movement keys only move her,
+  // so the camera keeps its place next to her instead of flying off as well
+  bool IsMovementKeysForFaith() { return m_CameraEnabled && m_AttachToFaith && !m_KbmDisabled; }
 
   void ReadConfig(INIReader* pReader);
   const std::string GetConfig();
@@ -82,6 +85,8 @@ private:
   void ApplyMotionBlur();
   void ApplyCulling();
   void WatchInstanceLists();
+  void ApplyHairFix();
+  void UnlinkFaithCamera();
   void ApplyShadowDistance();
   void PublishStreamingFocus(double dt);
   void SetThirdPersonBody(bool enable);
@@ -181,6 +186,7 @@ private:
   std::atomic<bool> m_StreamingFocusReady{ false }; // the camera position was published since enabling
   bool m_StreamAhead{ true };  // also load where the camera is heading
   bool m_StreamTrack{ true };  // also load along the selected track
+  bool m_StreamInView{ false }; // the extra zones only where the camera looks
   float m_StreamDistance{ 0.f }; // also load this far around the camera, 0 = its own and neighbouring zones
   // For the menu, from the zone streamer hook: its fullest zone slot count since the camera was
   // turned on, and when it last held the camera's extra zones back
@@ -195,9 +201,13 @@ private:
   int m_InstanceCapacity[2]{};
   __int64 m_InstanceBegin[2]{};
   int m_InstanceReserveOriginal[2]{};
-  std::atomic<int> m_MeshCount{ 0 };   // meshes in the mesh table, the game has room for 4096
+  std::atomic<int> m_MeshCount{ 0 };   // mesh records in use, the game has room for 4096
   std::atomic<int> m_MeshPeak{ 0 };
-  bool m_MeshesInline{ true };
+  std::atomic<int> m_MeshHighWater{ 0 }; // where the table's end is (the most there were)
+  int m_MeshInUse{ 0 };                    // records in use at the last count
+  int m_MeshScanHighWater{ 0 };            // the end at the last count
+  unsigned long long m_MeshScanTick{ 0 };
+  bool m_MeshesOverflowed{ false };  // the mesh table's end went past its 4096 records
   DirectX::XMFLOAT3 m_StreamLastPosition{ 0, 0, 0 };
   DirectX::XMFLOAT3 m_StreamVelocity{ 0, 0, 0 };
   bool m_StreamHasLast{ false };
@@ -210,6 +220,17 @@ private:
   // link that was there, so exactly that is put back
   __int64 m_ThirdPersonEntity{ 0 };
   __int64 m_ThirdPersonLink{ 0 };
+  // Her own camera is unlinked this long after the switch, so her hair can come on first
+  static const unsigned long long ThirdPersonUnlinkDelayMs = 500;
+  unsigned long long m_ThirdPersonUnlinkAt{ 0 };  // 0: nothing waiting
+
+  // Faith's hair cloth while her body is shown (see ApplyHairFix)
+  static const int MaxHairCloths = 4;
+  __int64 m_HairData[MaxHairCloths]{};  // ClothEntityData changed, and its 8 original floats
+  float m_HairSaved[MaxHairCloths][8]{};
+  __int64 m_HairMesh[MaxHairCloths]{};  // and its mesh asset with its original LodScale
+  float m_HairLodScale[MaxHairCloths]{};
+  int m_HairSavedCount{ 0 };
 
   // Where the free camera was when it was turned off (Start at the game camera off)
   DirectX::XMFLOAT3 m_LastCameraPosition{ 0, 0, 0 };

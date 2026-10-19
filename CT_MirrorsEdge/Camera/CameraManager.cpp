@@ -55,7 +55,11 @@ namespace
   const int MaxRingFoci = 40;             // enough for 600 m
   const int FocusTrackFirst = FocusRingFirst + MaxRingFoci;
   const float RingSpacing = 200.f;        // between the rings, and between the points on one
-  const float MaxStreamDistance = 600.f;  // the zone slot and mesh limits hold back what doesn't fit
+  const float MaxStreamDistance = 600.f;  // all round; the zone slot and mesh limits hold back what doesn't fit
+  // Only where the camera looks: about a third of each ring, so it reaches
+  // further for the same zones and meshes
+  const float MaxStreamDistanceInView = 1000.f;
+  const float ViewConeMargin = 20.f * 3.14159265f / 180.f; // past the edges of the view
   const float LookAheadSeconds = 2.5f;     // how far ahead the camera's movement is loaded
   const float LookAheadMaxDistance = 400.f;
 
@@ -120,8 +124,8 @@ namespace
   // their foci while there's plenty of room, and take some away when it fills.
   const int ZoneSlotsOffset = 0x2F8;
   const int ZoneSlotCount = 128;
-  const int ZoneSlotsAddBelow = 96;     // add one more focus only below this many in use
-  const int ZoneSlotsRemoveAbove = 104; // take the least important ones away above this
+  const int ZoneSlotsAddBelow = 100;    // add one more focus only below this many in use
+  const int ZoneSlotsRemoveAbove = 108; // take the least important ones away above this
   // Zones only get their slots once they load, so the count runs behind what
   // was asked for. A new focus is added only once the count has stood still
   // this long, and never sooner than this after the last one.
@@ -181,18 +185,34 @@ namespace
 
   // The mesh table: a vector at +0x50 (begin, end, capacity) with room for
   // 4096 meshes of 0x350 bytes inside the manager (+0x70 up to the instance
-  // lists at +0x350070). Past 4096 it moves out to new memory, and the jobs
-  // reading the old place crash. That's the limit that matters: extra zones
-  // bring in a lot of different meshes.
+  // lists at +0x350070). A new mesh takes a free record (first qword 0) if
+  // there is one, otherwise the end moves on (0x143551D50), without looking
+  // at the capacity: past 4096 it writes over the instance lists, and the
+  // game crashes. So the end only shows the most there ever were in this
+  // level; what counts is how many records are in use.
   const int MeshTableOffset = 0x50;
   const int MeshTableInline = 0x70;
   const int MeshRecordSize = 0x350;
   const int MeshTableCapacity = 4096;
   // One zone can bring in a few hundred meshes at once, so the limits leave
   // that much room below 4096 (4000 still went over it)
-  const int MeshesStopAdding = 3300; // no more zones around the camera from here
-  const int MeshesTakeAway = 3500;   // two of the camera's extra zones go
-  const int MeshesTakeAll = 3700;    // all of them go, the camera's own too
+  const int MeshesStopAdding = 3450; // no more zones around the camera from here
+  const int MeshesTakeAway = 3650;   // two of the camera's extra zones go
+  const int MeshesTakeAll = 3800;    // all of them go, the camera's own too
+  // The meshes of a focus's zones register in bursts as they load. Near the
+  // limit another focus is only added once the count has stood still this
+  // long, so two foci's bursts can't land on top of each other. (Further
+  // down the game's own streaming around Faith keeps the count moving, and a
+  // burst can't reach the limit anyway.)
+  const int MeshesSettleFrom = 2800;
+  const ULONGLONG MeshesSettleMs = 1000;
+  std::atomic<ULONGLONG> g_MeshesChangedAt{ 0 };
+  std::atomic<int> g_MeshesNow{ 0 };
+
+  bool MeshesSettled()
+  {
+    return g_MeshesNow < MeshesSettleFrom || GetTickCount64() - g_MeshesChangedAt >= MeshesSettleMs;
+  }
 
   struct InstanceLists
   {
@@ -204,6 +224,29 @@ namespace
     int Meshes;
     bool MeshesInline; // still in the manager's own room for 4096
   };
+
+  // Mesh records in use, with the game's own test (first qword not 0); -1 if unreadable
+  int CountMeshesInUse(__int64 ppManager)
+  {
+    __try
+    {
+      __int64 pManager = ppManager ? *(__int64*)ppManager : 0;
+      if (!pManager) return -1;
+      __int64 begin = *(__int64*)(pManager + MeshTableOffset);
+      __int64 end = *(__int64*)(pManager + MeshTableOffset + 8);
+      if (!begin || end < begin) return 0;
+      int count = (int)((end - begin) / MeshRecordSize);
+      if (count > MeshTableCapacity + 64) count = MeshTableCapacity + 64;
+      int used = 0;
+      for (int i = 0; i < count; ++i)
+        used += *(__int64*)(begin + (__int64)i * MeshRecordSize) != 0 ? 1 : 0;
+      return used;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return -1;
+    }
+  }
 
   bool ReadInstanceLists(__int64 ppManager, InstanceLists& lists)
   {
@@ -343,7 +386,7 @@ namespace
             limited = true;
             break;
           }
-          if (i != FocusCamera && (instancePressure >= 1 || !MayAddFocus(pZoneStreamer, usedSlots)))
+          if (i != FocusCamera && (instancePressure >= 1 || !MeshesSettled() || !MayAddFocus(pZoneStreamer, usedSlots)))
           {
             limited = usedSlots >= ZoneSlotsAddBelow || instancePressure >= 1;
             break;
@@ -479,6 +522,7 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   ApplyCulling();
   ApplyShadowDistance();
   WatchInstanceLists();
+  ApplyHairFix();
 
   // A track stopped setting the time of day: the clock carries on from there
   if (m_TrackTimeOfDayApplied && !(m_CameraEnabled && m_TrackPlayer.IsPlaying() && m_TrackPlayer.IsTimeOfDayLocked()))
@@ -486,6 +530,8 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
     g_mainHandle->GetVisualsManager()->StopTrackTimeOfDay();
     m_TrackTimeOfDayApplied = false;
   }
+  // A stopped clock is held every frame, not only at the game's visual updates
+  g_mainHandle->GetVisualsManager()->KeepClock();
 
   // Motion blur too. With the camera on it's applied after the track has
   // updated the strength below.
@@ -509,6 +555,14 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
 
   // Recorded into new keyframes
   m_Camera.TimeOfDay = g_mainHandle->GetVisualsManager()->GetCurrentTimeOfDay();
+
+  // The body switch unlinks her own camera a moment after it starts
+  if (m_ThirdPersonUnlinkAt && GetTickCount64() >= m_ThirdPersonUnlinkAt)
+  {
+    m_ThirdPersonUnlinkAt = 0;
+    if (m_ThirdPersonApplied)
+      UnlinkFaithCamera();
+  }
 
   FollowAttachTarget(dt, trackDt);
   UpdateInput(dt, mouseState);
@@ -566,8 +620,22 @@ void CameraManager::PublishStreamingFocus(double dt)
   // everything around the camera that far out.
   if (on && m_StreamDistance > 1.f)
   {
-    float distance = m_StreamDistance > MaxStreamDistance ? MaxStreamDistance : m_StreamDistance;
+    float maxDistance = m_StreamInView ? MaxStreamDistanceInView : MaxStreamDistance;
+    float distance = m_StreamDistance > maxDistance ? maxDistance : m_StreamDistance;
     int rings = (int)ceilf(distance / RingSpacing);
+    // Only where the camera looks: points within the view's width (and a
+    // margin) of the way it faces. The camera looks along -row 2.
+    float lookX = -m_Camera.Transform.m[2][0], lookZ = -m_Camera.Transform.m[2][2];
+    float lookLength = sqrtf(lookX * lookX + lookZ * lookZ);
+    bool inViewOnly = m_StreamInView && lookLength > 0.1f; // straight up or down: all round
+    float minDot = -2.f;
+    if (inViewOnly)
+    {
+      lookX /= lookLength;
+      lookZ /= lookLength;
+      float halfWidth = atanf(tanf(m_ViewFovY * 0.5f) * m_ViewAspect) + ViewConeMargin;
+      minDot = cosf(halfWidth < 1.5707963f ? halfWidth : 1.5707963f);
+    }
     // Centred on a point that moves in 100 m steps: rings that followed the
     // camera exactly would load and unload zones at their edges all the time
     XMFLOAT3 cameraPosition;
@@ -580,13 +648,28 @@ void CameraManager::PublishStreamingFocus(double dt)
       float radius = distance * ring / rings;
       int count = (int)ceilf(XM_2PI * radius / RingSpacing);
       if (count < 6) count = 6;
-      if (slot + count > FocusRingFirst + MaxRingFoci)
-        break; // a whole ring or none, never half of one
-      for (int k = 0; k < count; ++k)
+      XMVECTOR points[64];
+      int kept = 0;
+      for (int k = 0; k < count && kept < 64; ++k)
       {
         float angle = XM_2PI * k / count + ring * 0.5f; // rings turned against each other
         XMVECTOR point = centre + XMVectorSet(cosf(angle) * radius, 0, sinf(angle) * radius, 0);
-        XMStoreFloat3((XMFLOAT3*)results[slot].Position, point);
+        if (inViewOnly)
+        {
+          XMFLOAT3 p;
+          XMStoreFloat3(&p, point);
+          float dx = p.x - cameraPosition.x, dz = p.z - cameraPosition.z;
+          float length = sqrtf(dx * dx + dz * dz);
+          if (length > 1.f && (dx * lookX + dz * lookZ) / length < minDot)
+            continue;
+        }
+        points[kept++] = point;
+      }
+      if (slot + kept > FocusRingFirst + MaxRingFoci)
+        break; // a whole ring (or its part in view) or none, never half of one
+      for (int k = 0; k < kept; ++k)
+      {
+        XMStoreFloat3((XMFLOAT3*)results[slot].Position, points[k]);
         wanted[slot++] = true;
       }
     }
@@ -1472,8 +1555,10 @@ void CameraManager::DrawFollowUI()
     m_AttachTrackActive = false;
     util::log::Write("Camera %s Faith", m_AttachToFaith ? "follows" : "no longer follows");
   }
-  ImGui::HelpMarker("Attaches the camera to Faith: where she goes, the camera goes, and you can still fly "
-    "it around her. A track that plays while this is on moves with her from where she was when it "
+  ImGui::HelpMarker("Attaches the camera to Faith: where she goes, the camera goes, keeping its place next "
+    "to her. With Freeze Faith off, the movement keys (W A S D, Space, Ctrl) only move her; the arrow keys, "
+    "the FOV keys and the gamepad still adjust the camera. With Freeze Faith on you can fly the camera "
+    "around her instead. A track that plays while this is on moves with her from where she was when it "
     "started, so a camera move recorded around her can follow her while she runs (give her the "
     "controls with \"Faith keeps control while a track plays\" in the CAMERA tab).");
   if (m_AttachToFaith)
@@ -1570,6 +1655,170 @@ void CameraManager::DrawFollowUI()
     g_mainHandle->OnConfigChanged();
 }
 
+namespace
+{
+  // Faith's hair is a cloth mesh (characters/faith/hair/faith_hair_3pcloth_ingame)
+  // that her PamClientCharacterCustomizationComponent holds. The game only
+  // switches the cloth on within its activation radius (33 m) of the camera,
+  // and with her body switched (her own camera unlinked) it stays off and her
+  // hair isn't drawn. A radius of 100 km keeps it on. Its mesh also uses the
+  // shared LodGroups/Character_Streamable2 (LODs at 5, 15, 30, 60, 100 and
+  // 1025 m), and from 100 m there's no hair in it any more, so the mesh's own
+  // LodScale (only this mesh has it) is raised too. The vtables are for PE
+  // timestamp 0x5762E3B7 only, so on another build nothing is looked for.
+  const DWORD HairFixTimeStamp = 0x5762E3B7;
+  const __int64 CustomizationComponentVTableRva = 0x1C3C360;
+  const __int64 ClothEntityVTableRva = 0x1AD2998;
+  const __int64 ClothEntityDataVTableRva = 0x1AD2960;
+  const __int64 RigidMeshAssetVTableRva = 0x1BBDAB0;
+  const int ComponentCollectionOffset = 0x38;      // soldier -> its components, one every 0x20 bytes
+  const int ClothEntityDataOffset = 0x30;          // ClothEntity -> ClothEntityData
+  const int ClothActivationRadiusOffset = 0x84;    // 4 floats, then SmoothBlendOutDistance x4
+  const int ClothMeshOffset = 0x70;                // ClothEntityData.Mesh
+  const int MeshLodScaleOffset = 0x38;             // MeshAsset.LodScale
+  const float HairLodScale = 1000.f;               // the 100 m LOD at 100 km
+
+  bool IsHairFixBuild()
+  {
+    IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)g_gameHandle;
+    IMAGE_NT_HEADERS* pNt = (IMAGE_NT_HEADERS*)((BYTE*)g_gameHandle + pDos->e_lfanew);
+    return pNt->FileHeader.TimeDateStamp == HairFixTimeStamp;
+  }
+
+  // One qword, or 0 if it isn't readable. The component holds plenty of values
+  // that aren't pointers, so every read is checked on its own.
+  __int64 ReadQwordOrZero(__int64 address)
+  {
+    if (address < 0x10000 || address > 0x7FFFFFFF0000)
+      return 0;
+    __try
+    {
+      return *(__int64*)address;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return 0;
+    }
+  }
+
+  // The ClothEntityData of each cloth Faith's customization component holds
+  int FindHairClothData(__int64 pSoldier, __int64* pOut, int max)
+  {
+    __int64 base = (__int64)g_gameHandle;
+    int count = 0;
+    __int64 pCollection = ReadQwordOrZero(pSoldier + ComponentCollectionOffset);
+    if (!pCollection) return 0;
+    for (int entry = 0; entry < 32; ++entry)
+    {
+      __int64 pComponent = ReadQwordOrZero(pCollection + 0x20 + entry * 0x20);
+      if (!pComponent || ReadQwordOrZero(pComponent) != base + CustomizationComponentVTableRva)
+        continue;
+      for (int off = 0; off < 0x800 && count < max; off += 8)
+      {
+        __int64 pCloth = ReadQwordOrZero(pComponent + off);
+        if (!pCloth || pCloth == pComponent || ReadQwordOrZero(pCloth) != base + ClothEntityVTableRva)
+          continue;
+        __int64 pData = ReadQwordOrZero(pCloth + ClothEntityDataOffset);
+        if (!pData || ReadQwordOrZero(pData) != base + ClothEntityDataVTableRva)
+          continue;
+        bool known = false;
+        for (int k = 0; k < count; ++k)
+          known |= pOut[k] == pData;
+        if (!known)
+          pOut[count++] = pData;
+      }
+      break;
+    }
+    return count;
+  }
+
+  void WriteFloats(__int64 address, float const* values, int count)
+  {
+    __try
+    {
+      memcpy((void*)address, values, sizeof(float) * count);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  bool ReadFloats(__int64 address, float* values, int count)
+  {
+    __try
+    {
+      memcpy(values, (void*)address, sizeof(float) * count);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+}
+
+void CameraManager::ApplyHairFix()
+{
+  // While Faith's body is shown her hair cloth is kept on, see above
+  static bool s_supported = IsHairFixBuild();
+  bool wanted = s_supported && m_CameraEnabled && m_ThirdPersonApplied;
+  if (!wanted && m_HairSavedCount == 0)
+    return;
+
+  __int64 base = (__int64)g_gameHandle;
+  if (!wanted)
+  {
+    // Back to the game's values. The cloth data and the mesh are assets that
+    // stay as long as the level does, so they're put back while they still
+    // are what they were, even if Faith can't be found (a loading screen)
+    for (int i = 0; i < m_HairSavedCount; ++i)
+    {
+      if (ReadQwordOrZero(m_HairData[i]) == base + ClothEntityDataVTableRva)
+        WriteFloats(m_HairData[i] + ClothActivationRadiusOffset, m_HairSaved[i], 8);
+      if (m_HairMesh[i] && ReadQwordOrZero(m_HairMesh[i]) == base + RigidMeshAssetVTableRva)
+        WriteFloats(m_HairMesh[i] + MeshLodScaleOffset, &m_HairLodScale[i], 1);
+    }
+    m_HairSavedCount = 0;
+    return;
+  }
+
+  __int64 data[MaxHairCloths];
+  __int64 pSoldier = GetPlayerSoldier();
+  int count = pSoldier ? FindHairClothData(pSoldier, data, MaxHairCloths) : 0;
+
+  // The cloth is switched on near the camera; out to 100 km it's always on
+  const float wide[8] = { 100000.f, 100000.f, 100000.f, 100000.f, 99000.f, 99000.f, 99000.f, 99000.f };
+  for (int k = 0; k < count; ++k)
+  {
+    int slot = -1;
+    for (int i = 0; i < m_HairSavedCount; ++i)
+      if (m_HairData[i] == data[k]) slot = i;
+    if (slot < 0 && m_HairSavedCount < MaxHairCloths)
+    {
+      slot = m_HairSavedCount;
+      if (!ReadFloats(data[k] + ClothActivationRadiusOffset, m_HairSaved[slot], 8))
+        continue;
+      // Its mesh, only if it really is a mesh asset
+      __int64 pMesh = ReadQwordOrZero(data[k] + ClothMeshOffset);
+      m_HairMesh[slot] = pMesh && ReadQwordOrZero(pMesh) == base + RigidMeshAssetVTableRva &&
+        ReadFloats(pMesh + MeshLodScaleOffset, &m_HairLodScale[slot], 1) ? pMesh : 0;
+      // Never take the tools' own values for the game's (the game's are 33 m,
+      // 28 m and a detail scale of 1)
+      if (m_HairSaved[slot][0] >= wide[0] * 0.5f)
+        for (int f = 0; f < 8; ++f)
+          m_HairSaved[slot][f] = f < 4 ? 33.f : 28.f;
+      if (m_HairMesh[slot] && m_HairLodScale[slot] >= HairLodScale * 0.5f)
+        m_HairLodScale[slot] = 1.f;
+      m_HairData[m_HairSavedCount++] = data[k];
+      util::log::Write("Faith's hair: cloth activation radius raised from %.0f m%s while her body is shown",
+        m_HairSaved[slot][0], m_HairMesh[slot] ? " and its mesh's detail range" : "");
+    }
+    if (slot < 0)
+      continue;
+    WriteFloats(data[k] + ClothActivationRadiusOffset, wide, 8);
+    if (m_HairMesh[slot])
+      WriteFloats(m_HairMesh[slot] + MeshLodScaleOffset, &HairLodScale, 1);
+  }
+}
+
 void CameraManager::WatchInstanceLists()
 {
   InstanceLists lists{};
@@ -1599,20 +1848,43 @@ void CameraManager::WatchInstanceLists()
     m_InstanceCount[k] = lists.Count[k];
   }
 
+  // Mesh records in use, counted at most 20 times a second (it reads every
+  // record); in between, records added at the end count as used
+  ULONGLONG now = GetTickCount64();
+  if (now - m_MeshScanTick >= 50 || lists.Meshes < m_MeshScanHighWater)
+  {
+    int used = CountMeshesInUse(m_ppMeshStreaming);
+    if (used >= 0)
+    {
+      m_MeshInUse = used;
+      m_MeshScanHighWater = lists.Meshes;
+      m_MeshScanTick = now;
+    }
+  }
+  int inUse = m_MeshInUse + (lists.Meshes > m_MeshScanHighWater ? lists.Meshes - m_MeshScanHighWater : 0);
+
   // The instance lists by how full they are, the mesh table (what fills up
-  // first) by count, close to its 4096
+  // first) by records in use, close to its 4096
   int listPressure = fill >= 0.95f ? 3 : (fill >= 0.9f ? 2 : (fill >= 0.8f ? 1 : 0));
-  int meshPressure = (!lists.MeshesInline || lists.Meshes >= MeshesTakeAll) ? 3 :
-    (lists.Meshes >= MeshesTakeAway ? 2 : (lists.Meshes >= MeshesStopAdding ? 1 : 0));
-  float meshFill = (float)lists.Meshes / MeshTableCapacity;
+  // Its end past 4096 means the game is already writing over its instance lists
+  bool overflowing = !lists.MeshesInline || lists.Meshes > MeshTableCapacity;
+  int meshPressure = (overflowing || inUse >= MeshesTakeAll) ? 3 :
+    (inUse >= MeshesTakeAway ? 2 : (inUse >= MeshesStopAdding ? 1 : 0));
+  float meshFill = (float)inUse / MeshTableCapacity;
   if (meshFill > fill) fill = meshFill;
-  if (!lists.MeshesInline && m_MeshesInline)
-    util::log::Warning("The game has more than %d meshes loaded (%d) and had to move its mesh table, it can crash after this",
+  if (overflowing && !m_MeshesOverflowed)
+    util::log::Warning("The game's mesh table went past its %d records (%d): it writes over its model instance lists, it can crash after this",
       MeshTableCapacity, lists.Meshes);
-  m_MeshesInline = lists.MeshesInline;
-  m_MeshCount = lists.Meshes;
-  if (lists.Meshes > m_MeshPeak)
-    m_MeshPeak = lists.Meshes;
+  m_MeshesOverflowed = overflowing;
+  if (inUse != g_MeshesNow)
+  {
+    g_MeshesNow = inUse;
+    g_MeshesChangedAt = now;
+  }
+  m_MeshCount = inUse;
+  m_MeshHighWater = lists.Meshes;
+  if (inUse > m_MeshPeak)
+    m_MeshPeak = inUse;
 
   m_InstanceFill = fill;
   // 1 hold back, 2 take two away, 3 at the edge of the room the game has:
@@ -1746,11 +2018,11 @@ void CameraManager::DescribeState(char* buffer, size_t size)
 {
   // For the crash note: no lock, these are only read
   sprintf_s(buffer, size, "camera %s, track %s, follow Faith %s, follow object %s 0x%I64X, world around camera %s "
-    "(distance %.0f, zone slots %d of 128, meshes %d of 4096, most %d), Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, "
+    "(distance %.0f, zone slots %d of 128, meshes in use %d of 4096, most %d, table end %d), Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, "
     "camera at %.1f %.1f %.1f",
     m_CameraEnabled ? "on" : "off", m_TrackPlayer.IsPlaying() ? "playing" : "stopped",
     m_AttachToFaith ? "on" : "off", m_AttachObject ? attach::ClassName(m_AttachTarget.Class) : "none", m_AttachObject ? m_AttachTarget.Entity : 0,
-    m_StreamAroundCamera ? "on" : "off", m_StreamDistance, (int)m_StreamSlotsPeak, (int)m_MeshCount, (int)m_MeshPeak, m_ThirdPersonApplied ? "switched" : "normal",
+    m_StreamAroundCamera ? "on" : "off", m_StreamDistance, (int)m_StreamSlotsPeak, (int)m_MeshCount, (int)m_MeshPeak, (int)m_MeshHighWater, m_ThirdPersonApplied ? "switched" : "normal",
     m_LodFix ? "on" : "off", m_ShadowDistance, m_CullOverride ? "on" : "off", m_CullScale,
     m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
 }
@@ -1797,7 +2069,7 @@ void CameraManager::DrawStatusBar()
     if (IsPlayerControllingFaith())
       ImGui::TextColored(on, "Faith has the controls");
     else
-      ImGui::TextColored(off, m_KbmDisabled ? "Faith frozen" : "Faith moves too");
+      ImGui::TextColored(off, m_KbmDisabled ? "Faith frozen" : (m_AttachToFaith ? "Faith moves, camera follows" : "Faith moves too"));
   }
 }
 
@@ -1913,7 +2185,9 @@ void CameraManager::DrawUI()
       {
         ImGui::Indent();
         float streamDistance = m_StreamDistance;
-        if (ImGui::SliderFloat("Stream distance", &streamDistance, 0.f, MaxStreamDistance,
+        float maxDistance = m_StreamInView ? MaxStreamDistanceInView : MaxStreamDistance;
+        if (streamDistance > maxDistance) streamDistance = maxDistance;
+        if (ImGui::SliderFloat("Stream distance", &streamDistance, 0.f, maxDistance,
           streamDistance > 1.f ? "%.0f m" : "nearby zones only"))
         {
           m_StreamDistance = streamDistance < 10.f ? 0.f : streamDistance;
@@ -1936,13 +2210,15 @@ void CameraManager::DrawUI()
             (void)k;
             (void)fill;
             if (m_InstancePressure >= 1)
-              ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Meshes loaded: %d of 4096, at the limit: the camera's extra zones are held back",
+              ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Meshes in use: %d of 4096, at the limit: the camera's extra zones are held back",
                 (int)m_MeshCount);
             else
-              ImGui::TextDisabled("Meshes loaded: %d of 4096 (most so far %d)", (int)m_MeshCount, (int)m_MeshPeak);
+              ImGui::TextDisabled("Meshes in use: %d of 4096 (most so far %d)", (int)m_MeshCount, (int)m_MeshPeak);
             ImGui::HelpMarker("The game has room for 4096 different meshes and crashes when the loaded "
-              "zones need more. Extra zones around the camera bring in a lot, so the tools stop adding them "
-              "at 3300, take two away at 3500 and all of them at 3700. Whatever is loaded around Faith "
+              "zones need more (meshes of zones that unloaded leave free room it uses again). Extra zones "
+              "around the camera bring in a lot, so the tools stop adding them "
+              "at 3450, take two away at 3650 and all of them at 3800 (and near the limit wait for each "
+              "zone's meshes to finish loading before adding the next). Whatever is loaded around Faith "
               "counts too, so how far the camera can load depends on where she is.");
           }
           int slots = m_StreamSlotsPeak;
@@ -1951,6 +2227,16 @@ void CameraManager::DrawUI()
           else
             ImGui::TextDisabled("Zones loaded: %d of 128", slots);
         }
+        if (ImGui::Checkbox("Only where the camera looks", &m_StreamInView))
+        {
+          if (!m_StreamInView && m_StreamDistance > MaxStreamDistance)
+            m_StreamDistance = MaxStreamDistance;
+          configChanged = true;
+        }
+        ImGui::HelpMarker("Loads the extra zones only in front of the camera (the width of the view and "
+          "a little more), not all the way round it. That's about a third of the zones and meshes, so the "
+          "stream distance can go up to 1000 m. Behind the camera only the zones next to it stay loaded, "
+          "so turning around loads the new view over a few seconds.");
         configChanged |= ImGui::Checkbox("Load ahead of the camera", &m_StreamAhead);
         ImGui::HelpMarker("Also loads where the camera is heading (about 2.5 seconds ahead at its current "
           "speed), so zones are loading before it reaches them and less pops in while flying.");
@@ -2079,7 +2365,8 @@ void CameraManager::DrawUI()
 
     configChanged |= ImGui::Checkbox("Show Faith's body", &m_ThirdPersonToggle);
     ImGui::HelpMarker("Switches the game to Faith's third-person body while the camera is on, so she "
-      "can be seen, like the original tools. Used the next time the camera is turned on.");
+      "can be seen, like the original tools, with her hair (which the original tools lost). Used the "
+      "next time the camera is turned on.");
   }
 
   if (ImGui::CollapsingHeader("Keys"))
@@ -2149,9 +2436,11 @@ void CameraManager::ReadConfig(INIReader* pReader)
   m_StreamAroundCamera = pReader->GetBoolean("Misc", "StreamAroundCamera", false);
   m_StreamAhead = pReader->GetBoolean("Misc", "StreamAhead", true);
   m_StreamTrack = pReader->GetBoolean("Misc", "StreamTrack", true);
+  m_StreamInView = pReader->GetBoolean("Misc", "StreamInView", false);
   m_StreamDistance = (float)pReader->GetReal("Misc", "StreamDistance", 0.0);
   if (m_StreamDistance < 0) m_StreamDistance = 0;
-  if (m_StreamDistance > MaxStreamDistance) m_StreamDistance = MaxStreamDistance;
+  float maxStreamDistance = m_StreamInView ? MaxStreamDistanceInView : MaxStreamDistance;
+  if (m_StreamDistance > maxStreamDistance) m_StreamDistance = maxStreamDistance;
 
   m_MotionBlurOverride = pReader->GetBoolean("Misc", "MotionBlurOverride", false);
   m_MotionBlurEnable = pReader->GetBoolean("Misc", "MotionBlurEnable", true);
@@ -2212,6 +2501,7 @@ const std::string CameraManager::GetConfig()
   config += std::string("StreamAroundCamera = ") + (m_StreamAroundCamera ? "true" : "false") + "\n";
   config += std::string("StreamAhead = ") + (m_StreamAhead ? "true" : "false") + "\n";
   config += std::string("StreamTrack = ") + (m_StreamTrack ? "true" : "false") + "\n";
+  config += std::string("StreamInView = ") + (m_StreamInView ? "true" : "false") + "\n";
   config += "StreamDistance = " + std::to_string(m_StreamDistance) + "\n\n";
   config += "[Follow]\n";
   config += std::string("TurnWithIt = ") + (m_AttachRotation ? "true" : "false") + "\n";
@@ -2556,9 +2846,13 @@ void CameraManager::ApplyFieldOfView(float fov)
 void CameraManager::SetThirdPersonBody(bool enable)
 {
   // Does what the original tools' camera toggle did (sub_1800034c0 in
-  // CT_MirrorsEdge.dll): switches a player view mode value and detaches
-  // the local player's camera entity while the free camera is on.
-  // What the values mean is a guess, the code is copied as-is.
+  // CT_MirrorsEdge.dll). OFFSET_3PTOGGLE is FPSCamera's vtable, and what its
+  // first function returns is FPSCamera's type info: +0x28 is its class id
+  // range (0xED..0xED). 0xF2..0 makes nothing count as an FPSCamera any more,
+  // so the game draws Faith's whole body. Her own camera is unlinked too,
+  // otherwise it still hides her head, but only after half a second (see
+  // UnlinkFaithCamera): her hair cloth is only switched on or off while it's
+  // linked, so it has to come on first (ApplyHairFix keeps it on).
   typedef __int64(__fastcall* tGetViewSettings)(void*);
 
   // Same as GetPlayerTransform: no crash if the player is half loaded
@@ -2567,8 +2861,7 @@ void CameraManager::SetThirdPersonBody(bool enable)
     __int64* pEntityPair = GetPlayerEntityPair();
     if (!pEntityPair || !m_p3PToggle) return;
 
-    // OFFSET_3PTOGGLE is a vtable, its first function returns the settings
-    // object. The original passed the function's own address in rcx.
+    // FPSCamera's getType. The original passed the function's own address in rcx.
     tGetViewSettings getViewSettings = *(tGetViewSettings*)m_p3PToggle;
     __int64 pViewSettings = getViewSettings((void*)getViewSettings);
     if (!pViewSettings) return;
@@ -2580,10 +2873,11 @@ void CameraManager::SetThirdPersonBody(bool enable)
       m_ThirdPersonEntity = pEntity;
       m_ThirdPersonLink = *(__int64*)(pEntity + 0x150);
       *(DWORD*)(pViewSettings + 0x28) = 0xF2;
-      *(__int64*)(pEntity + 0x150) = 0;
+      m_ThirdPersonUnlinkAt = GetTickCount64() + ThirdPersonUnlinkDelayMs;
     }
     else
     {
+      m_ThirdPersonUnlinkAt = 0;
       *(DWORD*)(pViewSettings + 0x28) = 0x00ED00ED;
       // Only on the same Faith, and only if the game hasn't linked its own
       // camera since. After a respawn or a level load the player is a new
@@ -2598,6 +2892,24 @@ void CameraManager::SetThirdPersonBody(bool enable)
   __except (EXCEPTION_EXECUTE_HANDLER)
   {
     util::log::Warning("Couldn't switch Faith's third-person body, is a level loaded?");
+  }
+}
+
+void CameraManager::UnlinkFaithCamera()
+{
+  // The second half of the body switch: unlinked, her own camera no longer
+  // hides her head. Only on the same Faith, with the link the switch saw.
+  __try
+  {
+    __int64* pEntityPair = GetPlayerEntityPair();
+    if (!pEntityPair) return;
+    __int64 pEntity = pEntityPair[0];
+    if (pEntity == m_ThirdPersonEntity && *(__int64*)(pEntity + 0x150) == m_ThirdPersonLink)
+      *(__int64*)(pEntity + 0x150) = 0;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER)
+  {
+    util::log::Warning("Couldn't unlink Faith's camera, is a level loaded?");
   }
 }
 

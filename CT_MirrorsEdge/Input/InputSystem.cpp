@@ -372,17 +372,18 @@ void InputSystem::ActionUpdate()
     // While typing into the UI only the UI toggle is read, so it can always be closed
     bool uiHasKeyboard = g_mainHandle->GetUI()->HasKeyboardFocus();
     bool capturing = IsCapturing();
+    // The camera's movement keys are Faith's while it follows her (the arrow
+    // keys, FOV keys and gamepad still move the camera)
+    bool movementKeysForFaith = g_mainHandle->GetCameraManager()->IsMovementKeysForFaith();
     {
       for (int i = 0; i < Action::ActionCount; ++i)
       {
         if (capturing || (uiHasKeyboard && i != Action::ToggleUI))
           continue;
+        if (movementKeysForFaith && i >= Camera_Forward && i <= Camera_Down)
+          continue;
 
         int key = m_KeyboardBindings[i];
-
-        //if (!g_mainHandle->GetCameraManager()->IsKbmDisabled() &&
-        //  i >= Camera_Forward && i <= Camera_Down)
-        //  key = pInputMgr->m_keyboardMap[i + 14];
 
         // GetAsyncKeyState because this runs on the tools' own thread,
         // which has no message queue for GetKeyState to follow

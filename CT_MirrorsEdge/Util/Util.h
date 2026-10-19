@@ -67,6 +67,11 @@ namespace util
     __int64 GetOffset(std::string const& name);
   }
 
+  // MECMP (the multiplayer mod) is in the game: mecmp.dll is loaded, by its
+  // injector or its version.dll. The tools leave the time of day alone then.
+  // Looked up at most once a second, from any thread.
+  bool IsMecmpLoaded();
+
   bool GetResource(int, void*&, DWORD&);
   std::string VkToString(DWORD vk);
   std::string KeyLparamToString(LPARAM lparam);

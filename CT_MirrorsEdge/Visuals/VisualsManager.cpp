@@ -232,6 +232,8 @@ float* VisualsManager::GetTimeOfDay()
 void VisualsManager::UpdateTimeOfDay()
 {
   if (!m_TodFreeze && !m_TodFix && !m_TrackTodActive) return;
+  // With MECMP in the game the clock is left as the game has it
+  if (util::IsMecmpLoaded()) return;
   if (!IsLevelLoaded()) return;
 
   float* pTime = GetTimeOfDay();
@@ -255,6 +257,7 @@ float VisualsManager::GetCurrentTimeOfDay()
 void VisualsManager::SetTimeOfDay(float seconds)
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
+  if (util::IsMecmpLoaded()) return;
   float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
   if (!pTime || seconds < 0) return;
 
@@ -265,6 +268,7 @@ void VisualsManager::SetTimeOfDay(float seconds)
 void VisualsManager::SetTrackTimeOfDay(float seconds)
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
+  if (util::IsMecmpLoaded()) return;
   m_TrackTod = seconds;
   m_TrackTodActive = true;
 
@@ -272,6 +276,12 @@ void VisualsManager::SetTrackTimeOfDay(float seconds)
   float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
   if (pTime)
     *pTime = seconds;
+}
+
+void VisualsManager::KeepClock()
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  UpdateTimeOfDay();
 }
 
 void VisualsManager::StopTrackTimeOfDay()
@@ -288,6 +298,14 @@ void VisualsManager::DrawTimeOfDayUI()
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
 
+  if (util::IsMecmpLoaded())
+  {
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextDisabled("Time of day: MECMP (multiplayer) is open, so these controls are disabled "
+      "because MECMP syncs the time of day.");
+    ImGui::PopTextWrapPos();
+    return;
+  }
   float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
   if (!pTime)
   {
@@ -306,6 +324,21 @@ void VisualsManager::DrawTimeOfDayUI()
     m_TodFrozenValue = time;
   }
   ImGui::HelpMarker("Midnight on the left, noon in the middle. Ctrl+click to type the time in seconds (0 - 86400).");
+
+  // Steps of 10 minutes, round the clock past midnight
+  float step = 0.f;
+  if (ImGui::Button("- 10 min"))
+    step = -600.f;
+  ImGui::SameLine();
+  if (ImGui::Button("+ 10 min"))
+    step = 600.f;
+  if (step != 0.f)
+  {
+    time = fmodf(time + step + 86400.f, 86400.f);
+    *pTime = time;
+    m_TodFrozenValue = time;
+  }
+
   if (m_TrackTodActive)
     ImGui::TextDisabled("The camera track is setting the time of day");
 
@@ -335,8 +368,9 @@ void VisualsManager::OnVisualEnvironmentUpdate(bool beforeGameUpdate)
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
 
-  if (beforeGameUpdate)
-    UpdateTimeOfDay();
+  // Before and after the game's update, so the clock the game moves on during
+  // its update is put back straight away
+  UpdateTimeOfDay();
 
   Component const& dof = m_Components[1];
   bool anyOverride = m_DofMethodApplied;

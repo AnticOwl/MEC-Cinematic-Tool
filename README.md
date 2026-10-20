@@ -106,7 +106,7 @@ camera, ahead of it and along the selected track:
 ## Credits and license
 
 - [Hattiwatti](https://github.com/Hattiwatti) for the original tools and the CinematicTools
-  template (used with his permission)
+  template
 - MEC-TC (Mirror's Edge Catalyst Time Changer) for the time of day address and the stuck clock fix
 - [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui)
   and [inih](https://github.com/benhoyt/inih)

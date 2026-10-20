@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The status bar under the tabs shows the camera's position (x, y, z) while it's on.
+
 ## Version 1.2.1
 
 - **Fixed: crashes with the stream distance up** (also after alt-tabbing). The renderer files the

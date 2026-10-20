@@ -2331,6 +2331,10 @@ void CameraManager::DrawStatusBar()
       ImGui::TextColored(on, "Faith has the controls");
     else
       ImGui::TextColored(off, m_KbmDisabled ? "Faith frozen" : (m_AttachToFaith ? "Faith moves, camera follows" : "Faith moves too"));
+
+    // Where the camera is, every frame (game coordinates, y is up)
+    separator();
+    ImGui::TextColored(off, "x %.1f  y %.1f  z %.1f", m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
   }
 }
 

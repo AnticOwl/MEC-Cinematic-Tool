@@ -116,8 +116,9 @@ Reset all hotkeys need a second click.
 
 - **CAMERA**, in collapsible sections:
   - *Turn camera on / off* and *Move camera to Faith* (turns the camera on at Faith's head).
-  - *Camera tracks*: the tracks (new, rename, delete), play / stop with a progress bar, playback
-    speed, add / delete keyframes, and the keyframe list (the one playing is highlighted).
+  - *Camera tracks*: the tracks (new, rename, delete), play / stop and pause / resume with a
+    progress bar (paused, the camera holds on that frame until you resume), playback speed, add /
+    delete keyframes, and the keyframe list (the one playing is highlighted).
     *Keyframe options*: what the keyframes control (rotation, field of view, motion blur), play
     manually, time between new keyframes and how new keyframes move. *Playback options*: *Faith
     keeps control while a track plays* (on by default: during playback the game gets your keyboard,
@@ -183,6 +184,8 @@ camera's zones the way it does when its own foci move on. The log (`Cinematic To
 when each streamer gets or loses the camera focus. If it doesn't help somewhere, moving Faith there
 still works (*Faith keeps control* lets you run with a track playing).
 
+Some safe houses may or may not load with *Load the world around the camera*.
+
 Props popping in while flying are zones that only start loading once the camera gets near them.
 *Stream distance* (0 - 600 m, off by default) loads the city that far around the camera too: the
 tools add rings of foci about 200 m apart around it (up to 39), and each loads its zone and the
@@ -201,19 +204,40 @@ and crashes when the loaded zones need more (it adds them past the end of its ta
 model instance lists stored after it). A mesh that unloads leaves a free record the game uses
 again, so the table's end only shows the most there ever were; the tools count the records in
 use. Extra zones bring in a lot of meshes, and whatever is loaded around Faith counts too. The
-tools watch that count (*Meshes in use: N of 4096* in the menu): they stop adding
-zones at 3450, take two away at 3650, and at 3800 take the camera's own zones away as well. From
-2800 meshes on, another focus is only added once the count has stood still for a second, so the
-meshes of two foci's zones can't arrive at once.
-How far around the camera can be loaded therefore depends on the area. (They also ask for more
-room for model instances from the next level load, which the game has plenty of already.) The
-menu shows *Zones loaded: N of 128*, in yellow when zones are being held back. The rings move in
-100 m steps rather than with every bit of camera movement.
+tools watch that count (*Meshes in use: N of 4096* in the menu): they stop adding zones at 3450,
+take two away at 3650, and at 3800 take the camera's own zones away as well. From 2800 meshes on,
+another focus is only added once the count hasn't risen (by more than 16) for a second, so the
+meshes of two foci's zones can't arrive at once. Model instances (every model placed in a loaded
+zone) work the same way: the game reuses free slots, so the tools count the ones in use (*Model
+instances in use* in the menu), hold zones back from 80 % of the room and take some away from
+90 %. They always ask for four times the game's room from the next level load (quit to the main
+menu and continue once after starting the game to get it). How far around the camera can be
+loaded therefore depends on the area.
+
+The renderer has two limits of its own. It files every instance it draws into a few draw
+batches, and one batch has room for 111872 at once; past that the game crashes, so the tools watch
+the fullest (*Renderer draw batch*), stop adding zones at 70 %, take some away from 80 % and all
+from 88 %. And it keeps the instances of every kind of mesh it has drawn in one block of memory
+that it sets aside when the game starts and doesn't give back during play; past its end the game
+crashes. The level alone takes a third of the game's 16 MB, so the tools make it 64 MB as the
+game starts (the log says so), show how full it is (*Renderer instance memory*), stop adding zones
+around the camera at 70 %, take them away from 80 % and the camera's own from 88 %. It doesn't
+empty again, so past 80 % the camera's extra zones stay away.
+
+*Unrestricted* (off by default) ignores both renderer limits, the way it was before they were
+watched: more of the city loads far away, but the game crashes when a draw batch runs out (in
+tests about a minute into flying at 1000 m with Fix LOD on). The menu and the status bar show a
+red warning while it's on. The game's other limits (zone slots, meshes, model instances) still
+apply.
+
+The menu shows *Zones loaded: N of 128*, in yellow when zones are being held back. The rings move
+in 100 m steps rather than with every bit of camera movement.
 
 *Only where the camera looks* (off by default) puts the rings' foci only in front of the camera:
-the width of the view plus 20 degrees each side. That's about a third of the zones and meshes,
-so with it the stream distance goes up to 1000 m. Behind the camera only the zones next to it stay
-loaded, so after turning around the new view loads over a few seconds.
+the width of the view plus 20 degrees each side. Each point keeps its own focus while it's in
+view, so turning only loads and unloads at the edges of the view. That's about a third of the
+zones and meshes, so with it the stream distance goes up to 1000 m. Behind the camera only the
+zones next to it stay loaded, so after turning around the new view loads over a few seconds.
 
 Two sub-options (both on by default) load more in advance:
 
@@ -250,14 +274,15 @@ flying traffic) and *Other* (drones, vehicles, props, lifts and platforms that m
 30 seconds) filter it, and *Only moving* hides what stands still. With *On
 screen* every listed object gets a dot in the game view (brighter when it moves), the one under
 the mouse gets a white ring with its name, and the one being followed a red ring. **Click a row to
-follow it.**
+follow it**: the camera goes behind it and a little above, looking at it, so *Turn with it* works
+like a chase camera.
 
-*Put the camera next to what I pick* (on by default) puts the camera behind the object and a
-little above, looking at it, so *Turn with it* works like a chase camera. Without it the camera
-stays where it is and moves along with the object from there; with *Turn with it* on that swings
-the camera around the object at that distance, a long way for something far off. *Go next to it*
-does the same placement later. *Let go* stops following; *Tilt with it too* also uses its pitch
-and roll (a drone banking, flying traffic climbing).
+*Put the camera next to what I aim at* (on by default) does the same placement for *Attach to what
+the camera looks at* (below). Without it the camera stays where it is and moves along with the
+object from there; with *Turn with it* on that swings the camera around the object at that
+distance, a long way for something far off. *Go next to it* does the placement again later. *Let
+go* stops following; *Tilt with it too* also uses its pitch and roll (a drone banking, flying
+traffic climbing).
 
 *Smoothing* (0.4 by default) makes the camera follow a copy of the object that catches up over a
 moment (up to half a second at 1) instead of every small step: the swarm moves its members in
@@ -272,7 +297,7 @@ in view for a quarter of a second before it decides (that's how it tells what mo
 clicking a row, *Let go* or *Follow Faith* in that time cancels it.
 
 The FOLLOW tab's settings (*Turn with it*, *Tilt with it too*, *Put the camera next to what I
-pick*, *Smoothing*, *Crosshair*, the list's range, filters and *On screen*) are saved in
+aim at*, *Smoothing*, *Crosshair*, the list's range, filters and *On screen*) are saved in
 `Cinematic Tools\config.ini` under `[Follow]`.
 
 What can be followed:

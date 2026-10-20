@@ -1,5 +1,46 @@
 # Changelog
 
+## Version 1.2.1
+
+- **Fixed: crashes with the stream distance up** (also after alt-tabbing). The renderer files the
+  instances it draws into a few draw batches, and one batch has room for 111872 at once; past that
+  it writes over its own memory and crashes. Loading far around the camera (106000 model
+  instances) got there. The tools now watch the fullest batch (*Renderer draw batch* in the menu),
+  stop adding zones around the camera at 70 %, take some away from 80 % and all of them from 88 %.
+- *Unrestricted* (stream distance, off by default) ignores those two renderer limits, as before
+  they were watched: more loads far away, but the game can crash. A red warning in the menu and
+  the status bar shows while it's on, and the log notes it.
+- The renderer's memory for those instances, which it sets aside once when the game starts (16 MB)
+  and doesn't give back during play, is made 64 MB as the game starts. The level alone takes
+  5.5 MB, and far streaming took the rest in seconds. The tools also watch it (*Renderer instance
+  memory*).
+- **Fixed: the free camera's mouse look stopping.** It read the mouse through DirectInput in
+  background mode, which runs on a low-level hook that Windows silently removes when the game
+  is busy. It now reads the game's own raw input, so the mouse wheel's field of view zoom works
+  too. Mouse movement from while the game stalls (loading screens) is dropped rather than turning
+  the camera all at once afterwards.
+- **Fixed: loading around the camera doing nothing**, worst after a teleport (fast travel to a
+  safe house). The tools went by the end of the game's model instance list, but the instances of
+  zones that unloaded leave free slots the game uses again (33180 of 60123 after a teleport in a
+  test). They now count the instances in use, as they do with meshes.
+- *Only where the camera looks*: each point in view keeps its own focus while the camera turns,
+  so turning only loads and unloads zones at the edges of the view.
+- Near the mesh limit the tools only wait while meshes are still arriving, not for every small
+  change in the count.
+- The tools always ask for more room for model instances from the next level load, also with
+  *Load the world around the camera* off.
+- The menu also shows the model instances in use, and the menu and log say which limit holds the
+  camera's zones back.
+- The menu and README note that some safe houses may or may not load with *Load the world around
+  the camera*.
+- **Fixed: clicking a row in the FOLLOW tab's *Nearby* list seeming to do nothing.** It did start
+  following, but with *Put the camera next to what I pick* off the camera stayed where it was, often
+  far away or facing elsewhere. A click now always puts the camera next to what was clicked; the
+  checkbox, now *Put the camera next to what I aim at*, is only for *Attach to what the camera
+  looks at*.
+- *Pause* / *Resume* next to *Play* / *Stop*: a paused track holds the camera on that frame, and
+  carries on from there. The status bar says when it's paused.
+
 ## Version 1.2
 
 - **Fixed: Faith's hair missing with *Show Faith's body*** (the original tools lost it too). Her

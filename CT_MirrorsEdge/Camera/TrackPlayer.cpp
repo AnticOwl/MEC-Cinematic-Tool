@@ -234,6 +234,7 @@ void TrackPlayer::Toggle()
   }
 
   m_IsPlaying = true;
+  m_IsPaused = false;
   m_CurrentTime = 0;
   m_CurrentNode = 0;
   util::log::Write("Playing %s, %.2f seconds", m_Tracks[m_SelectedTrack].Name.c_str(), nodes.back().TimeStamp / m_PlaybackSpeed);
@@ -244,7 +245,16 @@ void TrackPlayer::Stop()
   if (!m_IsPlaying) return;
 
   m_IsPlaying = false;
+  m_IsPaused = false;
   util::log::Write("Track stopped");
+}
+
+void TrackPlayer::TogglePause()
+{
+  if (!m_IsPlaying) return;
+
+  m_IsPaused = !m_IsPaused;
+  util::log::Write("Track %s at %.2f s", m_IsPaused ? "paused" : "resumed", m_CurrentTime);
 }
 
 CatmullRomNode TrackPlayer::PlayForward(double dt, bool ignoreManual /* = false */)
@@ -253,19 +263,24 @@ CatmullRomNode TrackPlayer::PlayForward(double dt, bool ignoreManual /* = false 
   if (nodes.size() < 2)
   {
     m_IsPlaying = false;
+    m_IsPaused = false;
     return nodes.empty() ? CatmullRomNode() : nodes[0];
   }
 
   // If manual play is enabled, time is moved with the Up/Down
   // actions (triggers on a gamepad). IgnoreManual is for previews.
-  if (!m_ManualPlay || ignoreManual)
-    m_CurrentTime += dt * m_PlaybackSpeed;
-  else
+  // Paused, it stays where it is and the camera holds on that frame.
+  if (!m_IsPaused)
   {
-    InputSystem* pInput = g_mainHandle->GetInputSystem();
-    float input = pInput->GetActionState(Action::Camera_Up) - pInput->GetActionState(Action::Camera_Down);
-    // Quadratic response that keeps the direction, so it can go backwards too
-    m_CurrentTime += dt * input * std::fabs(input) * m_PlaybackSpeed;
+    if (!m_ManualPlay || ignoreManual)
+      m_CurrentTime += dt * m_PlaybackSpeed;
+    else
+    {
+      InputSystem* pInput = g_mainHandle->GetInputSystem();
+      float input = pInput->GetActionState(Action::Camera_Up) - pInput->GetActionState(Action::Camera_Down);
+      // Quadratic response that keeps the direction, so it can go backwards too
+      m_CurrentTime += dt * input * std::fabs(input) * m_PlaybackSpeed;
+    }
   }
 
   // Clamp to the ends of the track
@@ -284,6 +299,7 @@ CatmullRomNode TrackPlayer::PlayForward(double dt, bool ignoreManual /* = false 
     if (!m_ManualPlay)
     {
       m_IsPlaying = false;
+      m_IsPaused = false;
       util::log::Write("Track finished");
     }
     return nodes.back();
@@ -442,8 +458,20 @@ void TrackPlayer::DrawUI(Camera& camera, bool cameraEnabled)
     if (ImGui::Button(label, ImVec2(fontSize * 8.f, 0)))
       Toggle();
     ImGui::SameLine();
+    // Pause / resume, always there so the row doesn't move, faint until a track plays
+    bool canPause = m_IsPlaying;
+    if (!canPause)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.4f);
+    if (ImGui::Button(IsPaused() ? "Resume###PauseTrack" : "Pause###PauseTrack", ImVec2(fontSize * 5.f, 0)) && canPause)
+      TogglePause();
+    if (!canPause)
+      ImGui::PopStyleVar();
+    if (canPause)
+      ImGui::ItemTooltip(IsPaused() ? "Carries on playing from here."
+        : "Holds the track where it is: the camera stays on this frame until Resume (Stop ends the track).");
+    ImGui::SameLine();
     double shownTime = m_IsPlaying ? m_CurrentTime : 0.0;
-    sprintf_s(label, "%.2f / %.2f s", shownTime, trackLength);
+    sprintf_s(label, "%.2f / %.2f s%s", shownTime, trackLength, IsPaused() ? "  (paused)" : "");
     ImGui::ProgressBar(trackLength > 0 ? (float)(shownTime / trackLength) : 0.f, ImVec2(-1, 0), label);
   }
 

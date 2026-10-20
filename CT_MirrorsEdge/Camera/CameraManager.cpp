@@ -48,11 +48,11 @@ namespace
   const int ZoneFocusCountOffset    = 0x48;  // focus list -> record count, uint32
   const unsigned int ZoneFocusRemoved = 1;   // record flag, the record goes after the next update
   const unsigned int MaxZoneFoci    = 256;   // the game has a handful, more means the list isn't valid
-  const int MaxStreamingFoci = 72;        // the tools' own: camera, ahead, rings, track points
+  const int MaxStreamingFoci = 88;        // the tools' own: camera, ahead, rings, track points
   const int FocusCamera = 0;
   const int FocusAhead = 1;
   const int FocusRingFirst = 2;           // rings around the camera, out to the stream distance
-  const int MaxRingFoci = 40;             // enough for 600 m
+  const int MaxRingFoci = 56;             // 600 m all round (39), 1000 m in view (up to 56)
   const int FocusTrackFirst = FocusRingFirst + MaxRingFoci;
   const float RingSpacing = 200.f;        // between the rings, and between the points on one
   const float MaxStreamDistance = 600.f;  // all round; the zone slot and mesh limits hold back what doesn't fit
@@ -182,6 +182,133 @@ namespace
   const int InstanceRecordSize = 0x20;
   const int StreamingSettingsOffset = 0x386480; // MeshStreamingSettings*
   const int ReservedCountOffset = 0x58;         // positioned at +0x58, distanced at +0x5C
+  // A new instance takes a free slot if there is one, and only with none left
+  // does the list grow (0x1435447E0). The free slots are a linked list per
+  // instance list, 0x6060 apart, with its length at +0x10. So a list's end
+  // only shows the most there ever were; what counts is the end minus the
+  // free slots (a teleport leaves a lot of them behind).
+  const int InstanceFreeListOffset = 0x3500B0;
+  const int InstanceFreeListStride = 0x6060;
+  const int InstanceFreeCountOffset = 0x10;
+
+  // The renderer keeps the bounds of each mesh's instances in chunks of 64
+  // (0x2D80 bytes) that it takes from one arena (0x1436C3960): a global at
+  // 0x142568C00 with the next free byte (+0), the start (+8) and the size
+  // (+0x10: 16 MB, or 64 MB when the tools got there first, see
+  // EnlargeRenderArena in Offsets.cpp), set aside once when the game starts
+  // (0x1436D4CE0). Chunks
+  // are only given back when the renderer is torn down, and nothing checks the
+  // end: past it they're written over other memory and the game crashes.
+  // Every kind of mesh the camera's zones bring in can take more, so the tools
+  // stop well before. PE timestamp 0x5762E3B7 only.
+  const __int64 RenderArenaRva = 0x2568C00;
+  const DWORD RenderArenaTimeStamp = 0x5762E3B7;
+  const float ArenaStopAdding = 0.70f; // no more zones around the camera
+  const float ArenaTakeAway = 0.80f;   // the extra zones go (its use doesn't go down, but moving foci would load more)
+  const float ArenaTakeAll = 0.88f;    // the camera's own too
+
+  bool IsRenderArenaBuild()
+  {
+    IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)g_gameHandle;
+    IMAGE_NT_HEADERS* pNt = (IMAGE_NT_HEADERS*)((BYTE*)g_gameHandle + pDos->e_lfanew);
+    return pNt->FileHeader.TimeDateStamp == RenderArenaTimeStamp;
+  }
+
+  // The renderer files every instance into a draw batch: per renderer object
+  // (two, found through the array at 0x1424A9B98, owner + 0x48, vtable
+  // 0x141BF41D0) four categories (+0x90, 0x28980 bytes each) of up to 9
+  // batches (count at +0x28978), 0x4808 bytes each. A batch has room for 2048
+  // chunk pointers (+0x130), its chunk count (+0x4130) and one fill byte per
+  // chunk (+0x4134), which only has room for 1748 chunks. A new instance goes
+  // into the first chunk that isn't full, and only when all are full does the
+  // batch take another chunk, with no check: past 1748 the fill bytes go into
+  // the next batch, and at 2048 the new chunk's address goes over the batch's
+  // own count. Then the bounds job (0x1436D5A00) writes to a garbage address.
+  // So the most a batch can take is 1748 x 64 instances in it at once, and
+  // unloading zones gives room back (0x1436D27A0 takes the instance out).
+  const __int64 RendererOwnersRva = 0x24A9B98;
+  const int RendererOwnerCount = 2;
+  const int RendererOffset = 0x48;
+  const __int64 RendererVTableRva = 0x1BF41D0;
+  const int RendererCategoryOffset = 0x90;
+  const int RendererCategories = 4;
+  const int BatchCountOffset = 0x28978;
+  const int MaxBatches = 9;
+  const int BatchStride = 0x4808;
+  const int BatchChunkCountOffset = 0x4130;
+  const int BatchFillOffset = 0x4134;
+  const int BatchMaxChunks = 1748;
+  const int BatchCapacity = BatchMaxChunks * 64;
+  const float BatchStopAdding = 0.70f;
+  const float BatchTakeAway = 0.80f;
+  const float BatchTakeAll = 0.88f;
+
+  // The fullest batch of both renderer objects: its instances and its chunk
+  // count. False if no renderer object is there (no level).
+  bool ReadFullestBatch(int& instances, int& chunks)
+  {
+    __int64 base = (__int64)g_gameHandle;
+    instances = chunks = 0;
+    bool any = false;
+    __try
+    {
+      for (int o = 0; o < RendererOwnerCount; ++o)
+      {
+        __int64 pOwner = *(__int64*)(base + RendererOwnersRva + o * 8);
+        if (pOwner < 0x10000) continue;
+        __int64 pRenderer = *(__int64*)(pOwner + RendererOffset);
+        if (pRenderer < 0x10000 || *(__int64*)pRenderer != base + RendererVTableRva) continue;
+        any = true;
+        for (int c = 0; c < RendererCategories; ++c)
+        {
+          __int64 pCategory = *(__int64*)(pRenderer + RendererCategoryOffset + c * 8);
+          if (pCategory < 0x10000) continue;
+          int batches = *(int*)(pCategory + BatchCountOffset);
+          if (batches > MaxBatches) batches = MaxBatches;
+          for (int b = 0; b < batches; ++b)
+          {
+            BYTE* pBatch = (BYTE*)(pCategory + (__int64)b * BatchStride);
+            int count = *(int*)(pBatch + BatchChunkCountOffset);
+            if (count <= 0) continue;
+            int readable = count > BatchMaxChunks ? BatchMaxChunks : count;
+            int sum = 0;
+            for (int i = 0; i < readable; ++i)
+              sum += pBatch[BatchFillOffset + i];
+            if (count > BatchMaxChunks) sum = BatchCapacity; // already past its room
+            if (sum > instances)
+            {
+              instances = sum;
+              chunks = count;
+            }
+          }
+        }
+      }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+    return any;
+  }
+
+  bool ReadRenderArena(__int64& used, __int64& size)
+  {
+    __try
+    {
+      __int64* pArena = (__int64*)((__int64)g_gameHandle + RenderArenaRva);
+      __int64 next = pArena[0], start = pArena[1];
+      unsigned int bytes = *(unsigned int*)(pArena + 2);
+      if (!start || next < start || !bytes)
+        return false;
+      used = next - start;
+      size = bytes;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
 
   // The mesh table: a vector at +0x50 (begin, end, capacity) with room for
   // 4096 meshes of 0x350 bytes inside the manager (+0x70 up to the instance
@@ -200,14 +327,17 @@ namespace
   const int MeshesTakeAway = 3650;   // two of the camera's extra zones go
   const int MeshesTakeAll = 3800;    // all of them go, the camera's own too
   // The meshes of a focus's zones register in bursts as they load. Near the
-  // limit another focus is only added once the count has stood still this
-  // long, so two foci's bursts can't land on top of each other. (Further
+  // limit another focus is only added once the count has stopped rising (by
+  // more than MeshesBurst) for this long, so two foci's bursts can't land on
+  // top of each other. (Further
   // down the game's own streaming around Faith keeps the count moving, and a
   // burst can't reach the limit anyway.)
   const int MeshesSettleFrom = 2800;
   const ULONGLONG MeshesSettleMs = 1000;
+  const int MeshesBurst = 16;            // smaller rises (and drops) don't count as arriving
   std::atomic<ULONGLONG> g_MeshesChangedAt{ 0 };
   std::atomic<int> g_MeshesNow{ 0 };
+  int g_MeshesMark = 0;                  // camera hook only (game thread)
 
   bool MeshesSettled()
   {
@@ -216,7 +346,8 @@ namespace
 
   struct InstanceLists
   {
-    int Count[2];
+    int Count[2];   // up to the end
+    int Free[2];    // free slots before the end
     int Capacity[2];
     int Reserved[2];
     __int64 Begin[2];
@@ -263,6 +394,8 @@ namespace
         lists.Begin[k] = begin;
         lists.Count[k] = begin ? (int)((end - begin) / InstanceRecordSize) : 0;
         lists.Capacity[k] = begin ? (int)((capacity - begin) / InstanceRecordSize) : 0;
+        int free = *(int*)(pManager + InstanceFreeListOffset + k * InstanceFreeListStride + InstanceFreeCountOffset);
+        lists.Free[k] = free >= 0 && free <= lists.Count[k] ? free : 0;
       }
 
       __int64* pMeshes = (__int64*)(pManager + MeshTableOffset);
@@ -369,7 +502,12 @@ namespace
             removed++;
           }
         }
-        limited = true;
+        // Held back: some of the camera's were taken away or are waiting
+        // (with the camera off there are none, and nothing to say)
+        bool waiting = false;
+        for (int i = 0; i < MaxStreamingFoci; ++i)
+          waiting |= wanted[i] && !present[i];
+        limited = removed > 0 || waiting;
       }
       else
       {
@@ -502,7 +640,7 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   XMFLOAT3 mouseState = g_mainHandle->GetInputSystem()->GetMouseState();
   // Only used when the wheel hook isn't there; the menu ignores it unless
   // the mouse is over a menu window
-  g_mainHandle->GetUI()->AddWheelFromDirectInput(mouseState.z / WHEEL_DELTA);
+  g_mainHandle->GetUI()->AddWheelFromRawInput(mouseState.z / WHEEL_DELTA);
 
   std::lock_guard<std::mutex> lock(m_Mutex);
 
@@ -629,12 +767,15 @@ void CameraManager::PublishStreamingFocus(double dt)
     float lookLength = sqrtf(lookX * lookX + lookZ * lookZ);
     bool inViewOnly = m_StreamInView && lookLength > 0.1f; // straight up or down: all round
     float minDot = -2.f;
+    float viewFraction = 1.f; // of a ring's points, the most that can be in view
     if (inViewOnly)
     {
       lookX /= lookLength;
       lookZ /= lookLength;
       float halfWidth = atanf(tanf(m_ViewFovY * 0.5f) * m_ViewAspect) + ViewConeMargin;
-      minDot = cosf(halfWidth < 1.5707963f ? halfWidth : 1.5707963f);
+      if (halfWidth > 1.5707963f) halfWidth = 1.5707963f;
+      minDot = cosf(halfWidth);
+      viewFraction = halfWidth / XM_PI;
     }
     // Centred on a point that moves in 100 m steps: rings that followed the
     // camera exactly would load and unload zones at their edges all the time
@@ -648,9 +789,24 @@ void CameraManager::PublishStreamingFocus(double dt)
       float radius = distance * ring / rings;
       int count = (int)ceilf(XM_2PI * radius / RingSpacing);
       if (count < 6) count = 6;
-      XMVECTOR points[64];
-      int kept = 0;
-      for (int k = 0; k < count && kept < 64; ++k)
+      // All round, every point has its own slot. Only where the camera looks,
+      // a ring gets as many slots as it can have points in view (and two
+      // more), and point k uses slot k mod that: turning the camera then
+      // only changes the points at the edges of the view, the others keep
+      // their slots and their zones. Where the points in view go past k = 0
+      // two of them can come to the same slot (19 points in 9 slots: 18 and 0
+      // both get slot 0); the second then takes a free slot of the ring.
+      int span = count;
+      if (inViewOnly)
+      {
+        span = (int)ceilf(count * viewFraction) + 2;
+        if (span > count) span = count;
+      }
+      if (slot + span > FocusRingFirst + MaxRingFoci)
+        break; // a whole ring (or its part in view) or none, never half of one
+      XMVECTOR displaced[64]; // up to 32 points on a ring (1000 m)
+      int displacedCount = 0;
+      for (int k = 0; k < count; ++k)
       {
         float angle = XM_2PI * k / count + ring * 0.5f; // rings turned against each other
         XMVECTOR point = centre + XMVectorSet(cosf(angle) * radius, 0, sinf(angle) * radius, 0);
@@ -663,15 +819,26 @@ void CameraManager::PublishStreamingFocus(double dt)
           if (length > 1.f && (dx * lookX + dz * lookZ) / length < minDot)
             continue;
         }
-        points[kept++] = point;
+        int s = slot + k % span;
+        if (wanted[s])
+        {
+          if (displacedCount < 64)
+            displaced[displacedCount++] = point;
+          continue;
+        }
+        XMStoreFloat3((XMFLOAT3*)results[s].Position, point);
+        wanted[s] = true;
       }
-      if (slot + kept > FocusRingFirst + MaxRingFoci)
-        break; // a whole ring (or its part in view) or none, never half of one
-      for (int k = 0; k < kept; ++k)
+      for (int d = 0, s = slot; d < displacedCount; ++d)
       {
-        XMStoreFloat3((XMFLOAT3*)results[slot].Position, points[k]);
-        wanted[slot++] = true;
+        while (s < slot + span && wanted[s])
+          ++s;
+        if (s == slot + span)
+          break; // more in view than the ring has slots (the camera is far from the ring's centre)
+        XMStoreFloat3((XMFLOAT3*)results[s].Position, displaced[d]);
+        wanted[s] = true;
       }
+      slot += span;
     }
   }
 
@@ -734,8 +901,21 @@ void CameraManager::OnZoneStreamerUpdate(__int64 pZoneStreamer)
   if (limited && GetTickCount64() - s_lastLimitLog > 30000)
   {
     s_lastLimitLog = GetTickCount64();
-    util::log::Write("Zone streamer 0x%I64X has %d of its 128 zone slots in use, the camera's extra zones are held back so it can't overflow",
-      pZoneStreamer, usedSlots);
+    if (usedSlots >= ZoneSlotsAddBelow)
+      util::log::Write("Zone streamer 0x%I64X has %d of its 128 zone slots in use: the camera's extra zones are held back so it can't run out",
+        pZoneStreamer, usedSlots);
+    else if (!m_StreamUnrestricted && m_BatchPressure >= 1 && m_BatchPressure >= m_MeshPressure && m_BatchPressure >= m_ListPressure)
+      util::log::Write("The camera's extra zones are held back: the renderer's fullest draw batch has %d of its %d instances (zone streamer 0x%I64X, %d zone slots)",
+        (int)m_BatchInstances, BatchCapacity, pZoneStreamer, usedSlots);
+    else if (!m_StreamUnrestricted && m_ArenaPressure >= 1 && m_ArenaPressure >= m_MeshPressure && m_ArenaPressure >= m_ListPressure)
+      util::log::Write("The camera's extra zones are held back: the renderer's memory for mesh instances is %.1f of %d MB used (zone streamer 0x%I64X, %d zone slots)",
+        m_ArenaUsed / 1048576.0, (int)(m_ArenaSize >> 20), pZoneStreamer, usedSlots);
+    else if (m_MeshPressure >= m_ListPressure && m_MeshPressure >= 1)
+      util::log::Write("The camera's extra zones are held back: %d of the game's 4096 meshes are in use (zone streamer 0x%I64X, %d zone slots)",
+        (int)m_MeshCount, pZoneStreamer, usedSlots);
+    else if (m_ListPressure >= 1)
+      util::log::Write("The camera's extra zones are held back: %d of the game's %d model instances are in use (zone streamer 0x%I64X, %d zone slots)",
+        m_InstanceInUse[0], m_InstanceCapacity[0], pZoneStreamer, usedSlots);
   }
 }
 
@@ -822,7 +1002,9 @@ void CameraManager::FollowAttachTarget(double dt, double smoothDt)
   }
 
   // A row clicked in the FOLLOW tab's list. It wins over a pick that's still
-  // watching what's in view.
+  // watching what's in view. The camera always goes next to it: what's in the
+  // list can be far away or behind the camera, and following it from there
+  // looks like nothing happened.
   if (m_AttachListRequested)
   {
     m_AttachListRequested = false;
@@ -831,8 +1013,7 @@ void CameraManager::FollowAttachTarget(double dt, double smoothDt)
     if (attach::ReadTransform(m_AttachListRequest, transform))
     {
       AttachToObject(m_AttachListRequest);
-      if (m_AttachMoveCamera)
-        MoveCameraNextTo(transform, m_AttachTarget);
+      MoveCameraNextTo(transform, m_AttachTarget);
     }
     else
       sprintf_s(m_AttachMessage, "That %s is gone.", attach::KindOf(m_AttachListRequest));
@@ -1520,7 +1701,7 @@ bool CameraManager::DrawNearbyList()
   if (shown == 0)
     ImGui::TextDisabled(m_Nearby.empty() ? "Nothing that can be followed is this close." : "Nothing matches the filters.");
   ImGui::EndChild();
-  ImGui::TextDisabled("%d within %.0f m%s, %d listed. Click one to follow it.", m_NearbyTotal, m_NearbyListedRadius,
+  ImGui::TextDisabled("%d within %.0f m%s, %d listed. Click one to follow it, the camera goes next to it.", m_NearbyTotal, m_NearbyListedRadius,
     m_NearbyTotal > (int)m_Nearby.size() ? " (the nearest are listed)" : "", shown);
   if (m_NearbyDropped)
     ImGui::TextDisabled("%d more were left out: too many objects, try a smaller range.", m_NearbyDropped);
@@ -1603,9 +1784,10 @@ void CameraManager::DrawFollowUI()
   else
     ImGui::TextDisabled("Not following anything else. Pick something in the list below, or aim at it.");
 
-  configChanged |= ImGui::Checkbox("Put the camera next to what I pick", &m_AttachMoveCamera);
-  ImGui::HelpMarker("When you pick something, the camera goes behind it and a little above, looking at "
-    "it. Untick to keep the camera where it is (it then moves along with the object from there).");
+  configChanged |= ImGui::Checkbox("Put the camera next to what I aim at", &m_AttachMoveCamera);
+  ImGui::HelpMarker("When you attach to what the camera looks at, the camera goes behind it and a little "
+    "above, looking at it. Untick to keep the camera where it is (it then moves along with the object "
+    "from there). Clicking a row in the list below always puts the camera next to it.");
   ImGui::SameLine(0.f, fontSize * 2.f);
   ImGui::PushItemWidth(fontSize * 8.f);
   if (ImGui::SliderFloat("Smoothing", &m_AttachSmoothing, 0.f, 1.f, m_AttachSmoothing > 0.f ? "%.2f" : "off"))
@@ -1832,11 +2014,13 @@ void CameraManager::WatchInstanceLists()
   float fill = 0.f;
   for (int k = 0; k < 2; ++k)
   {
+    int inUse = lists.Count[k] - lists.Free[k];
     if (lists.Capacity[k] > 0)
     {
-      float f = (float)lists.Count[k] / lists.Capacity[k];
+      float f = (float)inUse / lists.Capacity[k];
       if (f > fill) fill = f;
     }
+    m_InstanceInUse[k] = inUse;
 
     // The game had to move a list while it was in use: logged, since that's
     // what crashes it. (It also moves them when a level loads, while empty.)
@@ -1876,11 +2060,16 @@ void CameraManager::WatchInstanceLists()
     util::log::Warning("The game's mesh table went past its %d records (%d): it writes over its model instance lists, it can crash after this",
       MeshTableCapacity, lists.Meshes);
   m_MeshesOverflowed = overflowing;
-  if (inUse != g_MeshesNow)
+  // Meshes are arriving while the count keeps going up by more than a few;
+  // drops and small changes (the game's own streaming) don't hold anything back
+  if (inUse > g_MeshesMark + MeshesBurst)
   {
-    g_MeshesNow = inUse;
+    g_MeshesMark = inUse;
     g_MeshesChangedAt = now;
   }
+  else if (inUse < g_MeshesMark)
+    g_MeshesMark = inUse;
+  g_MeshesNow = inUse;
   m_MeshCount = inUse;
   m_MeshHighWater = lists.Meshes;
   if (inUse > m_MeshPeak)
@@ -1889,12 +2078,75 @@ void CameraManager::WatchInstanceLists()
   m_InstanceFill = fill;
   // 1 hold back, 2 take two away, 3 at the edge of the room the game has:
   // everything extra goes, the camera's own zones too
-  m_InstancePressure = meshPressure > listPressure ? meshPressure : listPressure;
+  m_MeshPressure = meshPressure;
+  m_ListPressure = listPressure;
 
-  // With the world loaded around the camera, ask for four times the game's
-  // room from the next level load on (each instance is 32 bytes, so even
-  // a lot of room is only a few MB)
-  if (m_StreamAroundCamera && lists.pSettings)
+  // The renderer's instance arena (see RenderArenaRva)
+  static bool s_arenaBuild = IsRenderArenaBuild();
+  int arenaPressure = 0;
+  __int64 arenaUsed = 0, arenaSize = 0;
+  if (s_arenaBuild && ReadRenderArena(arenaUsed, arenaSize))
+  {
+    float arenaFill = (float)arenaUsed / (float)arenaSize;
+    arenaPressure = arenaFill >= ArenaTakeAll ? 3 : (arenaFill >= ArenaTakeAway ? 2 : (arenaFill >= ArenaStopAdding ? 1 : 0));
+    m_ArenaUsed = arenaUsed;
+    m_ArenaSize = arenaSize;
+    // Not while unrestricted (nothing is held back), so turning it off at a
+    // high fill still logs why zones go
+    if (!m_StreamUnrestricted)
+    {
+      if (arenaPressure > m_ArenaPressureLogged)
+        util::log::Warning("The renderer's memory for mesh instances is %.1f of %d MB used: the camera's extra zones are %s",
+          arenaUsed / 1048576.0, (int)(arenaSize >> 20),
+          arenaPressure >= 3 ? "all taken away" : (arenaPressure == 2 ? "taken away" : "held back"));
+      m_ArenaPressureLogged = arenaPressure;
+    }
+  }
+  m_ArenaPressure = arenaPressure;
+
+  // The renderer's fullest draw batch (see RendererOwnersRva), ten times a
+  // second (it adds up up to a few thousand bytes per batch)
+  if (s_arenaBuild && now - m_BatchScanTick >= 100)
+  {
+    int instances = 0, chunks = 0;
+    if (ReadFullestBatch(instances, chunks))
+    {
+      m_BatchInstances = instances;
+      m_BatchChunks = chunks;
+    }
+    else
+      m_BatchInstances = m_BatchChunks = 0;
+    m_BatchScanTick = now;
+  }
+  float batchFill = (float)m_BatchInstances / (float)BatchCapacity;
+  int batchPressure = batchFill >= BatchTakeAll ? 3 : (batchFill >= BatchTakeAway ? 2 : (batchFill >= BatchStopAdding ? 1 : 0));
+  // Logged when it goes higher than before, until it's well back under the
+  // first level (it goes up and down as zones load and unload)
+  if (batchPressure > m_BatchPressureLogged && !m_StreamUnrestricted)
+  {
+    util::log::Warning("The renderer's fullest draw batch has %d of its %d instances: the camera's extra zones are %s",
+      (int)m_BatchInstances, BatchCapacity,
+      batchPressure >= 3 ? "all taken away" : (batchPressure == 2 ? "taken away" : "held back"));
+    m_BatchPressureLogged = batchPressure;
+  }
+  else if (batchFill < BatchStopAdding - 0.1f)
+    m_BatchPressureLogged = 0;
+  m_BatchPressure = batchPressure;
+  if (batchPressure > arenaPressure)
+    arenaPressure = batchPressure;
+
+  // Unrestricted: the renderer's two limits are only shown, the camera's
+  // zones load past them (the user's call, it can crash the game)
+  if (m_StreamUnrestricted)
+    arenaPressure = 0;
+  int pressure = meshPressure > listPressure ? meshPressure : listPressure;
+  m_InstancePressure = arenaPressure > pressure ? arenaPressure : pressure;
+
+  // Ask for four times the game's room for model instances from the next
+  // level load on (each is 32 bytes, so even a lot of room is only a few MB).
+  // Always, so a level that loads with Load the world around the camera off
+  // still has the room when it's turned on.
+  if (lists.pSettings)
   {
     for (int k = 0; k < 2; ++k)
     {
@@ -2016,13 +2268,16 @@ void CameraManager::ApplyMotionBlur()
 
 void CameraManager::DescribeState(char* buffer, size_t size)
 {
-  // For the crash note: no lock, these are only read
-  sprintf_s(buffer, size, "camera %s, track %s, follow Faith %s, follow object %s 0x%I64X, world around camera %s "
-    "(distance %.0f, zone slots %d of 128, meshes in use %d of 4096, most %d, table end %d), Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, "
+  // For the crash note: no lock, these are only read. Cut short rather than
+  // fail if it's ever longer than the buffer (in a crash handler).
+  _snprintf_s(buffer, size, _TRUNCATE, "camera %s, track %s, follow Faith %s, follow object %s 0x%I64X, world around camera %s "
+    "(distance %.0f, zone slots %d of 128, meshes in use %d of 4096, most %d, table end %d, model instances %d of %d, renderer instance memory %.1f of %d MB, fullest draw batch %d of %d in %d chunks%s), Faith's body %s, Fix LOD %s, shadow distance %.0f, small object culling %s %.2f, "
     "camera at %.1f %.1f %.1f",
-    m_CameraEnabled ? "on" : "off", m_TrackPlayer.IsPlaying() ? "playing" : "stopped",
+    m_CameraEnabled ? "on" : "off", m_TrackPlayer.IsPaused() ? "paused" : (m_TrackPlayer.IsPlaying() ? "playing" : "stopped"),
     m_AttachToFaith ? "on" : "off", m_AttachObject ? attach::ClassName(m_AttachTarget.Class) : "none", m_AttachObject ? m_AttachTarget.Entity : 0,
-    m_StreamAroundCamera ? "on" : "off", m_StreamDistance, (int)m_StreamSlotsPeak, (int)m_MeshCount, (int)m_MeshPeak, (int)m_MeshHighWater, m_ThirdPersonApplied ? "switched" : "normal",
+    m_StreamAroundCamera ? "on" : "off", m_StreamDistance, (int)m_StreamSlotsPeak, (int)m_MeshCount, (int)m_MeshPeak, (int)m_MeshHighWater, m_InstanceInUse[0], m_InstanceCapacity[0],
+    m_ArenaUsed / 1048576.0, (int)(m_ArenaSize >> 20), (int)m_BatchInstances, BatchCapacity, (int)m_BatchChunks,
+    m_StreamUnrestricted ? ", UNRESTRICTED" : "", m_ThirdPersonApplied ? "switched" : "normal",
     m_LodFix ? "on" : "off", m_ShadowDistance, m_CullOverride ? "on" : "off", m_CullScale,
     m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z);
 }
@@ -2040,8 +2295,8 @@ void CameraManager::DrawStatusBar()
 
   separator();
   if (m_TrackPlayer.IsPlaying())
-    ImGui::TextColored(active, "Playing %s  %.1f / %.1f s", m_TrackPlayer.GetTrackName().c_str(),
-      m_TrackPlayer.GetPlaybackTime(), m_TrackPlayer.GetTrackLength());
+    ImGui::TextColored(active, "%s %s  %.1f / %.1f s", m_TrackPlayer.IsPaused() ? "Paused" : "Playing",
+      m_TrackPlayer.GetTrackName().c_str(), m_TrackPlayer.GetPlaybackTime(), m_TrackPlayer.GetTrackLength());
   else
     ImGui::TextColored(off, "%s: %d keyframe%s", m_TrackPlayer.GetTrackName().c_str(),
       m_TrackPlayer.GetNodeCount(), m_TrackPlayer.GetNodeCount() == 1 ? "" : "s");
@@ -2050,6 +2305,12 @@ void CameraManager::DrawStatusBar()
   {
     separator();
     ImGui::TextColored(on, "Time frozen");
+  }
+
+  if (m_StreamAroundCamera && m_StreamUnrestricted)
+  {
+    separator();
+    ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f), "UNRESTRICTED streaming (can crash)");
   }
 
   if (m_CameraEnabled && m_AttachToFaith)
@@ -2180,7 +2441,8 @@ void CameraManager::DrawUI()
       }
       ImGui::HelpMarker("The city is streamed in zone by zone around Faith, so props near a far-away camera "
         "can be missing. With this on, the zones around the free camera are loaded too, while the camera "
-        "is on. They take a moment to appear after a long move, and use more memory.");
+        "is on. They take a moment to appear after a long move, and use more memory.\n\nSome safe houses "
+        "may or may not load with this on.");
       if (m_StreamAroundCamera)
       {
         ImGui::Indent();
@@ -2205,11 +2467,7 @@ void CameraManager::DrawUI()
           float fill = m_InstanceFill;
           if (fill >= 0.f)
           {
-            int k = m_InstanceCapacity[1] > 0 && (float)m_InstanceCount[1] / m_InstanceCapacity[1] >
-              (m_InstanceCapacity[0] > 0 ? (float)m_InstanceCount[0] / m_InstanceCapacity[0] : 0.f) ? 1 : 0;
-            (void)k;
-            (void)fill;
-            if (m_InstancePressure >= 1)
+            if (m_MeshPressure >= 1)
               ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Meshes in use: %d of 4096, at the limit: the camera's extra zones are held back",
                 (int)m_MeshCount);
             else
@@ -2220,12 +2478,72 @@ void CameraManager::DrawUI()
               "at 3450, take two away at 3650 and all of them at 3800 (and near the limit wait for each "
               "zone's meshes to finish loading before adding the next). Whatever is loaded around Faith "
               "counts too, so how far the camera can load depends on where she is.");
+            if (m_ListPressure >= 1)
+              ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Model instances in use: %d of %d, nearly full: the camera's extra zones are held back",
+                m_InstanceInUse[0], m_InstanceCapacity[0]);
+            else
+              ImGui::TextDisabled("Model instances in use: %d of %d", m_InstanceInUse[0], m_InstanceCapacity[0]);
+            ImGui::HelpMarker("Every model placed in a loaded zone. The game sets aside room for them when a "
+              "level loads, and moving them to more room while it runs can crash it, so the tools hold zones "
+              "back from 80 % and take some away from 90 %. They ask for four times the room from the next "
+              "level load: after starting the game, quit to the main menu and continue once to get it.");
+            if (m_ArenaSize > 0)
+            {
+              float usedMb = (float)(m_ArenaUsed / 1048576.0);
+              int sizeMb = (int)(m_ArenaSize >> 20);
+              if (m_ArenaPressure >= 1 && m_StreamUnrestricted)
+                ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f), "Renderer instance memory: %.1f of %d MB, nearly full: NOT held back (unrestricted)",
+                  usedMb, sizeMb);
+              else if (m_ArenaPressure >= 1)
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Renderer instance memory: %.1f of %d MB, nearly full: the camera's extra zones are held back",
+                  usedMb, sizeMb);
+              else
+                ImGui::TextDisabled("Renderer instance memory: %.1f of %d MB", usedMb, sizeMb);
+              ImGui::HelpMarker("The renderer keeps the instances of every kind of mesh it has drawn in memory it "
+                "sets aside once, and gives none of it back while it runs. When it runs out the game crashes, so "
+                "the tools stop adding zones around the camera at 70 %, take them away from 80 % and the camera's "
+                "own from 88 %. Flying far, teleporting and Fix LOD fill it faster.");
+              if (m_BatchPressure >= 1 && m_StreamUnrestricted)
+                ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f), "Renderer draw batch: %d of %d instances, nearly full: NOT held back (unrestricted)",
+                  (int)m_BatchInstances, BatchCapacity);
+              else if (m_BatchPressure >= 1)
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Renderer draw batch: %d of %d instances, nearly full: the camera's extra zones are held back",
+                  (int)m_BatchInstances, BatchCapacity);
+              else
+                ImGui::TextDisabled("Renderer draw batch: %d of %d instances (the fullest)", (int)m_BatchInstances, BatchCapacity);
+              ImGui::HelpMarker("The renderer files every instance it draws into a few batches, and one batch "
+                "has room for about 112000. Past that it writes over its own memory and the game crashes, so "
+                "the tools stop adding zones around the camera at 70 %, take some away from 80 % and all of "
+                "them from 88 %. Unloading zones gives room back.");
+            }
           }
           int slots = m_StreamSlotsPeak;
-          if (GetTickCount64() - m_StreamLimitedTick < 3000)
+          if (slots >= ZoneSlotsAddBelow && GetTickCount64() - m_StreamLimitedTick < 3000)
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Zones loaded: %d of 128, near the game's limit: the furthest are held back", slots);
           else
             ImGui::TextDisabled("Zones loaded: %d of 128", slots);
+        }
+        // Past the renderer's limits: the user's call, with a warning that can't be missed
+        if (ImGui::Checkbox("Unrestricted: ignore the renderer's limits (can crash the game)", &m_StreamUnrestricted))
+        {
+          configChanged = true;
+          if (m_StreamUnrestricted)
+            util::log::Warning("Unrestricted streaming on: the renderer's limits are ignored, the game can crash");
+          else
+            util::log::Write("Unrestricted streaming off: the camera's zones are held back by the renderer's limits again");
+        }
+        ImGui::HelpMarker("Lets the camera's extra zones load past the renderer's draw batch and instance "
+          "memory limits above, the way it was before the tools watched them: more of the city loads far "
+          "away, but when a draw batch runs out the game crashes (in tests: about a minute of flying with "
+          "the stream distance at 1000 m and Fix LOD on). The game's other limits (zone slots, meshes, "
+          "model instances) still apply.");
+        if (m_StreamUnrestricted)
+        {
+          ImGui::PushTextWrapPos(0.f);
+          ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f), "WARNING: unrestricted streaming is on. The game can crash "
+            "without warning once the renderer runs out of room, and anything not saved is lost. Keep the "
+            "stream distance as low as the shot allows.");
+          ImGui::PopTextWrapPos();
         }
         if (ImGui::Checkbox("Only where the camera looks", &m_StreamInView))
         {
@@ -2437,6 +2755,9 @@ void CameraManager::ReadConfig(INIReader* pReader)
   m_StreamAhead = pReader->GetBoolean("Misc", "StreamAhead", true);
   m_StreamTrack = pReader->GetBoolean("Misc", "StreamTrack", true);
   m_StreamInView = pReader->GetBoolean("Misc", "StreamInView", false);
+  m_StreamUnrestricted = pReader->GetBoolean("Misc", "StreamUnrestricted", false);
+  if (m_StreamUnrestricted)
+    util::log::Warning("Unrestricted streaming is on (config): the renderer's limits are ignored, the game can crash");
   m_StreamDistance = (float)pReader->GetReal("Misc", "StreamDistance", 0.0);
   if (m_StreamDistance < 0) m_StreamDistance = 0;
   float maxStreamDistance = m_StreamInView ? MaxStreamDistanceInView : MaxStreamDistance;
@@ -2502,6 +2823,7 @@ const std::string CameraManager::GetConfig()
   config += std::string("StreamAhead = ") + (m_StreamAhead ? "true" : "false") + "\n";
   config += std::string("StreamTrack = ") + (m_StreamTrack ? "true" : "false") + "\n";
   config += std::string("StreamInView = ") + (m_StreamInView ? "true" : "false") + "\n";
+  config += std::string("StreamUnrestricted = ") + (m_StreamUnrestricted ? "true" : "false") + "\n";
   config += "StreamDistance = " + std::to_string(m_StreamDistance) + "\n\n";
   config += "[Follow]\n";
   config += std::string("TurnWithIt = ") + (m_AttachRotation ? "true" : "false") + "\n";

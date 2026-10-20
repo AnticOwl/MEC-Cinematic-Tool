@@ -36,8 +36,9 @@ namespace
   }
 
   // The game reads the mouse through raw input, so its window gets no wheel
-  // messages and DirectInput sees no wheel either. A low-level mouse hook
-  // sees the wheel before any of that. It only reads it.
+  // messages. The tools read that raw input too (InputSystem::HandleMouseMsg),
+  // but a low-level mouse hook sees the wheel before any of that, so the menu
+  // uses it while it's open. It only reads it.
   UI* g_pWheelUI = nullptr;
   DWORD g_wheelThreadId = 0;
 
@@ -354,11 +355,11 @@ void UI::AddCharFromMessage(unsigned int character)
     m_PendingChars.push_back(character);
 }
 
-void UI::AddWheelFromDirectInput(float notches)
+void UI::AddWheelFromRawInput(float notches)
 {
   if (notches == 0.f) return;
-  if (!m_UsedDirectInputWheel.exchange(true))
-    util::log::Write("DirectInput sees the mouse wheel");
+  if (!m_UsedRawInputWheel.exchange(true))
+    util::log::Write("Raw input sees the mouse wheel");
   // Only without the hook and wheel messages, so one notch never scrolls twice
   if (!m_WheelHookReady && !m_SawWheelMessage)
     AddWheel(notches);

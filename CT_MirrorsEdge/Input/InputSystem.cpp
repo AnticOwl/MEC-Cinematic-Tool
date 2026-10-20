@@ -15,13 +15,10 @@ static const float g_mouseSensitivity = 1.0f;
 
 InputSystem::InputSystem() :
   m_DInputInterface(NULL),
-  m_DIMouse(NULL),
-  m_MouseCooperativeSet(false),
   m_PreviousActionStates(),
   m_WantedActionStates(),
   m_SmoothActionStates(),
   m_GamepadKeyStates(),
-  m_MouseState(),
   m_KeyboardKeyNames(),
   m_ShowUI(false)
 {
@@ -38,24 +35,15 @@ void InputSystem::Initialize()
 {
   m_LastUpdate = std::chrono::steady_clock::now();
 
+  // DirectInput only for controllers. The mouse is read from the game's own
+  // raw input (HandleMouseMsg): a background DirectInput mouse runs on a
+  // low-level hook, which Windows silently removes when it answers too slowly
+  // (the game busy on every core), and the camera's mouse look then stops.
   HRESULT hr = DirectInput8Create(GetModuleHandle(NULL), DIRECTINPUT_VERSION, IID_IDirectInput8A, (LPVOID*)&m_DInputInterface, NULL);
   if (FAILED(hr))
   {
     util::log::Error("Unable to create DirectInput interface. HRESULT 0x%X", hr);
     util::log::Warning("DirectInput controllers unavailable");
-  }
-  else
-  {
-    m_DInputInterface->CreateDevice(GUID_SysMouse, &m_DIMouse, NULL);
-    if (m_DIMouse == NULL)
-    {
-      util::log::Error("Failed to create DirectInput mouse");
-    }
-    else
-    {
-      hr = m_DIMouse->SetDataFormat(&c_dfDIMouse2);
-      hr = m_DIMouse->Acquire();
-    }
   }
 
   // Controller acquisition sometimes ends up blocking the thread,
@@ -74,24 +62,24 @@ void InputSystem::Update()
 
 void InputSystem::HandleMouseMsg(LPARAM lParam)
 {
-  // Handle raw mouse messages
-
-  UINT dwSize = 0;
-  GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER));
-  if (dwSize < sizeof(RAWINPUTHEADER))
+  // Reading the message's data doesn't use it up, the game still gets it.
+  // Anything bigger than a mouse's data (keyboards, other devices) doesn't fit
+  // and is skipped.
+  RAWINPUT raw;
+  UINT size = sizeof(raw);
+  if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1)
+    return;
+  if (raw.header.dwType != RIM_TYPEMOUSE)
     return;
 
-  BYTE* lpb = new BYTE[dwSize];
-  GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER));
-
-  RAWINPUT* raw = (RAWINPUT*)lpb;
-  if (raw->header.dwType == RIM_TYPEMOUSE)
+  // Relative movement only: absolute positions come from tablets and remote desktop
+  if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
   {
-    m_MouseState.x += raw->data.mouse.lLastX;
-    m_MouseState.y += raw->data.mouse.lLastY;
+    m_MouseX += raw.data.mouse.lLastX;
+    m_MouseY += raw.data.mouse.lLastY;
   }
-
-  delete[] lpb;
+  if (raw.data.mouse.usButtonFlags & RI_MOUSE_WHEEL)
+    m_MouseWheel += (short)raw.data.mouse.usButtonData;
 }
 
 bool InputSystem::HandleKeyMsg(WPARAM wParam, LPARAM lParam)
@@ -259,34 +247,17 @@ float InputSystem::GetActionState(Action action)
 
 DirectX::XMFLOAT3 InputSystem::GetMouseState()
 {
-  DirectX::XMFLOAT3 dt(0, 0, 0);
-  if (!m_DIMouse) return dt;
-
-  // The window is only known after the first frame. Non-exclusive background
-  // access works alongside the game's own mouse and doesn't need focus changes.
-  if (!m_MouseCooperativeSet && g_gameHwnd)
-  {
-    m_DIMouse->Unacquire();
-    m_DIMouse->SetCooperativeLevel(g_gameHwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
-    m_MouseCooperativeSet = true;
-  }
-
-  // TODO: Look into buffered read
-  DIMOUSESTATE2 mouseState{ 0 };
-  HRESULT hr = m_DIMouse->GetDeviceState(sizeof(DIMOUSESTATE2), &mouseState);
-  if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED)
-  {
-    // Lost after alt-tab or the cooperative level change, get it back
-    m_DIMouse->Acquire();
-    hr = m_DIMouse->GetDeviceState(sizeof(DIMOUSESTATE2), &mouseState);
-  }
-  if (FAILED(hr))
-    return dt;
-
-  dt.x = mouseState.lX;
-  dt.y = mouseState.lY;
-  dt.z = mouseState.lZ;
-  return dt;
+  long x = m_MouseX.exchange(0);
+  long y = m_MouseY.exchange(0);
+  long wheel = m_MouseWheel.exchange(0);
+  // Movement from while nothing read it (menus, loading screens) would all
+  // land at once and throw the camera around: only a recent read counts
+  ULONGLONG now = GetTickCount64();
+  bool stale = now - m_MouseReadTick > 250;
+  m_MouseReadTick = now;
+  if (stale)
+    return DirectX::XMFLOAT3(0, 0, 0);
+  return DirectX::XMFLOAT3((float)x, (float)y, (float)wheel);
 }
 
 void InputSystem::ReadConfig(INIReader* pReader)

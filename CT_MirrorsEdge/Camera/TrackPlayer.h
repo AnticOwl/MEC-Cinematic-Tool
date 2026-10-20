@@ -16,11 +16,13 @@ public:
 
   void Toggle();
   void Stop();
+  void TogglePause(); // while playing: holds the track where it is, or carries on
   CatmullRomNode PlayForward(double dt, bool ignoreManual = false);
 
   void DrawUI(Camera& camera, bool cameraEnabled);
 
-  bool IsPlaying() { return m_IsPlaying; }
+  bool IsPlaying() { return m_IsPlaying; } // paused counts as playing: the track still sets the camera
+  bool IsPaused() { return m_IsPlaying && m_IsPaused; }
   bool IsRotationLocked() { return m_LockRotation; }
   bool IsFovLocked() { return m_LockFieldOfView; }
   bool IsMotionBlurLocked() { return m_LockMotionBlur; }
@@ -44,6 +46,7 @@ private:
 
 private:
   bool m_IsPlaying;
+  bool m_IsPaused{ false }; // only means something while playing
 
   bool m_LockRotation;
   bool m_LockFieldOfView;

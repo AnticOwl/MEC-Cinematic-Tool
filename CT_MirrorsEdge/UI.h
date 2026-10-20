@@ -44,10 +44,10 @@ public:
   void SetDrawOwnCursor(bool draw) { m_DrawOwnCursor = draw; }
 
   // Mouse wheel notches for scrolling the menu, added to its next frame.
-  // From the window's wheel messages, and from the DirectInput wheel (camera
+  // From the window's wheel messages, and from the raw input wheel (camera
   // hook) for as long as the game sends no wheel messages.
   void AddWheelFromMessage(float notches);
-  void AddWheelFromDirectInput(float notches);
+  void AddWheelFromRawInput(float notches);
   // The low-level mouse hook, the one that works in this game
   void AddWheelFromHook(float notches);
   void OnWheelHookReady();
@@ -77,7 +77,7 @@ private:
 
   std::atomic<float> m_PendingWheel{ 0.f };
   std::atomic<bool> m_SawWheelMessage{ false };
-  std::atomic<bool> m_UsedDirectInputWheel{ false };
+  std::atomic<bool> m_UsedRawInputWheel{ false };
   std::atomic<bool> m_WheelHookReady{ false };
   std::atomic<bool> m_UsedWheelHook{ false };
 

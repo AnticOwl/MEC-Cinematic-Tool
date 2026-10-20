@@ -56,6 +56,37 @@ namespace
     }
   }
 
+  bool ReadQwordSafely(__int64 address, __int64& value)
+  {
+    __try
+    {
+      value = *(__int64*)address;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+
+  // Inside one of the game exe's executable sections (from its PE header)
+  bool IsGameCode(__int64 address)
+  {
+    __int64 base = (__int64)g_gameHandle;
+    IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)base;
+    IMAGE_NT_HEADERS* pNt = (IMAGE_NT_HEADERS*)(base + pDos->e_lfanew);
+    IMAGE_SECTION_HEADER* pSection = IMAGE_FIRST_SECTION(pNt);
+    for (int i = 0; i < pNt->FileHeader.NumberOfSections; ++i, ++pSection)
+    {
+      if (!(pSection->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+        continue;
+      __int64 start = base + pSection->VirtualAddress;
+      if (address >= start && address < start + pSection->Misc.VirtualSize)
+        return true;
+    }
+    return false;
+  }
+
   // When the game is about to crash, note where and what the tools were
   // doing in CT.log, then let the game's or Windows' own handling go on
   LONG WINAPI CrashFilter(EXCEPTION_POINTERS* pInfo)
@@ -76,7 +107,7 @@ namespace
         if (pName) memmove(module, pName + 1, strlen(pName));
       }
 
-      char text[768];
+      char text[1536];
       int length = sprintf_s(text, "[CRASH] The game crashed: exception 0x%08X at %s+0x%I64X", pRecord->ExceptionCode,
         module, hModule ? address - (__int64)hModule : address);
       if (pRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && pRecord->NumberParameters >= 2 && length > 0)
@@ -85,9 +116,38 @@ namespace
           (__int64)pRecord->ExceptionInformation[1]);
       util::log::CrashNote(text);
 
+      // The registers, and the game code the stack goes back to, to see where
+      // a bad value came from
+      if (pInfo->ContextRecord)
+      {
+        CONTEXT const* c = pInfo->ContextRecord;
+        sprintf_s(text, "[CRASH] rax %I64X rbx %I64X rcx %I64X rdx %I64X rsi %I64X rdi %I64X rbp %I64X rsp %I64X",
+          c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+        util::log::CrashNote(text);
+        sprintf_s(text, "[CRASH] r8 %I64X r9 %I64X r10 %I64X r11 %I64X r12 %I64X r13 %I64X r14 %I64X r15 %I64X",
+          c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
+        util::log::CrashNote(text);
+
+        int stackLength = sprintf_s(text, "[CRASH] game code on the stack:");
+        int found = 0;
+        for (int i = 0; i < 1024 && found < 16 && stackLength > 0 && stackLength < (int)sizeof(text) - 24; ++i)
+        {
+          __int64 value = 0;
+          if (!ReadQwordSafely((__int64)c->Rsp + i * 8, value))
+            break;
+          if (IsGameCode(value))
+          {
+            stackLength += sprintf_s(text + stackLength, sizeof(text) - stackLength, " +0x%I64X",
+              value - (__int64)g_gameHandle);
+            ++found;
+          }
+        }
+        util::log::CrashNote(text);
+      }
+
       if (g_mainHandle && g_mainHandle->GetCameraManager())
       {
-        char state[512];
+        char state[1024];
         g_mainHandle->GetCameraManager()->DescribeState(state, sizeof(state));
         sprintf_s(text, "[CRASH] Tools at the time: %s", state);
         util::log::CrashNote(text);
@@ -307,6 +367,11 @@ LRESULT CALLBACK Main::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 {
   if (g_mainHandle && g_mainHandle->m_pUI)
     UpdateCursorVisibility();
+
+  // The camera's mouse look reads the game's own raw input, before the game
+  // (or the menu, which keeps it from the game) gets the message
+  if (uMsg == WM_INPUT && g_mainHandle && g_mainHandle->m_pInputSystem)
+    g_mainHandle->m_pInputSystem->HandleMouseMsg(lParam);
 
   // The wheel doesn't go to ImGui directly: this runs on the window's thread,
   // and a wheel added to ImGui while the render thread is building the menu

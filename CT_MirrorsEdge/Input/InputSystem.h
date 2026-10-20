@@ -3,6 +3,7 @@
 #include "../inih/cpp/INIReader.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -49,6 +50,8 @@ public:
   ~InputSystem();
 
   void Initialize();
+  // WM_INPUT on the game's window (the game reads the mouse through raw
+  // input): adds up the mouse's movement and wheel for GetMouseState
   void HandleMouseMsg(LPARAM lParam);
   bool HandleKeyMsg(WPARAM wParam, LPARAM lParam);
 
@@ -64,6 +67,7 @@ public:
   bool IsActionDown(Action action);
   bool WentDown(Action action);
   float GetActionState(Action action);
+  // Movement and wheel (in WHEEL_DELTA units) since the last call
   DirectX::XMFLOAT3 GetMouseState();
 
   void ReadConfig(INIReader* pReader);
@@ -103,9 +107,11 @@ private:
   std::array<float, GamepadKey::GamepadKey_Count>   m_GamepadKeyStates;
 
   DirectX::XMFLOAT2 m_PrevMousePos;
-  DirectX::XMFLOAT2 m_MouseState;
-  LPDIRECTINPUTDEVICE8 m_DIMouse;
-  bool m_MouseCooperativeSet;
+  // From the window's thread (HandleMouseMsg), read in the camera hook (GetMouseState)
+  std::atomic<long> m_MouseX{ 0 };
+  std::atomic<long> m_MouseY{ 0 };
+  std::atomic<long> m_MouseWheel{ 0 };
+  unsigned long long m_MouseReadTick{ 0 };  // when GetMouseState last ran (only the camera hook calls it)
 
   CaptureInfo m_CaptureState;
 

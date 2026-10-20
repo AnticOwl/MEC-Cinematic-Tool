@@ -160,6 +160,112 @@ namespace
     return pNtHeaders->FileHeader.TimeDateStamp;
   }
 
+  // The renderer's instance arena (CameraManager.cpp, RenderArenaRva) is set
+  // aside once while the game starts, 16 MB, and streaming the city around the
+  // camera fills it (the level alone takes a third). Its size is two constants
+  // in the code that sets it aside (0x1436D4CE0), so it's made 64 MB here,
+  // before the game gets there (about a second after its code is decrypted).
+  // Only one byte of each changes: the size asked for, 0xE6FFA20F + disp32,
+  // from 0x01000010 to 0x04000010, and the size it records, from 16 MB to 64.
+  // The first goes first: if the game runs it in between, it gets 64 MB but
+  // records 16, and the tools hold back too early rather than too late.
+  enum class ArenaPatch { Done, TooLate, Unexpected, Failed };
+
+  ArenaPatch TryEnlargeRenderArena()
+  {
+    BYTE* pSizeLea = (BYTE*)g_gameHandle + 0x36D4D00;   // lea edx, [rdx + 0x1A005E01]
+    BYTE* pSizeStore = (BYTE*)g_gameHandle + 0x36D4D12; // mov dword ptr [rip + x], 0x01000000
+    __int64* pArenaStart = (__int64*)((BYTE*)g_gameHandle + 0x2568C08);
+    __try
+    {
+      if (*pArenaStart)
+        return ArenaPatch::TooLate;
+      bool leaOk = pSizeLea[0] == 0x8D && pSizeLea[1] == 0x92 && pSizeLea[2] == 0x01 && pSizeLea[3] == 0x5E &&
+        pSizeLea[4] == 0x00 && pSizeLea[5] == 0x1A;
+      bool storeOk = pSizeStore[0] == 0xC7 && pSizeStore[1] == 0x05 && pSizeStore[6] == 0x00 &&
+        pSizeStore[7] == 0x00 && pSizeStore[8] == 0x00 && pSizeStore[9] == 0x01;
+      if (!leaOk || !storeOk)
+        return ArenaPatch::Unexpected;
+
+      DWORD oldProtect;
+      if (!VirtualProtect(pSizeLea, 0x20, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return ArenaPatch::Failed;
+      pSizeLea[5] = 0x1D;   // 0x04000010 bytes
+      pSizeStore[9] = 0x04; // records 0x04000000
+      VirtualProtect(pSizeLea, 0x20, oldProtect, &oldProtect);
+      FlushInstructionCache(GetCurrentProcess(), pSizeLea, 0x20);
+      return ArenaPatch::Done;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return ArenaPatch::Failed;
+    }
+  }
+
+  bool RenderArenaStarted()
+  {
+    __try
+    {
+      return *(__int64*)((BYTE*)g_gameHandle + 0x2568C08) != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+
+  void RecordRenderArenaSize(DWORD bytes)
+  {
+    __try
+    {
+      *(DWORD*)((BYTE*)g_gameHandle + 0x2568C10) = bytes;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  void EnlargeRenderArena()
+  {
+    // The code may still be decrypting for a moment: a few tries
+    ArenaPatch result = ArenaPatch::Unexpected;
+    for (int attempt = 0; attempt < 300 && !g_shutdown; ++attempt)
+    {
+      result = TryEnlargeRenderArena();
+      if (result != ArenaPatch::Unexpected)
+        break;
+      Sleep(10);
+    }
+    if (result == ArenaPatch::Done)
+    {
+      // Set aside right as it was patched, the game may have been in the
+      // middle: asked for 16 MB (the old size) and then recorded 64. The
+      // record is only read by the tools (the game writes it there and clears
+      // it when it frees the memory), so it's set back to 16, the safe side
+      // (the tools then hold back as if it were 16). The game records the
+      // size before the start (0x1436D4D12, then 0x1436D4D23), so once the
+      // start is there the game's own write is done.
+      ULONGLONG patched = GetTickCount64();
+      bool soon = false;
+      while (!soon && GetTickCount64() - patched < 100)
+      {
+        soon = RenderArenaStarted();
+        if (!soon)
+          Sleep(1);
+      }
+      if (soon)
+      {
+        RecordRenderArenaSize(0x1000000);
+        util::log::Warning("The renderer's instance memory was set aside just as it was made bigger, the tools treat it as 16 MB");
+      }
+      else
+        util::log::Ok("The renderer's instance memory will be 64 MB instead of 16 MB");
+    }
+    else if (result == ArenaPatch::TooLate)
+      util::log::Warning("The renderer's instance memory was already set aside (16 MB), too late to make it bigger");
+    else
+      util::log::Warning("The renderer's instance memory couldn't be made bigger (%s), it stays 16 MB",
+        result == ArenaPatch::Unexpected ? "its code isn't what was expected" : "the code couldn't be changed");
+  }
+
   bool ResolveSignature(std::string const& name, util::offsets::Signature& sig)
   {
     __int64 result = ScanModule(sig);
@@ -294,7 +400,9 @@ void util::offsets::Scan()
       codeReady = true;
       break;
     }
-    Sleep(250);
+    // Often: the renderer's instance memory is set aside about a second after
+    // the code is decrypted, and it's made bigger before that (EnlargeRenderArena)
+    Sleep(50);
   }
 
   if (!codeReady)
@@ -308,6 +416,10 @@ void util::offsets::Scan()
   m_UseHardcodedFallback = (timeStamp == g_supportedTimeStamp);
   util::log::Write("Game build timestamp 0x%X (%s)", timeStamp,
     m_UseHardcodedFallback ? "same build as the original tools" : "unknown build, no hardcoded fallback");
+
+  // First, before the game sets its renderer's instance memory aside
+  if (m_UseHardcodedFallback)
+    EnlargeRenderArena();
 
   util::log::Write("Scanning for offsets...");
 

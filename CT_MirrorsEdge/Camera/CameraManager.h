@@ -187,6 +187,7 @@ private:
   bool m_StreamAhead{ true };  // also load where the camera is heading
   bool m_StreamTrack{ true };  // also load along the selected track
   bool m_StreamInView{ false }; // the extra zones only where the camera looks
+  bool m_StreamUnrestricted{ false }; // past the renderer's limits (draw batch, instance memory): can crash
   float m_StreamDistance{ 0.f }; // also load this far around the camera, 0 = its own and neighbouring zones
   // For the menu, from the zone streamer hook: its fullest zone slot count since the camera was
   // turned on, and when it last held the camera's extra zones back
@@ -197,7 +198,19 @@ private:
   __int64 m_ppMeshStreaming{ 0 };
   std::atomic<int> m_InstancePressure{ 0 };  // 0 fine, 1 hold back, 2 take zones away, 3 take all away
   std::atomic<float> m_InstanceFill{ -1.f }; // the fuller list, 0 - 1, -1 = unknown
-  int m_InstanceCount[2]{};
+  int m_InstanceCount[2]{};               // up to each list's end
+  int m_InstanceInUse[2]{};               // without the free slots (what counts)
+  std::atomic<int> m_MeshPressure{ 0 };   // the parts of m_InstancePressure (with the two below), for the menu and log
+  std::atomic<int> m_ListPressure{ 0 };
+  std::atomic<int> m_ArenaPressure{ 0 };          // the renderer's instance arena (see RenderArenaRva)
+  std::atomic<long long> m_ArenaUsed{ 0 };
+  std::atomic<long long> m_ArenaSize{ 0 };
+  int m_ArenaPressureLogged{ 0 };
+  std::atomic<int> m_BatchPressure{ 0 };          // the renderer's fullest draw batch (see RendererOwnersRva)
+  std::atomic<int> m_BatchInstances{ 0 };
+  std::atomic<int> m_BatchChunks{ 0 };
+  int m_BatchPressureLogged{ 0 };
+  unsigned long long m_BatchScanTick{ 0 };
   int m_InstanceCapacity[2]{};
   __int64 m_InstanceBegin[2]{};
   int m_InstanceReserveOriginal[2]{};

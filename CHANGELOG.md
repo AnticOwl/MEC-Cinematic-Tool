@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Version 1.2.2
 
 - The status bar under the tabs shows the camera's position (x, y, z) while it's on.
 

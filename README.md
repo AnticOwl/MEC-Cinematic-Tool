@@ -11,9 +11,6 @@ A rebuild of Hattiwatti's Mirror's Edge Catalyst cinematic tools on his
 - time freeze, HUD toggle, time of day, Fix LOD, draw and shadow distance, motion blur, visual
   effects (color, DoF, grain, light, tonemap, vignette) and lights
 
-> For the Steam / EA app build (PE timestamp `0x5762E3B7`). Not affiliated with or endorsed by EA
-> or DICE. Mirror's Edge is a trademark of Electronic Arts.
-
 ## Installing
 
 1. Copy `CT_MirrorsEdge.dll` and `usp10.dll` (from a release, or `dist/` after building) next to

@@ -78,6 +78,9 @@
     <ClCompile Include="Camera\CameraManager.cpp">
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
+    <ClCompile Include="Camera\IgcsBridge.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
     <ClCompile Include="Camera\TrackPlayer.cpp">
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
@@ -141,6 +144,15 @@
       <Filter>Source Files\Util</Filter>
     </ClInclude>
     <ClInclude Include="Camera\CameraStructs.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\IgcsBridge.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\IgcsCameraData.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\IgcsSession.h">
       <Filter>Source Files\Camera</Filter>
     </ClInclude>
     <ClInclude Include="Camera\TrackPlayer.h">

@@ -111,7 +111,7 @@ __int64 __fastcall hVisualEnvironmentUpdate(__int64 a1, __int64 a2, __int64 a3, 
 tEntryInput oEntryInput = nullptr;
 __int64 __fastcall hEntryInput(__int64 a1, __int64 a2, __int64 a3, __int64 a4)
 {
-  if (g_mainHandle->GetCameraManager()->IsKbmDisabled() || g_mainHandle->GetUI()->IsEnabled())
+  if (!g_shutdown && (g_mainHandle->GetCameraManager()->IsKbmDisabled() || g_mainHandle->GetUI()->IsEnabled()))
     return 0;
 
   return oEntryInput(a1, a2, a3, a4);

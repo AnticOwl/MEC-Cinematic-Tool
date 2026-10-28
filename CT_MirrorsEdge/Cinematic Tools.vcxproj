@@ -142,6 +142,7 @@
   <ItemGroup>
     <ClCompile Include="Camera\AttachTargets.cpp" />
     <ClCompile Include="Camera\CameraManager.cpp" />
+    <ClCompile Include="Camera\IgcsBridge.cpp" />
     <ClCompile Include="Camera\TrackPlayer.cpp" />
     <ClCompile Include="DllMain.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -165,6 +166,9 @@
     <ClInclude Include="Camera\AttachTargets.h" />
     <ClInclude Include="Camera\CameraManager.h" />
     <ClInclude Include="Camera\CameraStructs.h" />
+    <ClInclude Include="Camera\IgcsBridge.h" />
+    <ClInclude Include="Camera\IgcsCameraData.h" />
+    <ClInclude Include="Camera\IgcsSession.h" />
     <ClInclude Include="Camera\TrackPlayer.h" />
     <ClInclude Include="imgui\imconfig.h" />
     <ClInclude Include="imgui\imgui.h" />

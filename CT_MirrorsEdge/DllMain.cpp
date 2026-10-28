@@ -7,7 +7,9 @@ DWORD WINAPI RunCT(LPVOID lpArg)
   if (g_mainHandle->Initialize())
     g_mainHandle->Run();
 
+  g_shutdown = true;
   delete g_mainHandle;
+  g_mainHandle = nullptr;
 
   return 0;
 }

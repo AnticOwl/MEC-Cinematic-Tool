@@ -10,6 +10,8 @@ A rebuild of Hattiwatti's Mirror's Edge Catalyst cinematic tools on his
 - **load the city around the camera**, so a far-away camera isn't surrounded by missing props
 - time freeze, HUD toggle, time of day, Fix LOD, draw and shadow distance, motion blur, visual
   effects (color, DoF, grain, light, tonemap, vignette) and lights
+- **native IGCS DoF integration** for the standard IGCS Connector addon; this fork's first
+  implementation is a test build awaiting validation in Mirror's Edge Catalyst
 
 ## Installing
 
@@ -24,6 +26,23 @@ or 11. To uninstall, delete the two files and the `Cinematic Tools` folder.
 Settings are saved in `Cinematic Tools\config.ini`, the log in `Cinematic Tools\CT.log` (the
 previous one is kept as `CT.previous.log`, with `[CRASH]` lines at the end if the game crashed).
 
+## IGCS DoF
+
+The native camera interface lets [IGCS Connector](https://github.com/FransBouma/IgcsConnector)
+move this camera during a DoF capture, then restore the starting pose and FOV when the
+session ends or is cancelled. After a render reaches **Done**, save the result before
+clicking **End session**; that action removes the rendered result. It supports
+multishot sessions used by IGCS DoF; panorama sessions are not implemented in this first version.
+Install the standard addon and its DoF shader/texture separately, following the
+[installation and test guide](docs/IGCS_DOF.md). Use one camera provider at a time: disable
+the IGCS Relay or another IGCS camera provider for these native tests.
+
+The camera DLL does not automatically pause the game or change visual effects. Freeze the
+scene and time of day, and disable native DoF and motion blur before a capture. End or cancel
+the capture in ReShade before changing the camera or loading another level.
+
+This integration does not change Faith's texture streaming or tattoo resolution.
+
 ## Building
 
 Visual Studio 2022 (or the Build Tools) with the C++ workload and a Windows 10/11 SDK:
@@ -34,6 +53,23 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 This fills `dist/` with `CT_MirrorsEdge.dll` and `usp10.dll` (static CRT, no redistributable
 needed). The C4244 warnings from `Input/InputSystem.cpp` come from the template.
+
+Run the production capture-state tests and check the built DLL's x64 exports:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/test-igcs.ps1 -DllPath dist/CT_MirrorsEdge.dll
+```
+
+The GitHub Actions workflow builds and tests both Release and Debug x64. Its Release artifact
+contains the two DLLs, licenses, the IGCS test guide, checksums and `BUILD_INFO.txt` identifying
+the exact commit. A successful build is not an in-game compatibility result.
+
+The camera-session math and ABI assertions also run without Windows:
+
+```sh
+g++ -std=c++14 -Wall -Wextra -Werror -pedantic -ICT_MirrorsEdge tests/igcs_session_tests.cpp -o /tmp/mec_igcs_tests
+/tmp/mec_igcs_tests
+```
 
 ## Controls
 

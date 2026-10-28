@@ -1,6 +1,8 @@
 #pragma once
 #include "TrackPlayer.h"
 #include "AttachTargets.h"
+#include "IgcsCameraData.h"
+#include "IgcsSession.h"
 #include "../inih/cpp/INIReader.h"
 
 #include <atomic>
@@ -33,14 +35,22 @@ public:
   // A line about what the tools are doing, for the crash note
   void DescribeState(char* buffer, size_t size);
 
+  // Native IGCS entry points. They only change logical camera state; the
+  // normal game-thread hook remains the writer of the game's render view.
+  int StartIgcsSession(std::uint8_t type);
+  void EndIgcsSession();
+  void MoveIgcsCamera(float horizontal, float vertical, float fovDegrees, bool fromStartPosition);
+  igcs::CameraData GetIgcsCameraData();
+  void SetIgcsConnected(bool connected) { m_IgcsConnected = connected; }
+
   bool IsCameraEnabled() { return m_CameraEnabled; }
   // While a track plays Faith can be given the controls back
-  bool IsPlayerControllingFaith() { return m_PlayerControlDuringPlayback && m_TrackPlayer.IsPlaying(); }
-  bool IsGamepadDisabled() { return m_CameraEnabled && m_GamepadDisabled && !IsPlayerControllingFaith(); };
-  bool IsKbmDisabled() { return m_CameraEnabled && m_KbmDisabled && !IsPlayerControllingFaith(); };
+  bool IsPlayerControllingFaith() { return !m_IgcsSessionActive && m_PlayerControlDuringPlayback && m_TrackPlayer.IsPlaying(); }
+  bool IsGamepadDisabled() { return m_IgcsSessionActive || (m_CameraEnabled && m_GamepadDisabled && !IsPlayerControllingFaith()); };
+  bool IsKbmDisabled() { return m_IgcsSessionActive || (m_CameraEnabled && m_KbmDisabled && !IsPlayerControllingFaith()); };
   // Following Faith while she isn't frozen: the movement keys only move her,
   // so the camera keeps its place next to her instead of flying off as well
-  bool IsMovementKeysForFaith() { return m_CameraEnabled && m_AttachToFaith && !m_KbmDisabled; }
+  bool IsMovementKeysForFaith() { return !m_IgcsSessionActive && m_CameraEnabled && m_AttachToFaith && !m_KbmDisabled; }
 
   void ReadConfig(INIReader* pReader);
   const std::string GetConfig();
@@ -75,6 +85,10 @@ private:
 
   void UpdateCamera(double dt, double trackDt);
   void UpdateInput(double dt, DirectX::XMFLOAT3 const& mouseState);
+  igcs::capture::Pose GetIgcsPose() const;
+  void ApplyIgcsPose(igcs::capture::Pose const& pose);
+  void ClearCameraDeltas();
+  void ResetIgcsTransientState();
 
   void ToggleCamera();
   void MoveToPlayer();
@@ -120,6 +134,14 @@ private:
 
 private:
   std::mutex m_Mutex;
+
+  igcs::capture::Session m_IgcsSession;
+  // Input hooks query this without the camera mutex. All session/pose changes
+  // themselves are serialized by m_Mutex.
+  std::atomic<bool> m_IgcsSessionActive{ false };
+  std::atomic<bool> m_IgcsConnected{ false };
+  bool m_IgcsViewReady{ false };
+  bool m_IgcsRestoreFrame{ false };
 
   std::atomic<bool> m_CameraEnabled;
   bool m_FirstEnable;

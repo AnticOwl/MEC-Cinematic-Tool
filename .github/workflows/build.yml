@@ -1,0 +1,66 @@
+name: Build and test IGCS DoF
+
+on:
+  push:
+    branches: [main, feature/igcs-dof]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: igcs-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 (${{ matrix.configuration }})
+    runs-on: windows-2022
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build camera and loader
+        run: ./build.ps1 -Configuration '${{ matrix.configuration }}'
+
+      - name: Test capture state, math, ABI and DLL exports
+        run: ./tools/test-igcs.ps1 -Configuration '${{ matrix.configuration }}' -DllPath ./dist/CT_MirrorsEdge.dll
+
+      - name: Prepare Release test package
+        if: matrix.configuration == 'Release'
+        run: |
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md, CHANGELOG.md -Destination dist
+          New-Item -ItemType Directory -Force dist/docs, dist/minhook | Out-Null
+          Copy-Item docs/IGCS_DOF.md -Destination dist/docs
+          Copy-Item minhook/LICENSE.txt -Destination dist/minhook
+          @(
+            'MEC Cinematic Tool - native IGCS DoF test build'
+            'Source: https://github.com/AnticOwl/MEC-Cinematic-Tool'
+            "Commit: $env:GITHUB_SHA"
+            'Configuration: Release x64'
+            "Workflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            'In-game validation is pending; see docs/IGCS_DOF.md.'
+          ) | Set-Content -Encoding ascii dist/BUILD_INFO.txt
+          Get-FileHash dist/CT_MirrorsEdge.dll, dist/usp10.dll -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLowerInvariant(), (Split-Path -Leaf $_.Path) } |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: Upload Release test package
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: MEC-Cinematic-Tool-IGCSDOF-x64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

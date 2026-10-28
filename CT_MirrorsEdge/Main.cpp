@@ -1,4 +1,5 @@
 #include "Main.h"
+#include "Camera/IgcsBridge.h"
 #include "Util/Util.h"
 #include <chrono>
 #include <d3d11.h>
@@ -13,7 +14,7 @@ HINSTANCE g_dllHandle = NULL;
 HINSTANCE g_gameHandle = NULL;
 HWND g_gameHwnd = NULL;
 WNDPROC g_origWndProc = 0;
-bool g_shutdown = false;
+std::atomic<bool> g_shutdown{ false };
 bool g_hasFocus = true;
 
 ID3D11DeviceContext* g_d3d11Context = nullptr;
@@ -169,6 +170,9 @@ Main::Main() :
 
 Main::~Main()
 {
+  // Also handles initialization failure. Detach exported IGCS callbacks
+  // before member destruction can invalidate the camera manager.
+  igcs::Shutdown();
 }
 
 bool Main::Initialize()
@@ -215,6 +219,7 @@ bool Main::Initialize()
   util::hooks::Init();
 
   LoadConfig();
+  igcs::Initialize(m_pCameraManager.get());
   return true;
 }
 
@@ -228,6 +233,10 @@ void Main::Run()
     auto now = std::chrono::steady_clock::now();
     std::chrono::duration<double> dt = now - lastUpdate;
     lastUpdate = now;
+
+    // The addon can load after the tools. Discovery is throttled by the
+    // bridge and stops once connected; it does not depend on the menu.
+    igcs::PollConnection();
 
     // WM_ACTIVATE can be missed when the tools are injected after the
     // window got focus, so check directly
@@ -252,6 +261,10 @@ void Main::Run()
     Sleep(5);
   }
 
+  // Stop accepting IGCS callbacks and restore any capture before the
+  // managers disappear. The bridge also publishes camera-disabled.
+  igcs::Shutdown();
+
   // Save config and disable hooks before exit
   SaveConfig();
   util::hooks::SetHookState(false);
@@ -267,7 +280,11 @@ void Main::OnPresent(IDXGISwapChain* pSwapChain)
 
   // Overlays (Origin etc.) can present their own swapchains, only draw on the game's
   if (pSwapChain == g_dxgiSwapChain)
+  {
+    // Publish even when UI::Draw returns early because the menu is hidden.
+    igcs::PublishCameraData();
     m_pUI->Draw();
+  }
 }
 
 bool Main::InitializeGraphics(IDXGISwapChain* pSwapChain)
@@ -365,6 +382,11 @@ void Main::SaveConfig()
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK Main::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+  // The window can deliver its final messages while the tools worker is
+  // shutting down. Do not access managers after shutdown has started.
+  if (g_shutdown)
+    return g_origWndProc ? CallWindowProc(g_origWndProc, hwnd, uMsg, wParam, lParam) : DefWindowProc(hwnd, uMsg, wParam, lParam);
+
   if (g_mainHandle && g_mainHandle->m_pUI)
     UpdateCursorVisibility();
 

@@ -346,7 +346,7 @@
     - INSTALLED 22:46 with the game closed (game folder and dist, hash checked). The old DLL is kept
       (CT_MirrorsEdge_935727c51f4b.dll). **Not tested in game.**
 
-- **Reflections settle sooner after a time of day jump** (CAMERA > Time and HUD, *Light catches up with time jumps*).
+- **Reflections settle sooner after a time of day jump** (GAME > Time of day, *Light catches up with time jumps*).
   - **What lagged:** measured on two jumps, reflections were final 4 - 5 s after the jump, against about 3 s for
     the shade.
     - They were captured again only once the light's reset had done its 5 passes.
@@ -362,8 +362,8 @@
   - Build D9CA6F54AFEF (11-13 16:01, Idle priority; the folder is B3846F99D215 plus this).
     - INSTALLED 16:03 when the game closed (game folder and dist, hash checked). **Not tested in game.**
 
-- **Fixed: after dragging the time of day, the light could stay at a time you passed through** (CAMERA > Time and
-  HUD, *Light catches up with time jumps*).
+- **Fixed: after dragging the time of day, the light could stay at a time you passed through** (GAME > Time of
+  day, *Light catches up with time jumps*).
   - **What went wrong:** in the 2026-11-13 13:43 run, the light's reset ran at 11:21 while the slider was still
     moving, the drag ended at 08:54, and the last reset was skipped ("already at 08:54"). The shade kept the 11:21
     light until the game's own steps caught up, several seconds later.
@@ -1081,7 +1081,7 @@
     skeptics: 17 confirmed and fixed). Offline: 79,430,938 checks of `VoiceEmotion.cpp` with the real helper; the Pose
     window's harness 330 checks at three window sizes with the real helper and 20,000 - 30,000 random-input frames each.
   - **Also in this work:** the living face's changelog entry was put under Version 2.0.2 by mistake (that section is road
-    traffic only); it is moved here to Unreleased.
+    traffic only); it is moved here.
   - **Not known until it runs in the game:** how it looks on a face; how right it is on game voices; other Windows
     (Windows ML comes with Windows 10 1809 and later; whether its version reads this model was tested only on Windows 11
     build 26300).

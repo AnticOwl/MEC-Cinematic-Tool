@@ -17,6 +17,7 @@
 // drives to, from / to / next node, speed factor (half). Its node array: 0x30 bytes a node, position at + 0, radius
 // at + 0x14.
 #include "RoadTrafficLanes.h"
+#include "RoadTrafficHeights.h"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -261,7 +262,7 @@ namespace road_traffic_core
           {
             float o = road_traffic_lanes::Samples[g.First + k][lane];
             Point[g.First + k][lane][0] = g.From[0] + dx * t + px * o;
-            Point[g.First + k][lane][1] = g.From[1] + (g.To[1] - g.From[1]) * t;
+            Point[g.First + k][lane][1] = road_traffic_heights::SampleY[g.First + k][lane];   // the road's there
             Point[g.First + k][lane][2] = g.From[2] + dz * t + pz * o;
           }
         }
@@ -392,15 +393,18 @@ namespace road_traffic_core
   {
     static const int MaxPoints = 48;
     float X[MaxPoints], Y[MaxPoints], Z[MaxPoints];
+    int Seg[MaxPoints];            // the lane table's segment the point is on (-1 none) and how far along it (0 - 1)
+    float T[MaxPoints];
     int Count = 0;
+    int Lane = 0;                  // the car's lane (0, 1)
     bool OffRoad = false;          // the car's segment has no road under it
     float CarArc = 0.f;            // where along it the car was before the step
     float EndX = 0.f, EndY = 0.f, EndZ = 0.f;   // its lane's point at the to node
 
-    void Add(float x, float y, float z)
+    void Add(float x, float y, float z, int seg = -1, float t = 0.f)
     {
       if (Count > 0 && std::fabs(X[Count - 1] - x) < 0.01f && std::fabs(Z[Count - 1] - z) < 0.01f) return;
-      if (Count < MaxPoints) { X[Count] = x; Y[Count] = y; Z[Count] = z; ++Count; }
+      if (Count < MaxPoints) { X[Count] = x; Y[Count] = y; Z[Count] = z; Seg[Count] = seg; T[Count] = t; ++Count; }
     }
   };
 
@@ -639,7 +643,7 @@ namespace road_traffic_core
         {
           int other;
           float py = b.Pos[1];
-          if (path.Count >= 2) Project(path, b.Pos[0], b.Pos[2], &py, s.WayX[i], s.WayZ[i]);
+          if (path.Count >= 2) py = HeightAt(path, Project(path, b.Pos[0], b.Pos[2], nullptr, s.WayX[i], s.WayZ[i]));
           // the time of day's share full: it stays unseen for that. Any unseen car shows only out of sight (with no
           // view known, wherever it's in a gap: the caller has no share then), but where the placement has none shown,
           // anywhere: with none shown its box is under the city (see HiddenY)
@@ -1152,9 +1156,10 @@ namespace road_traffic_core
       float t0 = Clamp(m0 / len, 0.f, 1.f), t1 = Clamp(m1 / len, 0.f, 1.f);
       int seg = Segment(s, in, a, b);
       int n = seg >= 0 && road_traffic_lanes::Segments[seg].Count >= 2 ? road_traffic_lanes::Segments[seg].Count : 2;
+      int onTable = seg >= 0 && road_traffic_lanes::Segments[seg].Count >= 2 ? seg : -1;
       float x, y, z;
       LanePoint(s, in, a, b, lane, side, t0, x, y, z);
-      path.Add(x, y, z);
+      path.Add(x, y, z, onTable, t0);
       // the samples strictly between t0 and t1
       int k0 = (int)std::floor(t0 * (float)(n - 1)) + 1, k1 = (int)std::ceil(t1 * (float)(n - 1)) - 1;
       if (k0 < 1) k0 = 1;
@@ -1164,10 +1169,10 @@ namespace road_traffic_core
         float t = (float)k / (float)(n - 1);
         if (t <= t0 || t >= t1) continue;
         LanePoint(s, in, a, b, lane, side, t, x, y, z);
-        path.Add(x, y, z);
+        path.Add(x, y, z, onTable, t);
       }
       LanePoint(s, in, a, b, lane, side, t1, x, y, z);
-      path.Add(x, y, z);
+      path.Add(x, y, z, onTable, t1);
     }
 
     // The car's lane round it: the end of the segment before (if known), its own, the start of the next one
@@ -1179,6 +1184,7 @@ namespace road_traffic_core
       float len = Len2(dx, dz);
       int seg = Segment(s, in, r.From, r.To);
       path.OffRoad = seg >= 0 && (road_traffic_lanes::Segments[seg].Flags & 1) != 0;
+      path.Lane = lane;
       LanePoint(s, in, r.From, r.To, lane, side, 1.f, path.EndX, path.EndY, path.EndZ);
       // where along its segment the car is
       float at = len > 1e-3f ? ((b.Pos[0] - pf[0]) * dx + (b.Pos[2] - pf[2]) * dz) / len : 0.f;
@@ -1200,7 +1206,11 @@ namespace road_traffic_core
         float bx = path.X[k + 1] - path.X[k], bz = path.Z[k + 1] - path.Z[k];
         if (ax * bx + az * bz < -0.5f * Len2(ax, az) * Len2(bx, bz))
         {
-          for (int j = k; j + 1 < path.Count; ++j) { path.X[j] = path.X[j + 1]; path.Y[j] = path.Y[j + 1]; path.Z[j] = path.Z[j + 1]; }
+          for (int j = k; j + 1 < path.Count; ++j)
+          {
+            path.X[j] = path.X[j + 1]; path.Y[j] = path.Y[j + 1]; path.Z[j] = path.Z[j + 1];
+            path.Seg[j] = path.Seg[j + 1]; path.T[j] = path.T[j + 1];
+          }
           --path.Count;
           if (k > 1) --k;
         }
@@ -1243,6 +1253,39 @@ namespace road_traffic_core
         arc -= l;
       }
       x = path.X[path.Count - 1]; y = path.Y[path.Count - 1]; z = path.Z[path.Count - 1];
+    }
+
+    // The drawn road's height along the path at arc (as PointAt goes along it): on a piece of the path whose two points
+    // are on one segment's lane, the road's height there from RoadTrafficHeights.h's fine heights (about every metre;
+    // the path's own points are the lane samples, about 5.6 m apart, and the road bends between them); elsewhere (a
+    // join of two segments' lanes, a segment the table hasn't) straight between the path's points
+    static float HeightAt(Path const& path, float arc)
+    {
+      for (int k = 0; k + 1 < path.Count; ++k)
+      {
+        float dx = path.X[k + 1] - path.X[k], dz = path.Z[k + 1] - path.Z[k];
+        float l = Len2(dx, dz);
+        if (arc <= l && l > 1e-6f)
+        {
+          float w = arc / l;
+          int seg = path.Seg[k];
+          int n = seg >= 0 && seg == path.Seg[k + 1] ? (int)road_traffic_heights::FineCount[seg] : 0;
+          if (n >= 2)
+          {
+            float t = Clamp(path.T[k] + (path.T[k + 1] - path.T[k]) * w, 0.f, 1.f);
+            float f = t * (float)(n - 1);
+            int j = (int)f;
+            if (j >= n - 1) j = n - 2;
+            float u = f - (float)j;
+            float const* p0 = road_traffic_heights::FineY[road_traffic_heights::FineFirst[seg] + j];
+            float const* p1 = road_traffic_heights::FineY[road_traffic_heights::FineFirst[seg] + j + 1];
+            return p0[path.Lane] + (p1[path.Lane] - p0[path.Lane]) * u;
+          }
+          return path.Y[k] + (path.Y[k + 1] - path.Y[k]) * w;
+        }
+        arc -= l;
+      }
+      return path.Y[path.Count - 1];
     }
 
     // how far ahead on its lane a car steers for (2.5 + 0.08 x speed, 3 - 8 m, until 2026-11-03 14:3x: tighter, but the
@@ -1298,8 +1341,9 @@ namespace road_traffic_core
         arc += step;
         left -= step;
       }
-      float px, y, pz;
-      PointAt(path, arc, px, y, pz);
+      // its height: the road's at its lane's point nearest where it is (until 2026-11-15 straight between the path's
+      // points at arc; a car cutting inside a sharp turn is off its lane's point at arc)
+      float y = HeightAt(path, Project(path, x, z, nullptr));
       r.Pos[0] = x; r.Pos[2] = z;
       r.Pos[1] = unseen ? HiddenY : y;
       s.M[i].LaneY = y;

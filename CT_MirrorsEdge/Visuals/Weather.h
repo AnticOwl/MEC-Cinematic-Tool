@@ -189,6 +189,11 @@ namespace weather
   // then; known false when neither is drawn or its tip isn't known. Any
   // thread (the Shard's code calls it from the camera hook).
   void SetShardTop(bool known, float const* top);
+  // Whether lightning can come now (a storm at the last update, or Strike
+  // now pressed): only then does the Shard's code look for its tip in the
+  // city (camera hook, every frame before weather::Update; a burst waits for
+  // an update this was asked before with true)
+  bool ShardTopWanted();
   // The visual environment manager's mix of a view, right after it (game
   // thread): the rain's strength given to the game's emitters while Rain is
   // on; true when the view should be mixed again (the game's value back)

@@ -11,6 +11,8 @@ namespace frameshot
   void Request(std::wstring const& path);
   // A request still waiting for its frame or being written
   bool Busy();
+  // A request not taken yet is dropped (one being written is finished)
+  void Cancel();
 
   // Render thread, from the Present hook, on the game's swapchain, before the menu
   void OnPresent(IDXGISwapChain* pSwapChain, ID3D11Device* pDevice, ID3D11DeviceContext* pContext);

@@ -1891,6 +1891,35 @@ bool TrackPlayer::SampleAt(double time, CatmullRomNode& out)
   return !out.Orbit;
 }
 
+// As PlayForward gives it: the ends' own, else the segment's (the time of day
+// doesn't depend on orbits or the focus, InterpolateNodes)
+bool TrackPlayer::TimeOfDayAt(double time, float& clock)
+{
+  std::vector<CatmullRomNode> const& nodes = m_Tracks[m_SelectedTrack].Nodes;
+  clock = -1.f;
+  if (nodes.size() < 2)
+    return false;
+  double end = nodes.back().TimeStamp;
+  if (time <= 0.0)
+    clock = nodes.front().TimeOfDay;
+  else if (time >= end)
+    clock = nodes.back().TimeOfDay;
+  else
+  {
+    unsigned int segment = 0;
+    while (segment + 2 < nodes.size() && time >= nodes[segment + 1].TimeStamp)
+      ++segment;
+    if (!(nodes[segment + 1].TimeStamp > nodes[segment].TimeStamp))
+      return false;
+    CatmullRomNode const& n1 = nodes[segment];
+    CatmullRomNode const& n2 = nodes[segment + 1];
+    CatmullRomNode const& n0 = segment > 0 ? nodes[segment - 1] : n1;
+    CatmullRomNode const& n3 = segment + 2 < nodes.size() ? nodes[segment + 2] : n2;
+    clock = InterpolateNodes(n0, n1, n2, n3, time).TimeOfDay;
+  }
+  return clock >= 0.f;
+}
+
 int TrackPlayer::InsertNodes(std::vector<std::pair<double, XMFLOAT3>> const& inserts)
 {
   std::vector<CatmullRomNode>& nodes = m_Tracks[m_SelectedTrack].Nodes;

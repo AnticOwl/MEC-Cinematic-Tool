@@ -11,12 +11,14 @@
 #include "Camera/FaithSize.h"
 #include "Camera/GroundLevel.h"
 #include "Camera/RoadTraffic.h"
+#include "Camera/CullingOff.h"
 #include "Camera/ReplayAudio.h"
 #include "Camera/ReplayShapes.h"
 #include "Camera/ReplayAssetLog.h"
 #include "Camera/ReplayDrawLog.h"
 #include "Camera/ReplayGameDraws.h"
 #include "Camera/ReplayStore.h"
+#include "Camera/PoseEditor.h"
 #include "Util/Perf.h"
 #include "Util/GameState.h"
 #include <algorithm>
@@ -27,6 +29,8 @@
 #include <psapi.h>
 #include <stdarg.h>
 #include <tlhelp32.h>
+#include <csignal>
+#include <intrin.h>
 
 static const char* g_gameName = "Mirror's Edge Catalyst";
 static const char* g_moduleNames[] = { "MirrorsEdgeCatalyst.exe", "MirrorsEdgeCatalystTrial.exe" };
@@ -312,6 +316,64 @@ namespace
     return g_previousCrashFilter ? g_previousCrashFilter(pInfo) : EXCEPTION_CONTINUE_SEARCH;
   }
 
+  // What the tools' own C runtime ends the game for goes past the crash filter: it is a "fail fast", no exception a
+  // filter is shown. A failed ImGui check (IM_ASSERT is compiled in: imconfig.h), abort() from anything else, and a
+  // secure CRT call that refuses its arguments (a text longer than its buffer in sprintf_s or strcpy_s) all end the
+  // game with Windows' code 0xC0000409 and, until now, nothing in CT.log (2026-11-12: the game ended at ImGui's
+  // check of a window's stacks; only Windows' crash dump said where). So each writes its own [CRASH] lines first:
+  // what, the call chain, the tools' state. The game then ends exactly as it did before.
+  volatile LONG g_runtimeEndNoted = 0;
+
+  void NoteRuntimeEnd(char const* what)
+  {
+    if (InterlockedExchange(&g_runtimeEndNoted, 1) != 0)
+      return;
+    util::log::CrashNote(what);
+    CONTEXT context;
+    RtlCaptureContext(&context);
+    NoteCallChain(&context);
+    if (g_mainHandle && g_mainHandle->GetCameraManager())
+    {
+      char state[1024], text[1100];
+      g_mainHandle->GetCameraManager()->DescribeState(state, sizeof(state));
+      _snprintf_s(text, sizeof(text), _TRUNCATE, "[CRASH] Tools at the time: %s", state);
+      util::log::CrashNote(text);
+    }
+  }
+
+  // abort() of the tools' C runtime (theirs alone: it is linked into the DLL), before it ends the process
+  void __cdecl OnRuntimeAbort(int)
+  {
+    NoteRuntimeEnd("[CRASH] The tools' C runtime ends the game with abort(): a failed check, or a C++ exception nothing "
+      "caught");
+  }
+
+  // A call the tools' C runtime refuses. Its own handler ends the process the same way (no details in a release build)
+  void __cdecl OnRuntimeRefusal(wchar_t const*, wchar_t const*, wchar_t const*, unsigned int, uintptr_t)
+  {
+    NoteRuntimeEnd("[CRASH] The tools' C runtime refused a call's arguments and ends the game: most often a text longer "
+      "than its buffer (sprintf_s, strcpy_s and the like)");
+    __fastfail(FAST_FAIL_INVALID_ARG);
+  }
+}
+
+// ImGui's failed check (imconfig.h's IM_ASSERT): written to CT.log, then assert()'s own failure as before. In the
+// game that is the C runtime's Abort / Retry / Ignore message box (the tools' runtime doesn't know of a console);
+// Abort ends the game through abort(), Ignore comes back here and the game goes on.
+void CtImGuiCheckFailed(const wchar_t* expression, unsigned line)
+{
+  char text[768];
+  _snprintf_s(text, sizeof(text), _TRUNCATE, "[CRASH] A check inside the menu's library (ImGui) failed: %ls (imgui line %u). "
+    "The C runtime's Abort / Retry / Ignore box follows; Abort ends the game", expression ? expression : L"?", line);
+  NoteRuntimeEnd(text);
+  _wassert(expression ? expression : L"?", L"imgui", line);
+  // Back here only after Ignore (or Retry under a debugger): the next end is to be written again
+  util::log::CrashNote("[CRASH] That box was answered with Ignore (or Retry under a debugger): the game goes on");
+  InterlockedExchange(&g_runtimeEndNoted, 0);
+}
+
+namespace
+{
   // The hang watch (2026-10-27, the user: the game doesn't close after
   // quitting; Windows closed its frozen window at 01:07 and 02:59). CT.log
   // said nothing about a session's end, so where the game waits was unknown.
@@ -884,6 +946,11 @@ bool Main::Initialize()
     util::g_DiagnosticsOn = earlyConfig.GetBoolean("Debug", "Diagnostics", false);
   }
   util::log::Init(m_ShowConsole);
+  // What the tools' own C runtime ends the game for goes past the crash filter (set later, in InitializeGraphics):
+  // its lines are written by these (see NoteRuntimeEnd). Set from the start: they are the tools' runtime's own, the
+  // game has another, and the start-up is where a too-long text or an abort would otherwise leave nothing.
+  signal(SIGABRT, &OnRuntimeAbort);
+  _set_invalid_parameter_handler(&OnRuntimeRefusal);
   util::log::Write("Cinematic Tools for %s\n", g_gameName);
 
   // Used for relative offsets and signature scanning
@@ -931,10 +998,17 @@ bool Main::Initialize()
   ground::Init();
   // The road cars keep to their lanes and their gaps (the game's car step; no menu entry)
   road_traffic::Init();
+  // GAME > Level streaming > No culling: the hooks on the main view's two mesh cull tests (pass-through until on);
+  // before LoadConfig, which may switch it on
+  culling_off::Init();
   // The game's sound back if a replay's sound track was cut short last time
   replay_audio::Init();
 
   LoadConfig();
+  // GAME > Pose: the game's pose blend hooked here at the start, not at the first Take on the game's thread (that
+  // frame took 45 - 53 ms, CT.log 2026-11-13; that making the hook, which freezes every thread, is why is inferred).
+  // Last, so everything before the first level is made as early as before
+  pose_editor::Init();
   return true;
 }
 
@@ -1141,6 +1215,7 @@ void Main::LoadConfig()
   m_pCameraManager->ReadConfig(m_pConfig.get());
   m_pInputSystem->ReadConfig(m_pConfig.get());
   worldimages::ReadConfig(m_pConfig.get());
+  pose_editor::ReadConfig(m_pConfig.get());
   m_pUI->SetTextSize((int)m_pConfig->GetInteger("General", "TextSize", 1));
   m_pUI->SetDrawOwnCursor(m_pConfig->GetBoolean("General", "DrawMenuCursor", false));
 }
@@ -1166,6 +1241,7 @@ void Main::SaveConfig()
   file << m_pCameraManager->GetConfig();
   file << m_pInputSystem->GetConfig();
   file << worldimages::GetConfig();
+  file << pose_editor::GetConfig();
 
   file.close();
 }

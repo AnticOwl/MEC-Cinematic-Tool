@@ -11,6 +11,8 @@ A rebuild of Hattiwatti's Mirror's Edge Catalyst cinematic tools on his
 - **load the city around the camera**, so a far-away camera isn't surrounded by missing props
 - time freeze, HUD toggle, time of day, Fix LOD, draw and shadow distance, motion blur, visual
   effects (color, DoF, grain, light, tonemap, vignette, fog with a greenscreen) and lights
+- a **pose editor** for Faith and other characters: bone by bone, keyframes, animation clips and
+  voices with lip sync
 
 ## Installing
 
@@ -21,6 +23,11 @@ A rebuild of Hattiwatti's Mirror's Edge Catalyst cinematic tools on his
 No injector is needed: the game loads `usp10.dll`, which loads the tools. It works next to
 Catalyst Clarity; another mod with its own `usp10.dll` can't be used at the same time. Windows 10
 or 11. To uninstall, delete the two files and the `Cinematic Tools` folder.
+
+The emotion model is a separate, optional download (the second zip on the release page; the model
+is about 660 MB and licensed for non-commercial use only): unpack it into the game folder like the
+tools, and it goes in `Cinematic Tools\EmotionModel`. Only the Pose window's Voice → *From the
+voice* needs it.
 
 Settings are saved in `Cinematic Tools\config.ini`, the log in `Cinematic Tools\CT.log` (the
 previous one is kept as `CT.previous.log`, with `[CRASH]` lines at the end if the game crashed).
@@ -35,6 +42,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 This fills `dist/` with `CT_MirrorsEdge.dll` and `usp10.dll` (static CRT, no redistributable
 needed). The C4244 warnings from `Input/InputSystem.cpp` come from the template.
+
+It also builds `EmotionHelper.exe` and makes `dist/EmotionModel` (the helper, its README and the
+model's license) for the optional emotion model download. `emotion_feel.onnx` isn't built there:
+it is made and added by hand, see `tools/emotion_model/README.md`.
 
 ## Controls
 
@@ -78,13 +89,20 @@ Tracks and lights aren't saved when the game closes.
 - **CAMERA**: camera on / off; camera tracks and keyframes (shot sequences, the track's path with
   dots to drag, a preview camera); moves round a focus (orbit, aim, dolly zoom, auto-focus); how the
   camera moves (heavy camera, fly level, speed by height, camera collision); camera shake; letterbox
-  and guide lines; wide fields of view (Panini); motion blur and camera speeds. *Show Faith's body*
-  shows her third-person body, hair included.
-- **GAME**: game speed; time of day and HUD; Faith (outfit, no arm tattoo, no MagRope, no bag, the
-  gridlink); *Pose*, a pose editor; *Faith in the streets* (*Solid street*); detail; level
-  streaming (*Load the world around the camera*, districts, the real Shard from anywhere); sun
-  shadows. The time of day controls are disabled while MECMP is open, because MECMP syncs the time
-  of day.
+  and guide lines; wide fields of view (Panini); *Time-lapse* (the clock run on a frame at a time,
+  each frame with its own light saved as a picture, the camera still or along a track); motion blur
+  and camera speeds. *Show Faith's body* shows her third-person body, hair included.
+- **GAME**: game speed; time of day and HUD; *First camera view* (*Default*, the game's own, or
+  *Bodycam*, a camera worn on Faith's chest, helmet or shoulder); Faith (outfit, no arm tattoo, no
+  MagRope, no bag, the gridlink); *Pose*, a pose editor; *Faith in the streets* (*Solid street*);
+  detail; level streaming (*No culling*, *Load the world around the camera*, districts, the real
+  Shard from anywhere); sun shadows. The time of day controls are disabled while MECMP is open,
+  because MECMP syncs the time of day.
+  - The **Pose window** (*Pose* → *Open the Pose window...*): Faith and other characters posed
+    bone by bone, with keyframes on a timeline (saved to a file and loaded back), animation clips
+    (FBX from Mixamo or another human rig, Unity humanoid `.anim`) and *Voice*: a sound file played
+    on a posed character with lip sync, a living face and, with the optional emotion model, the
+    feeling read from the voice (*From the voice*).
 - **FOLLOW**: *Follow Faith*, or click something in the *Nearby* list to follow it (the camera goes
   next to it), or aim at it and use *Attach to what the camera looks at*. *Turn with it*, *Tilt with
   it too* and *Smoothing* change how the camera follows. The list's groups (People, Cars, Drones,
@@ -117,13 +135,12 @@ camera, ahead of it and along the selected track:
 - The game crashes when some of its limits run out (zones, meshes, model instances, the renderer's
   draw batches and memory). The tools watch them and hold the camera's zones back in time; the
   menu shows how full each one is.
-- *Room for the whole city* (on by default): the game files what it draws in one draw batch, room
+- *Room for the whole city* (always on): the game files what it draws in one draw batch, room
   for 111872 instances, far less than the whole city needs (in busy parts what's loaded around
-  Faith alone takes about 75 % of it). On, the renderer's eight unused batches take the rest.
-  Switched on or off, it takes effect only while the renderer's first draw batch is still well
-  short of where the spread starts and its other batches have never been used; CT.log says when
-  it's switched.
-- At a limit (the draw batch at 80 %, or with *Room for the whole city* on the renderer's
+  Faith alone takes about 75 % of it). The renderer's eight unused batches take the rest. It
+  starts only while the renderer's first draw batch is still well short of where the spread starts
+  and its other batches have never been used; until then the menu says it's waiting.
+- At a limit (the draw batch at 80 %, or, once *Room for the whole city* is on, the renderer's
   instance list) the camera's extra zones are held back; a little higher the least important go:
   what's behind the camera first, then what's in view, then the *Always* districts, then the point
   ahead of the camera. Right at the limit the rain's zones and the real Shard's go too (before the
@@ -137,15 +154,21 @@ camera, ahead of it and along the selected track:
 *Fix LOD* and *Show small objects far away* help with the detail of what is loaded. *Smooth
 animations far away* (characters past 10 m move as smoothly as near ones) is on by default, and
 *Billboard quality* is at *Much sharper* (the video billboards' full-size video allowed, and their
-bigger versions from farther away).
+bigger versions from farther away). *No culling (camera view)* draws what's loaded where the game
+would leave it out (behind other things, small, or just outside the view), at a cost in fps.
 
 ## Credits and license
 
 - [Hattiwatti](https://github.com/Hattiwatti) for the original tools and the CinematicTools
   template
 - MEC-TC (Mirror's Edge Catalyst Time Changer) for the time of day address and the stuck clock fix
-- [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui)
-  and [inih](https://github.com/benhoyt/inih)
+- [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui),
+  [inih](https://github.com/benhoyt/inih) and [ufbx](https://github.com/ufbx/ufbx) (MIT or
+  Unlicense)
+- [C++/WinRT](https://github.com/microsoft/cppwinrt) (MIT), in `EmotionHelper.exe`
+- audeering's wav2vec2-large-robust-12-ft-emotion-msp-dim and RAVDESS for the optional emotion
+  model (CC BY-NC-SA 4.0; credited in full in its download)
 
 MIT, see `LICENSE`. The bundled libraries keep their own licenses (`THIRD_PARTY_NOTICES.md`);
-include that file with any release of the DLLs. See `CHANGELOG.md` for what changed in each version.
+include that file with any release of the DLLs or of `EmotionHelper.exe`. See `CHANGELOG.md` for
+what changed in each version.

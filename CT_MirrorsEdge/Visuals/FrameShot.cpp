@@ -95,7 +95,11 @@ namespace
     if (SUCCEEDED(hr))
       util::log::Write("Frame picture: %s saved (%u x %u)", name, width, height);
     else
+    {
+      // (the stream made the file before anything was written: none left half-written, 2026-11-15)
+      DeleteFileW(path.c_str());
       util::log::Warning("Frame picture: %s couldn't be written (HRESULT 0x%X)", name, hr);
+    }
     g_Writing = false;
   }
 }
@@ -104,6 +108,12 @@ void frameshot::Request(std::wstring const& path)
 {
   std::lock_guard<std::mutex> lock(g_Mutex);
   g_Path = path;
+}
+
+void frameshot::Cancel()
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  g_Path.clear();
 }
 
 bool frameshot::Busy()

@@ -51,4 +51,10 @@ namespace ground
 
   // One line for the menu: what the floor does now
   const char* GetStatus(char* buffer, size_t size);
+
+  // For other parts' checks (road traffic's ground check, diagnostics), any thread: the road data's surface at (x, z),
+  // the highest no higher than top (false: none there); and Faith's feet as the camera last gave them (UpdateGates:
+  // every frame, Solid street on or off; false when none came for over a second)
+  bool RoadHeightUnder(float x, float z, float top, float& height);
+  bool LastFeet(float* feet);
 }

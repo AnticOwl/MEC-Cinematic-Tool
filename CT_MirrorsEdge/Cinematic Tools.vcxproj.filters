@@ -19,6 +19,9 @@
     <Filter Include="Source Files\Camera">
       <UniqueIdentifier>{7040c13f-c219-4522-a3ac-a9d283be9483}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\ufbx">
+      <UniqueIdentifier>{29c292ec-4af6-58e5-a5cf-b2686ba9375d}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Source Files\inih">
       <UniqueIdentifier>{f2f63845-aa38-4ce1-b94d-fc03140fa0fe}</UniqueIdentifier>
     </Filter>
@@ -105,6 +108,57 @@
     <ClCompile Include="Camera\PausedHair.cpp">
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
+    <ClCompile Include="Camera\PoseClips.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\PoseKeys.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\PoseSkeletonLive.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\Voice.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceFace.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceLife.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceLifeFace.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceAlive.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceFeel.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceFeelFace.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceGaze.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceEmotion.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceDecode.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoiceMouth.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\VoicePlayer.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\PoseClipsUnity.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="ufbx\ufbx.c">
+      <Filter>Source Files\ufbx</Filter>
+    </ClCompile>
     <ClCompile Include="Camera\GroundLevel.cpp">
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
@@ -115,6 +169,18 @@
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
     <ClCompile Include="Camera\RoadTraffic.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\CullingOff.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\Bodycam.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\BodycamMotion.cpp">
+      <Filter>Source Files\Camera</Filter>
+    </ClCompile>
+    <ClCompile Include="Camera\Timelapse.cpp">
       <Filter>Source Files\Camera</Filter>
     </ClCompile>
     <ClCompile Include="Camera\ReplayModels.cpp">
@@ -230,6 +296,63 @@
     <ClInclude Include="Camera\PoseSkeletons.h">
       <Filter>Source Files\Camera</Filter>
     </ClInclude>
+    <ClInclude Include="Camera\PoseClips.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\PoseKeys.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\PoseSkeletonLive.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\Voice.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceFace.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceLife.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceLifeFace.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceAlive.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceFeel.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceFeelFace.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceFeelTables.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceGaze.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceEmotion.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceDecode.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoiceMouth.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\VoicePlayer.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\PoseClipsUnityData.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\PoseRest.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="ufbx\ufbx.h">
+      <Filter>Source Files\ufbx</Filter>
+    </ClInclude>
     <ClInclude Include="Camera\GroundLevel.h">
       <Filter>Source Files\Camera</Filter>
     </ClInclude>
@@ -240,6 +363,18 @@
       <Filter>Source Files\Camera</Filter>
     </ClInclude>
     <ClInclude Include="Camera\RoadTraffic.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\CullingOff.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\Bodycam.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\BodycamMotion.h">
+      <Filter>Source Files\Camera</Filter>
+    </ClInclude>
+    <ClInclude Include="Camera\Timelapse.h">
       <Filter>Source Files\Camera</Filter>
     </ClInclude>
     <ClInclude Include="Camera\RoadTrafficCore.h">

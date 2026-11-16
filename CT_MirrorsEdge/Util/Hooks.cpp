@@ -13903,7 +13903,27 @@ HCURSOR WINAPI hSetCursor(HCURSOR hCursor)
 
 namespace
 {
+  // The hooks made. Added to by the tools' start-up thread and, at a first
+  // use, by the game's thread and the drawing thread (CreateGameHook, and
+  // HookDepthClears' CreateHook), so only under m_CreatedHooksMutex: two
+  // threads adding to a map at once can break it (2026-11-13 CT.log: the
+  // drawing thread's first-frame hooks and the start-up thread's road
+  // traffic ones in the same second)
   std::unordered_map<std::string, util::hooks::Hook> m_CreatedHooks;
+  std::mutex m_CreatedHooksMutex;
+
+  // A hook made, added to the list: false when one of that name is in it already
+  bool NoteCreatedHook(std::string const& name, util::hooks::Hook const& info)
+  {
+    std::lock_guard<std::mutex> lock(m_CreatedHooksMutex);
+    return m_CreatedHooks.emplace(name, info).second;
+  }
+
+  bool IsHookCreated(std::string const& name)
+  {
+    std::lock_guard<std::mutex> lock(m_CreatedHooksMutex);
+    return m_CreatedHooks.count(name) != 0;
+  }
 
   // Placeholder reservation next to the game exe, released right before the
   // game hooks are created so MinHook's VirtualAlloc can land in it
@@ -14022,14 +14042,15 @@ static MH_STATUS MinHookCreate(LPVOID target, LPVOID detour, LPVOID* original)
 
 // Creates a normal function hook with MinHook,
 // which places a jmp instruction at the start of the function.
+// True when it's made and added to the list (what CreateGameHook gives back)
 template <typename T>
-static void CreateHook(std::string const& name, __int64 target, PVOID hook, T original, bool enable = true)
+static bool CreateHook(std::string const& name, __int64 target, PVOID hook, T original, bool enable = true)
 {
   if (!target)
   {
     util::log::Error("Could not create %s hook, target address is unknown", name.c_str());
     NoteFailedHook(name);
-    return;
+    return false;
   }
 
   LPVOID* pOriginal = reinterpret_cast<LPVOID*>(original);
@@ -14038,7 +14059,7 @@ static void CreateHook(std::string const& name, __int64 target, PVOID hook, T or
   {
     util::log::Error("Could not create %s hook. MH_STATUS 0x%X error code 0x%X", name.c_str(), result, GetLastError());
     NoteFailedHook(name);
-    return;
+    return false;
   }
 
   // enable false: made, the game's code left as it is until it's turned on
@@ -14048,7 +14069,7 @@ static void CreateHook(std::string const& name, __int64 target, PVOID hook, T or
   {
     util::log::Error("Could not enable %s hook. MH_STATUS 0x%X error code 0x%X", name.c_str(), result, GetLastError());
     NoteFailedHook(name);
-    return;
+    return false;
   }
 
   util::hooks::Hook hookInfo{ 0 };
@@ -14056,8 +14077,9 @@ static void CreateHook(std::string const& name, __int64 target, PVOID hook, T or
   hookInfo.Type = util::hooks::HookType::MinHook;
   hookInfo.Enabled = enable;
 
-  m_CreatedHooks.emplace(name, hookInfo);
+  bool listed = NoteCreatedHook(name, hookInfo);
   util::log::Ok("Hooked %s at 0x%I64X%s", name.c_str(), target, enable ? "" : " (off until it's needed)");
+  return listed;
 }
 
 std::vector<std::string> util::hooks::FailedHooks()
@@ -14094,7 +14116,7 @@ static void CreateVTableHook(std::string const& name, PDWORD64* ppVTable, PVOID 
   hookInfo.Original = pOriginal;
   hookInfo.Enabled = true;
 
-  m_CreatedHooks.emplace(name, hookInfo);
+  NoteCreatedHook(name, hookInfo);
 }
 
 void util::hooks::ReserveSpaceNearGame()
@@ -14232,7 +14254,7 @@ static void HookFarFlares()
     info.Address = (__int64)site.pTarget;
     info.Type = util::hooks::HookType::MinHook;
     info.Enabled = true;
-    m_CreatedHooks.emplace(site.Name, info);
+    NoteCreatedHook(site.Name, info);
     util::log::Ok("Hooked %s at 0x%I64X", site.Name, (__int64)site.pTarget);
   }
   g_FlareCave = pCave;
@@ -14259,7 +14281,7 @@ static void HookFarFlares()
   info.Address = (__int64)pSkipAt;
   info.Type = util::hooks::HookType::MinHook;
   info.Enabled = true;
-  m_CreatedHooks.emplace("FlareDrawSkip", info);
+  NoteCreatedHook("FlareDrawSkip", info);
   util::log::Ok("Hooked FlareDrawSkip at 0x%I64X", (__int64)pSkipAt);
   g_FlareSkipHooked = true;
 }
@@ -14347,7 +14369,7 @@ static void HookReflectionFaces()
   info.Address = (__int64)pTarget;
   info.Type = util::hooks::HookType::MinHook;
   info.Enabled = true;
-  m_CreatedHooks.emplace("ReflectionFaces", info);
+  NoteCreatedHook("ReflectionFaces", info);
   util::log::Ok("Hooked ReflectionFaces at 0x%I64X", (__int64)pTarget);
   g_ReflectionCave = pCave;
 }
@@ -14449,7 +14471,7 @@ static void HookMissionCleanup()
   info.Type = util::hooks::HookType::MinHook;
   info.Enabled = true;
   info.Keep = true;
-  m_CreatedHooks.emplace("MissionCleanupGuard", info);
+  NoteCreatedHook("MissionCleanupGuard", info);
   util::log::Ok("Hooked MissionCleanupGuard at 0x%I64X (quitting during a Dash: no server world is taken as none)",
     (__int64)pTarget);
   g_CleanupCave = pCave;
@@ -14780,7 +14802,7 @@ static void HookJobQueueFull()
   info.Address = (__int64)pTarget;
   info.Type = util::hooks::HookType::MinHook;
   info.Enabled = true;
-  m_CreatedHooks.emplace("JobQueueFull", info);
+  NoteCreatedHook("JobQueueFull", info);
   util::log::Ok("Hooked JobQueueFull at 0x%I64X (a job that finds the game's job queue full is kept by the tools and handed on "
     "once there's room; no thread runs another job in its place or waits for room)", (__int64)pTarget);
   g_JobQueueCave = pCave;
@@ -14927,6 +14949,23 @@ void util::hooks::LogJobQueue()
 // (2026-10-25 04:35:28). So a request carries the time the tools set, and its
 // own clock is waited for until it's within TodArrivedSeconds of that, at most
 // TodClockWaitMs.
+// "Already there" goes by the light shown (TodShown), not by its first job's
+// time: a step of its own sets job 0 to the clock with no pass (job 2's is
+// the step's only one, shown two steps later). After a slider drag on
+// 2026-11-13 13:43:41 a step had just started at 08:54 while the light shown
+// was still the reset's (11:21 - 11:29), and the reset at 08:54 was dropped as
+// "already at 08:54". So each pass into a new output buffer is noted as it's
+// filed: a job's request id changed (+ 0, 0x1439507E1) with its flag set
+// (+ 0x18, the request's buffer flag, 0x1439507C5; 0x14379A8B1 moves the
+// buffer written, + 0x10858, on it). In Enlighten's mode 1 (+ 0x10780, live)
+// the light shown is the two buffers after the one written last ((i + 1) % 3
+// and (i + 2) % 3, 0x14378D10A): the two passes before the newest. (The
+// reset's first SolveIterations passes go into all three buffers, and they're
+// noted as that many at its time, so they fill all three here too.) No reset
+// when both are within 2 of the game's own intervals + 120 s of the clock: a
+// step of its own lights 2 intervals ahead, so at its own pace (~330 game s a
+// step) the light shown runs up to ~510 game s off the clock, 480 with the
+// clock stopped.
 namespace
 {
   const __int64 TodStepRva = 0x3950920;
@@ -14954,6 +14993,26 @@ namespace
   const ULONGLONG TodFreshRequestMs = 2000;
   const float TodArrivedSeconds = 120.f;
   const ULONGLONG TodClockWaitMs = 10000;
+  const int TodJobIdOffset = 0;
+  const int TodJobFlagOffset = 0x18;          // set: its passes go into a new output buffer
+  const unsigned int TodNoRequest = 0xFFFFFFFF;
+  const __int64 TodEnlightenRva = 0x256AF40;
+  const int TodEnlightenModeOffset = 0x10780;
+  // Reflections after a reset (2026-11-13, measured, report section 10): they
+  // were final 4 - 5 s after a jump. They're captured again (TakeTodResetSettled)
+  // once TodEarlyPasses of the reset's first job are done (its count + 0x10,
+  // 0x143950827) and again when all are, so they show the new light about a
+  // second sooner and end with all of it. And the reset's later two jobs are
+  // given the reset's own time, not + 1 and + 2 intervals: each time the
+  // manager's output time moved (the third job, + 8 minutes), the Future sky
+  // changed, the game's sky cubemap was captured again and that marked every
+  // reflection to be captured again (0x1436FAB20 -> 0x1436FC9E0,
+  // LocalIBLUpdateWithEnlightenSkyBoxChange): the round going on started over,
+  // 1.1 - 1.3 s after the tools' recapture, both jumps measured (taken from the
+  // timing, not traced through the VE versions; the tools' log now says what
+  // marks them, VisualsManager::NoteReflectionMarks).
+  const int TodJobDoneOffset = 0x10;
+  const int TodEarlyPasses = 3;
 
   typedef void(__fastcall* tTodStep)(__int64 manager, __int64 info);
   typedef void(__fastcall* tTodEvent)(__int64 manager, __int64 event);
@@ -14969,6 +15028,7 @@ namespace
     long Done;            // the last request done (or not needed) for it
     bool Running;         // a reset of ours whose jobs aren't all done
     bool FirstDone;       // its first job (SolveIterations passes) done
+    bool EarlyDone;       // TodEarlyPasses of them done
     ULONGLONG Started;
     float Time;
     int Passes;
@@ -14976,15 +15036,37 @@ namespace
     ULONGLONG WaitStart;
     float WaitClock;      // its clock when that request was first looked at (WaitClockSet)
     bool WaitClockSet;
+    long ResetFor;        // the request the reset running (or last run) is for (TodResetOutcome)
+    bool Quiet;           // its lines left out (a time-lapse frame's, see g_TodQuietId)
+    float ClockAtReset;   // its clock when the reset was done (the time lit is t.Time)
+    // + 0x5C set by a reset of ours and not seen clear since: a newer one goes through 0x14394F050 as while it runs
+    // (what clears + 0x5C isn't known: maybe one of its own steps, which a time-lapse holds)
+    bool OursPending;
+    long WarnedFor;       // the request its clock's "didn't get to" warning was written for (once each)
+    // The reset running is a time-lapse frame's: no TodWatchMs on it (that's real time, and the frame may wait
+    // through a pause, a freeze or a low game speed; the time-lapse gives up after its own game time instead)
+    bool Forced;
+    // Its passes into a new output buffer as they're filed (see TodShown):
+    // each job's request id when last looked at; the times of the last three,
+    // newest last; how many of those are known
+    bool JobsSeen;
+    unsigned int JobIds[3];
+    float Lit[3];
+    int LitCount;
   };
   TodManager g_TodManagers[4] = {};
   std::atomic<long> g_TodWanted{ 0 };
   std::atomic<float> g_TodTarget{ -1.f };   // the time the last request was for, -1 for none
   std::atomic<ULONGLONG> g_TodWantedTick{ 0 };
   std::atomic<bool> g_TodBusy{ false };
-  std::atomic<bool> g_TodSettled{ false };
+  // A reset's first job: its passes done when the reflections should be
+  // captured again (0: not now), and of how many (TakeTodResetSettled)
+  std::atomic<int> g_TodSettled{ 0 };
+  std::atomic<int> g_TodSettledOf{ 0 };
+  bool g_TodDoneKnown = false;   // IsTodDoneCode
   std::atomic<ULONGLONG> g_TodStepTick{ 0 };
   bool g_TodHooked = false;
+  bool g_TodShownKnown = false;   // IsTodShownCode
 
   // Following a clock that runs fast (2026-11-06, the user: "Improve more the
   // Light catches up with time jumps"; offline, the update 0x143950920). Its
@@ -15033,6 +15115,32 @@ namespace
   TodFollow g_TodFollow = { 0, 0, 0.f, 0.f, 0.f, -1.0, 0.f, false, 0.0, 0.0, 0.5, 0 };
   std::atomic<bool> g_TodFollowWanted{ false };
   bool g_TodFollowKnown = false;
+
+  // CAMERA > Time-lapse's resets (2026-11-14, Camera/Timelapse.cpp): a request may be forced (no "already there"
+  // test: every frame gets the same reset at its own time, however close to the light shown; its clock waited for
+  // until within TodForcedArrivedSeconds of the time asked, not the 120 s a jump takes, since a frame's step can be
+  // shorter than that) and quiet (no lines but warnings: one a frame would fill the log). What became of one is
+  // kept for TodResetOutcome: the request a reset ran for once its three jobs were done (at what time, in how
+  // long), one served without a reset, one whose reset wasn't done in TodWatchMs. And while the time-lapse runs the
+  // game's own steps are held (SetTodHoldSteps): the update's own add to its step count is taken off before it
+  // (TodBeforeStep), so the light shown stays the reset's until the frame is taken.
+  const float TodForcedArrivedSeconds = 5.f;
+  std::atomic<long> g_TodForcedId{ 0 };
+  std::atomic<long> g_TodQuietId{ 0 };
+  std::atomic<long> g_TodDoneFor{ 0 };
+  std::atomic<float> g_TodDoneAt{ -1.f };
+  std::atomic<float> g_TodDoneClock{ -1.f };
+  std::atomic<double> g_TodDoneSeconds{ 0.0 };
+  std::atomic<long> g_TodNoResetFor{ 0 };
+  std::atomic<long> g_TodFailedFor{ 0 };
+  std::atomic<bool> g_TodHoldSteps{ false };
+  std::atomic<bool> g_TodHoldLogged{ false };
+  // The level's clock went or changed (ForgetTodManagers): the managers seen are forgotten at the next update, so a
+  // new level's manager (even at an old one's address) starts with nothing of the old one's (a reset running, ours
+  // pending)
+  std::atomic<bool> g_TodForget{ false };
+  // The time-lapse ended: a reset of its still running gets the TodWatchMs watchdog again (TodManager::Forced)
+  std::atomic<bool> g_TodUnforce{ false };
 }
 
 static bool IsTodCode(BYTE const* pBase)
@@ -15108,10 +15216,90 @@ static void TodFormat(float seconds, char* out, size_t size)
   sprintf_s(out, size, "%02d:%02d", (s / 3600) % 24, (s / 60) % 60);
 }
 
-// The Reset for one manager (see above) if it may have it now; false: again
-// after its next update
-static bool TryTodReset(TodManager& t, __int64 manager, ULONGLONG now, float target)
+// What the light shown relies on (see TodShown): a job's flag is its
+// request's buffer flag and its request id is kept in it; the request
+// processor moves the buffer written on that flag; the pair shown in mode 1
+static bool IsTodShownCode(BYTE const* pBase)
 {
+  // movzx edx, byte [rbx + 0x18]; movzx eax, word [rsp + 0x30]; mov [rsp + 0x32], dl
+  static const BYTE flag[] = { 0x0F, 0xB6, 0x53, 0x18, 0x0F, 0xB7, 0x44, 0x24, 0x30, 0x88, 0x54, 0x24, 0x32 };
+  // mov [rbx], eax (the request id); mov eax, [rbx + 8]; mov [rsi], eax; mov dword [rbx + 4], 1
+  static const BYTE id[] = { 0x89, 0x03, 0x8B, 0x43, 0x08, 0x89, 0x06, 0xC7, 0x43, 0x04, 0x01, 0x00, 0x00, 0x00 };
+  // cmp byte [rsi + 2], r14b; je; mov ecx, [r15 + 0x10858]; inc ecx
+  static const BYTE turn[] = { 0x44, 0x38, 0x76, 0x02, 0x74, 0x32, 0x41, 0x8B, 0x8F, 0x58, 0x08, 0x01, 0x00, 0xFF, 0xC1 };
+  // cmp dword [rcx + 0x10780], 1; ...; jne; mov ecx, [rcx + 0x10858]; lea r8d, [rcx + 1]; add ecx, 2
+  static const BYTE shown[] = { 0x83, 0xB9, 0x80, 0x07, 0x01, 0x00, 0x01, 0x48, 0x89, 0xCE, 0xB8, 0x0F, 0xA2, 0x90, 0xC3, 0x8D, 0x80,
+    0x9C, 0x08, 0x1A, 0xE7, 0x75, 0x37, 0x8B, 0x89, 0x58, 0x08, 0x01, 0x00, 0x44, 0x8D, 0x41, 0x01, 0x83, 0xC1, 0x02 };
+  // the same pair handed to the views (0x14379B690): cmp dword [rbx + 0x10780], 1; ...; jne; mov r9d, [rbx + 0x10858];
+  // lea r8d, [r9 + 1]
+  static const BYTE viewsMode[] = { 0x83, 0xBB, 0x80, 0x07, 0x01, 0x00, 0x01 };
+  static const BYTE views[] = { 0x75, 0x43, 0x44, 0x8B, 0x8B, 0x58, 0x08, 0x01, 0x00, 0x45, 0x8D, 0x41, 0x01 };
+  return memcmp(pBase + 0x39507C5, flag, sizeof(flag)) == 0 && memcmp(pBase + 0x39507E1, id, sizeof(id)) == 0 &&
+    memcmp(pBase + 0x379A8B1, turn, sizeof(turn)) == 0 && memcmp(pBase + 0x378D10A, shown, sizeof(shown)) == 0 &&
+    memcmp(pBase + 0x379B78A, viewsMode, sizeof(viewsMode)) == 0 && memcmp(pBase + 0x379B7AB, views, sizeof(views)) == 0;
+}
+
+// Its passes into a new output buffer, noted as they're filed (see TodShown):
+// after each of its updates, a job whose request id changed since the last
+// look (not to none) with its flag set. The ids count up, so two filed
+// between looks go in that order.
+static void TodNotePasses(TodManager& t, __int64 manager)
+{
+  unsigned int ids[3];
+  float times[3];
+  int filed = 0;
+  for (int job = 0; job < 3; ++job)
+  {
+    BYTE const* pJob = (BYTE const*)(manager + TodJobsOffset + job * TodJobSize);
+    unsigned int id = *(unsigned int const*)(pJob + TodJobIdOffset);
+    bool fresh = t.JobsSeen && id != t.JobIds[job] && id != TodNoRequest && pJob[TodJobFlagOffset];
+    t.JobIds[job] = id;
+    if (!fresh)
+      continue;
+    int at = filed++;
+    while (at > 0 && ids[at - 1] > id)
+    {
+      ids[at] = ids[at - 1];
+      times[at] = times[at - 1];
+      --at;
+    }
+    ids[at] = id;
+    times[at] = *(float const*)(pJob + TodJobTimeOffset);
+  }
+  t.JobsSeen = true;
+  for (int i = 0; i < filed; ++i)
+  {
+    t.Lit[0] = t.Lit[1];
+    t.Lit[1] = t.Lit[2];
+    t.Lit[2] = times[i];
+    if (t.LitCount < 3)
+      ++t.LitCount;
+  }
+}
+
+// The light shown, as the times its two buffers were worked out for (see
+// above); false when that isn't known (fewer than three passes noted since it
+// was first seen, another mode, or code not the tools'): then only its first
+// job's time is there to go by
+static bool TodShown(TodManager const& t, float& from, float& to)
+{
+  if (!g_TodShownKnown || t.LitCount < 3)
+    return false;
+  __int64 enlighten = *(__int64 const*)((__int64)g_gameHandle + TodEnlightenRva);
+  if (!enlighten || *(int const*)(enlighten + TodEnlightenModeOffset) != 1)
+    return false;
+  from = t.Lit[0];
+  to = t.Lit[1];
+  return true;
+}
+
+// The Reset for one manager (see above) if it may have it now; false: again
+// after its next update. forced / quiet: a time-lapse frame's (see
+// TodForcedArrivedSeconds); reset: whether one was done (true returned
+// without one: not needed, or it can't have one)
+static bool TryTodReset(TodManager& t, __int64 manager, ULONGLONG now, float target, bool forced, bool quiet, bool& reset)
+{
+  reset = false;
   BYTE const* p = (BYTE const*)manager;
   __int64 data = *(__int64*)(manager + TodDataOffset);
   __int64 clockLink = *(__int64*)(manager + TodClockOffset);
@@ -15136,16 +15324,21 @@ static bool TryTodReset(TodManager& t, __int64 manager, ULONGLONG now, float tar
     t.WaitClock = clock;
     t.WaitClockSet = true;
   }
-  bool arrived = !(target >= 0.f) || TodClockDistance(clock, target) <= TodArrivedSeconds ||
-    TodClockDistance(clock, t.WaitClock) > TodArrivedSeconds;
+  // (a forced one only at the time asked: a time-lapse's frames can be closer together than TodArrivedSeconds, so
+  // a looser test could light the frame before's time)
+  bool arrived = !(target >= 0.f) || (forced ? TodClockDistance(clock, target) <= TodForcedArrivedSeconds :
+    (TodClockDistance(clock, target) <= TodArrivedSeconds || TodClockDistance(clock, t.WaitClock) > TodArrivedSeconds));
   if (!arrived && now - t.WaitStart < TodClockWaitMs)
     return false;
   char wanted[16], seen[16];
   TodFormat(target, wanted, sizeof(wanted));
   TodFormat(clock, seen, sizeof(seen));
-  if (!arrived)
-    util::log::Warning("Time of day lighting: its clock didn't get to %s in %.0f s (it's at %s), its own time taken", wanted,
-      TodClockWaitMs / 1000.0, seen);
+  if (!arrived && t.WarnedFor != t.Waiting)
+  {
+    t.WarnedFor = t.Waiting;
+    util::log::Warning("Time of day lighting: its clock didn't get to %s in %.0f s (it's at %s), %s", wanted,
+      TodClockWaitMs / 1000.0, seen, forced ? "lit at the time asked anyway" : "its own time taken");
+  }
   for (int job = 0; job < 3; ++job)
   {
     int state = TodJobState(manager, job);
@@ -15153,15 +15346,31 @@ static bool TryTodReset(TodManager& t, __int64 manager, ULONGLONG now, float tar
       return false;   // a pass of its own still with Enlighten
   }
   bool pending = p[TodResetPendingOffset] != 0;
-  if (pending && !t.Running)
+  if (pending && !t.Running && !t.OursPending)
     return false;   // the game's own reset still in its first jobs
   int passes = *(int const*)(data + TodSolveIterationsOffset);
-  char from[16], to[16];
-  TodFormat(lit, from, sizeof(from));
-  TodFormat(clock, to, sizeof(to));
-  if (TodClockDistance(clock, lit) <= (std::max)(interval, 120.f))
+  // The light shown (see TodShown), else its first job's time as before; its
+  // own steps light 2 of the game's own intervals ahead (not the following's)
+  float shownFrom = lit, shownTo = lit;
+  bool shownKnown = TodShown(t, shownFrom, shownTo);
+  float own = (g_TodFollow.Driving && g_TodFollow.Manager == manager) ? g_TodFollow.Original : interval;
+  float tolerance = shownKnown ? 2.f * own + 120.f : (std::max)(interval, 120.f);
+  char from[40], to[16];
+  TodFormat(shownFrom, from, sizeof(from));
+  if (shownKnown)
   {
-    util::log::Write("Time of day lighting: already at %s (the clock %s), no reset", from, to);
+    char later[16];
+    TodFormat(shownTo, later, sizeof(later));
+    strcat_s(from, " - ");
+    strcat_s(from, later);
+  }
+  TodFormat(clock, to, sizeof(to));
+  if (!forced && TodClockDistance(clock, shownFrom) <= tolerance && TodClockDistance(clock, shownTo) <= tolerance)
+  {
+    if (shownKnown)
+      util::log::Write("Time of day lighting: the light shown is for %s (the clock %s), no reset", from, to);
+    else
+      util::log::Write("Time of day lighting: already at %s (the clock %s; the light shown isn't known yet), no reset", from, to);
     return true;
   }
   if (pending)
@@ -15177,14 +15386,37 @@ static bool TryTodReset(TodManager& t, __int64 manager, ULONGLONG now, float tar
     util::log::Warning("Time of day lighting: the reset at %s didn't take", to);
     return true;
   }
+  // Its later two jobs at the reset's own time (see TodEarlyPasses): set up,
+  // not filed yet (state 0; filed after job 0's passes). A time-lapse frame's
+  // all three at the frame's own time, job 0 too (it's at state 0 as well, its
+  // time put in its requests when it's filed): the light is that time's even
+  // when its clock is still a second or two behind the tools' (frames can be
+  // closer together than TodForcedArrivedSeconds)
+  float resetTime = *(float const*)(manager + TodJobsOffset + TodJobTimeOffset);
+  if (forced && target >= 0.f && target < 86400.f)
+    resetTime = target;
+  for (int job = forced ? 0 : 1; job < 3; ++job)
+    *(float*)(manager + TodJobsOffset + job * TodJobSize + TodJobTimeOffset) = resetTime;
   t.Running = true;
   t.FirstDone = false;
+  t.EarlyDone = false;
   t.Started = now;
-  t.Time = clock;
+  t.Time = forced ? resetTime : clock;
+  t.ClockAtReset = clock;
   t.Passes = passes;
-  util::log::Write("Time of day lighting: the game's own reset at %s (the light was for %s)%s, %.1f s after it was asked for: %d "
-    "passes there, the bounce light started again, then one at + %.0f s and one at + %.0f s", to, from, pending ? ", again" : "",
-    (now - t.WaitStart) / 1000.0, passes, interval, 2 * interval);
+  t.Quiet = quiet;
+  t.OursPending = true;
+  t.Forced = forced;
+  reset = true;
+  if (!quiet)
+  {
+    char lit[16];
+    TodFormat(t.Time, lit, sizeof(lit));
+    util::log::Write("Time of day lighting: the game's own reset at %s (the light was for %s)%s%s, %.1f s after it was asked for: "
+      "%d passes there, the bounce light started again, then two more there (not %.0f and %.0f game s ahead, so the sky the "
+      "reflections go by stays put)", lit, from, pending ? ", again" : "", forced ? ", a time-lapse frame's, lit at "
+      "the frame's own time" : "", (now - t.WaitStart) / 1000.0, passes, interval, 2 * interval);
+  }
   return true;
 }
 
@@ -15193,6 +15425,12 @@ static void TodAfterStep(__int64 manager)
   ULONGLONG now = GetTickCount64();
   g_TodStepTick = now;
   long wanted = g_TodWanted.load();
+  if (g_TodForget.exchange(false))
+    for (TodManager& m : g_TodManagers)
+      m = TodManager{};
+  if (g_TodUnforce.exchange(false))
+    for (TodManager& m : g_TodManagers)
+      m.Forced = false;
   TodManager* pT = nullptr;
   TodManager* pOldest = &g_TodManagers[0];
   for (TodManager& t : g_TodManagers)
@@ -15207,35 +15445,62 @@ static void TodAfterStep(__int64 manager)
   }
   if (!pT)
   {
-    if (!wanted)
-      return;   // nothing asked yet
+    // (from its first update, before anything is asked: its passes are noted)
     pT = pOldest;
     *pT = TodManager{};
     pT->Manager = manager;
-    // One that turns up (a level loaded) takes only a request just made
-    pT->Done = now - g_TodWantedTick.load() < TodFreshRequestMs ? wanted - 1 : wanted;
+    // One that turns up (a level loaded) takes only a request just made, or a
+    // running time-lapse's frame's (it waits for its outcome)
+    bool fresh = now - g_TodWantedTick.load() < TodFreshRequestMs || (g_TodHoldSteps.load() && g_TodForcedId.load() == wanted);
+    pT->Done = wanted && fresh ? wanted - 1 : wanted;
   }
   TodManager& t = *pT;
   t.Seen = now;
+  // (see TodManager::OursPending)
+  if (!((BYTE const*)manager)[TodResetPendingOffset])
+    t.OursPending = false;
+  TodNotePasses(t, manager);
   if (t.Running)
   {
     int s0 = TodJobState(manager, 0), s1 = TodJobState(manager, 1), s2 = TodJobState(manager, 2);
     char at[16];
     TodFormat(t.Time, at, sizeof(at));
+    // Reflections captured again after TodEarlyPasses of its first job's
+    // passes (when it has more than that), and once all are done
+    int early = (std::min)(TodEarlyPasses, t.Passes);
+    if (g_TodDoneKnown && !t.EarlyDone && !t.FirstDone && early < t.Passes && s0 != TodJobIdle &&
+        *(int const*)(manager + TodJobsOffset + TodJobDoneOffset) >= early)
+    {
+      t.EarlyDone = true;
+      g_TodSettledOf = t.Passes;
+      g_TodSettled = early;
+      if (!t.Quiet)
+        util::log::Write("Time of day lighting: %d of its %d passes at %s done in %.1f s", early, t.Passes, at,
+          (now - t.Started) / 1000.0);
+    }
     if (!t.FirstDone && s0 == TodJobIdle)
     {
       t.FirstDone = true;
-      g_TodSettled = true;
-      util::log::Write("Time of day lighting: its %d passes at %s done in %.1f s", t.Passes, at, (now - t.Started) / 1000.0);
+      g_TodSettledOf = t.Passes;
+      g_TodSettled = t.Passes > 0 ? t.Passes : 1;
+      if (!t.Quiet)
+        util::log::Write("Time of day lighting: its %d passes at %s done in %.1f s", t.Passes, at, (now - t.Started) / 1000.0);
     }
     if (s0 == TodJobIdle && s1 == TodJobIdle && s2 == TodJobIdle)
     {
       t.Running = false;
-      util::log::Write("Time of day lighting: the reset at %s done in %.1f s (its three steps)", at, (now - t.Started) / 1000.0);
+      // (the values first: TodResetOutcome reads the request, then them)
+      g_TodDoneAt = t.Time;
+      g_TodDoneClock = t.ClockAtReset;
+      g_TodDoneSeconds = (now - t.Started) / 1000.0;
+      g_TodDoneFor = t.ResetFor;
+      if (!t.Quiet)
+        util::log::Write("Time of day lighting: the reset at %s done in %.1f s (its three steps)", at, (now - t.Started) / 1000.0);
     }
-    else if (now - t.Started > TodWatchMs)
+    else if (!t.Forced && now - t.Started > TodWatchMs)
     {
       t.Running = false;
+      g_TodFailedFor = t.ResetFor;
       util::log::Warning("Time of day lighting: the reset at %s isn't done after %.0f s (Enlighten paused?), not watched any more", at,
         TodWatchMs / 1000.0);
     }
@@ -15248,8 +15513,18 @@ static void TodAfterStep(__int64 manager)
       t.WaitStart = now;
       t.WaitClockSet = false;
     }
-    if (TryTodReset(t, manager, now, g_TodTarget.load()))
+    // A time-lapse frame's (see TodForcedArrivedSeconds): forced, and quiet after its first frames
+    bool forced = g_TodForcedId.load() == wanted;
+    bool quiet = g_TodQuietId.load() == wanted;
+    bool reset = false;
+    if (TryTodReset(t, manager, now, g_TodTarget.load(), forced, quiet, reset))
+    {
       t.Done = wanted;
+      if (reset)
+        t.ResetFor = wanted;
+      else if (forced)
+        g_TodNoResetFor = wanted;
+    }
   }
   bool busy = false;
   for (TodManager const& m : g_TodManagers)
@@ -15303,8 +15578,22 @@ static void TodBeforeStep(__int64 manager, __int64 info)
   __int64 data = *(__int64*)(manager + TodDataOffset);
   __int64 clockLink = *(__int64*)(manager + TodClockOffset);
   // As TryTodReset: its update steps nothing without these
-  bool usable = g_TodFollowWanted.load() && data && clockLink && (*(BYTE const*)(clockLink + 0x1C) & 0x40) &&
+  bool stepping = data && clockLink && (*(BYTE const*)(clockLink + 0x1C) & 0x40) &&
     *(int const*)(manager + TodCountdownOffset) == -1 && p[TodJobsOnOffset];
+  bool usable = g_TodFollowWanted.load() && stepping;
+  // A time-lapse running (SetTodHoldSteps): no step of its own (the update's own add of dt x 30 to its count taken
+  // off before it, never below 0), so the light shown stays the last reset's; its jobs (the reset's) go on as ever
+  if (stepping && g_TodHoldSteps.load())
+  {
+    float* pCount = (float*)(manager + TodAccOffset);
+    float held = *pCount - *(float const*)info * TodStepRate;
+    *pCount = held > 0.f ? held : 0.f;
+    if (!g_TodHoldLogged)
+    {
+      g_TodHoldLogged = true;
+      util::log::Write("Time of day lighting: its own steps held for the time-lapse (the light stays each frame's reset's)");
+    }
+  }
   if (usable && f.Driving && data != f.Data)
   {
     // (its data was swapped: the one set went with it)
@@ -15446,8 +15735,18 @@ static void HookTodLighting()
   if (!g_TodFollowKnown)
     util::log::Warning("The time of day lighting's step code isn't what the tools know: a time-lapse's light catches up only "
       "at its start and end");
+  // A job's passes done at + 0x10: inc dword [rbx + 0x10]; mov eax, [rbx + 0x10]; cmp eax, [rbx + 0xc] (0x143950827)
+  static const BYTE done[] = { 0xFF, 0x43, 0x10, 0x8B, 0x43, 0x10, 0x3B, 0x43, 0x0C };
+  g_TodDoneKnown = memcmp((BYTE*)g_gameHandle + 0x3950827, done, sizeof(done)) == 0;
+  if (!g_TodDoneKnown)
+    util::log::Warning("The time of day lighting's pass count isn't the code the tools know: reflections are captured again only "
+      "once all of a reset's passes are done");
+  g_TodShownKnown = IsTodShownCode((BYTE*)g_gameHandle);
+  if (!g_TodShownKnown)
+    util::log::Warning("Enlighten's output buffers aren't the code the tools know: a reset after a time jump is skipped by its "
+      "last step's time, not by the light shown");
   CreateHook("TodLightingStep", (__int64)g_gameHandle + TodStepRva, hTodStep, &oTodStep);
-  g_TodHooked = m_CreatedHooks.count("TodLightingStep") != 0;
+  g_TodHooked = IsHookCreated("TodLightingStep");
 }
 
 void util::hooks::SetTodFollow(bool wanted)
@@ -15460,14 +15759,73 @@ bool util::hooks::TodResetAvailable()
   return g_TodHooked;
 }
 
-void util::hooks::RequestTodReset(float clock)
+long util::hooks::RequestTodReset(float clock, bool forced, bool quiet)
 {
   if (!g_TodHooked)
-    return;
+    return 0;
   g_TodTarget = clock;
   g_TodWantedTick = GetTickCount64();
-  ++g_TodWanted;
+  // (its flags before its id is made the one wanted: the hook reads the id, then them)
+  long id = g_TodWanted.load() + 1;
+  g_TodForcedId = forced ? id : 0;
+  g_TodQuietId = quiet ? id : 0;
+  g_TodWanted = id;
   g_TodBusy = true;
+  return id;
+}
+
+int util::hooks::TodResetOutcome(long id, float& litAt, double& seconds, float* clockAt)
+{
+  litAt = -1.f;
+  seconds = 0.0;
+  if (clockAt)
+    *clockAt = -1.f;
+  if (!id)
+    return TodOutcome_Failed;
+  if (g_TodDoneFor.load() == id)
+  {
+    litAt = g_TodDoneAt.load();
+    seconds = g_TodDoneSeconds.load();
+    if (clockAt)
+      *clockAt = g_TodDoneClock.load();
+    return TodOutcome_Done;
+  }
+  if (g_TodNoResetFor.load() == id)
+    return TodOutcome_NoReset;
+  if (g_TodFailedFor.load() == id)
+    return TodOutcome_Failed;
+  return TodOutcome_Working;
+}
+
+void util::hooks::SetTodHoldSteps(bool hold)
+{
+  bool was = g_TodHoldSteps.exchange(hold);
+  if (hold && !was)
+    g_TodHoldLogged = false;
+  // The time-lapse ended: a frame's request still waiting isn't forced or quiet any more (a level loaded later would
+  // otherwise be lit at its time)
+  if (!hold && was)
+  {
+    g_TodForcedId = 0;
+    g_TodQuietId = 0;
+    g_TodUnforce = true;
+  }
+}
+
+void util::hooks::ForgetTodManagers()
+{
+  g_TodForget = true;
+}
+
+bool util::hooks::TodHoldAvailable()
+{
+  return g_TodHooked && g_TodFollowKnown;
+}
+
+long long util::hooks::TodSinceUpdateMs()
+{
+  ULONGLONG last = g_TodStepTick.load();
+  return last ? (long long)(GetTickCount64() - last) : -1;
 }
 
 bool util::hooks::TodResetBusy()
@@ -15475,9 +15833,11 @@ bool util::hooks::TodResetBusy()
   return g_TodHooked && g_TodBusy && GetTickCount64() - g_TodStepTick.load() < TodManagerGoneMs;
 }
 
-bool util::hooks::TakeTodResetSettled()
+bool util::hooks::TakeTodResetSettled(int& passes, int& of)
 {
-  return g_TodSettled.exchange(false);
+  passes = g_TodSettled.exchange(0);
+  of = g_TodSettledOf.load();
+  return passes > 0;
 }
 
 // A jump at pSite (rel32, 5 bytes) to pTarget, the rest of the site's
@@ -15863,7 +16223,7 @@ void util::hooks::EnlargeZoneSlots()
     info.Type = util::hooks::HookType::MinHook;
     info.Enabled = true;
     info.Keep = true;
-    m_CreatedHooks.emplace(hook.Name, info);
+    NoteCreatedHook(hook.Name, info);
     util::log::Ok("Hooked %s at 0x%I64X", hook.Name, (__int64)hook.pTarget);
   }
   g_ZoneSlotsMoved = true;
@@ -16096,7 +16456,7 @@ void util::hooks::EnlargeRecordPool()
   info.Type = util::hooks::HookType::MinHook;
   info.Enabled = true;
   info.Keep = true;
-  m_CreatedHooks.emplace("RecordPoolConstructor", info);
+  NoteCreatedHook("RecordPoolConstructor", info);
   util::log::Ok("Hooked RecordPoolConstructor at 0x%I64X", (__int64)pCtor);
   g_RecordBlocksMoved = true;
   util::log::Ok("The renderer's instance records have room for %u instead of 262144 (code at 0x%I64X)",
@@ -16390,7 +16750,7 @@ void util::hooks::Init()
     if (IsBatchAddCode(pAdd))
     {
       CreateHook("BatchAdd", (__int64)pAdd, hBatchAdd, &oBatchAdd);
-      g_BatchAddHooked = oBatchAdd && m_CreatedHooks.count("BatchAdd") != 0;
+      g_BatchAddHooked = oBatchAdd && IsHookCreated("BatchAdd");
     }
     else
       util::log::Warning("The renderer's add isn't the code the tools know, its draw batches can't be spread");
@@ -16455,7 +16815,7 @@ void util::hooks::Init()
   bool triggerCodeKnown = CameraTriggerCodeKnown();
   if (triggerCodeKnown)
     CreateHook("CameraTriggerInit", (__int64)g_gameHandle + CameraTriggerInitRva, hCameraTriggerInit, &oCameraTriggerInit);
-  bool triggersHooked = triggerCodeKnown && oCameraTriggerInit && m_CreatedHooks.count("CameraTriggerInit") != 0;
+  bool triggersHooked = triggerCodeKnown && oCameraTriggerInit && IsHookCreated("CameraTriggerInit");
   g_CameraTriggerCodeOk = triggersHooked ? 1 : 0;
   if (!triggersHooked)
     util::log::Warning("The camera area triggers' set-up %s: Unbroken Shard and Bauble and the Shard office blinds (Kruger's "
@@ -16501,6 +16861,10 @@ void util::hooks::CheckPresentHooks()
 // In some cases it's useful or even required to disable all hooks or just certain ones
 void util::hooks::SetHookState(bool enable, std::string const& name)
 {
+  // (the list under its lock while it's gone through: a hook another thread
+  // makes meanwhile waits for this to be added. MinHook's own lock is never
+  // held by a thread that asks for this one, so the two can't wait on each other)
+  std::lock_guard<std::mutex> lock(m_CreatedHooksMutex);
   if (name.empty())
   {
     if (enable)
@@ -16566,7 +16930,20 @@ void util::hooks::SetHookState(bool enable, std::string const& name)
 
 bool util::hooks::CreateGameHook(char const* name, __int64 target, PVOID detour, LPVOID* original)
 {
-  size_t before = m_CreatedHooks.size();
-  CreateHook(name, target, detour, original);
-  return m_CreatedHooks.size() > before;
+  // Its own hook's result: the list's size compared before and after counted
+  // another thread's hook made meanwhile as this one (the start-up thread and
+  // the drawing thread make theirs in the same seconds)
+  bool timed = util::DiagnosticsOn();
+  ULONGLONG from = timed ? GetTickCount64() : 0;
+  bool made = CreateHook(name, target, detour, original);
+  // Diagnostic: a hook that took a second or more to make, the wait for
+  // MinHook's lock included
+  if (timed)
+  {
+    ULONGLONG took = GetTickCount64() - from;
+    if (took >= 1000)
+      util::log::Write("Hook timing (diagnostic): %s took %.1f s to make, on thread %u", name, took / 1000.0,
+        (unsigned)GetCurrentThreadId());
+  }
+  return made;
 }

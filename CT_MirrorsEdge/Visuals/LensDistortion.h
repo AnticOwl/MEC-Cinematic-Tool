@@ -16,6 +16,12 @@ namespace lensdistortion
   // LensDistortionGain and LensDistortionCubicGain
   void Set(bool on, float gain, float cubicGain);
 
+  // Game thread, from the camera hook: GAME > First person > Bodycam's
+  // fisheye (Bodycam.cpp), on while the bodycam writes the view. The same
+  // bend with this gain (no cubic gain), drawn when the one above is off: the
+  // VISUALS one wins.
+  void SetBodycam(bool on, float gain);
+
   // Render thread, from the Present hook, on the game's swapchain only
   void Apply(IDXGISwapChain* pSwapChain, ID3D11Device* pDevice, ID3D11DeviceContext* pContext);
 }

@@ -109,12 +109,29 @@ namespace util
     // hooked; the game's own Reset of it asked for, for the time the tools set
     // (done in its update once its own clock is there and it may be); whether
     // one is asked for and not done yet, or its passes still run; true once
-    // when a reset's first passes are done (the light at the new time is
-    // shown).
+    // when the reflections should be captured again: 3 of a reset's first
+    // passes done, and again all of them (passes: how many are done, of: of
+    // how many).
     bool TodResetAvailable();
-    void RequestTodReset(float clock);
+    // (returns the request, 0 when not hooked. forced: a time-lapse frame's, done at the time asked however close
+    // the light shown is, its clock waited for until within 5 s of it; quiet: no log lines but warnings. Called
+    // under VisualsManager's lock only, so two requests never get the same id.)
+    long RequestTodReset(float clock, bool forced = false, bool quiet = false);
     bool TodResetBusy();
-    bool TakeTodResetSettled();
+    bool TakeTodResetSettled(int& passes, int& of);
+    // What became of a request (CAMERA > Time-lapse): working; done (its reset's three jobs, lit at litAt, in
+    // seconds; clockAt: its lighting's own clock when the reset was done); served without a reset (its lighting
+    // can't have one: no clock, no jobs, its countdown); its reset not done in 60 s
+    enum TodOutcome { TodOutcome_Working, TodOutcome_Done, TodOutcome_NoReset, TodOutcome_Failed };
+    int TodResetOutcome(long id, float& litAt, double& seconds, float* clockAt = nullptr);
+    // While on, the game's own steps of its time of day lighting are held (no new step starts), so the light shown
+    // stays the last reset's (a time-lapse running); whether the tools know that code; real ms since its lighting
+    // last updated (-1: never)
+    void SetTodHoldSteps(bool hold);
+    bool TodHoldAvailable();
+    long long TodSinceUpdateMs();
+    // The level's clock went or changed: the lighting managers seen are forgotten at the next update
+    void ForgetTodManagers();
     // Whether its lighting may follow a clock that runs fast (a time-lapse:
     // the hooks' "Following a clock that runs fast"), every update (Light
     // catches up with time jumps on, a level, no MECMP)

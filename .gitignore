@@ -27,6 +27,11 @@ __pycache__/
 *.npz
 *.npy
 
+# The optional emotion model and the download it is made from (about 660 MB each, CC BY-NC-SA 4.0): never committed,
+# see tools/emotion_model/README.md
+*.onnx
+*.safetensors
+
 # Street level's props data as made offline (144 MiB, over GitHub's limit): build.ps1 packs it into
 # Resources/GroundProps.ctpk, which is committed
 CT_MirrorsEdge/Resources/GroundProps.bin

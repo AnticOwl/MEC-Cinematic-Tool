@@ -203,6 +203,9 @@ public:
   // The selected track at a moment (seconds of track time), as it plays;
   // false where that isn't a place of its own (round a focus, or no track)
   bool SampleAt(double time, CatmullRomNode& out);
+  // The selected track's time of day at time (seconds of track time) as it
+  // plays it; false where its keyframes have none (CAMERA > Time-lapse)
+  bool TimeOfDayAt(double time, float& clock);
   // The selected track's keyframes
   std::vector<CatmullRomNode> const& GetNodes() { return m_Tracks[m_SelectedTrack].Nodes; }
   // Keyframes put in at those moments with those places (the rest as the
@@ -213,6 +216,8 @@ public:
 
   // For the status bar
   double GetPlaybackTime() { return m_CurrentTime; }
+  // The time from the start of what plays: a playing shot sequence's earlier shots added (as Seek gives a replay)
+  double GetSequenceTime() { return m_CurrentTime + (m_SequencePlaying ? m_SequenceOffset : 0.0); }
   float GetPlaybackSpeed() { return m_PlaybackSpeed; }
   float GetTrackLength() { auto& nodes = m_Tracks[m_SelectedTrack].Nodes; return nodes.empty() ? 0.f : nodes.back().TimeStamp; }
   std::string const& GetTrackName() { return m_Tracks[m_SelectedTrack].Name; }

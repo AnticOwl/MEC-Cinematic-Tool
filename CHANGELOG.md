@@ -1,5 +1,1405 @@
 # Changelog
 
+## Version 2.1.0
+
+- **Release 2.1.0: diagnostics off for users, no local paths in the DLL, the emotion model a separate download**
+  (2026-11-16).
+  - The research and measurement CT.log lines added since 2.0.2 (Pose and Voice, No culling, Bodycam, reflections) are
+    now behind the hidden diagnostics switch (`[Debug] Diagnostics`, util::DiagnosticsOn()), like the others since 2.0.0.
+  - ufbx's asserts are off (`UFBX_NO_ASSERT`): the DLL holds no build paths, and a bad FBX file no longer stops the
+    game on an assert.
+  - The time-lapse's unused same-time test mode was removed.
+  - Test-status wording was taken out of the tooltips.
+  - The emotion model (EmotionHelper.exe + emotion_feel.onnx) ships as a separate, optional zip.
+  - The KSEC work (KSEC chases, KSEC in the streets) is not in this release.
+
+- **Time-lapse and Pose window: fewer (?), shorter help** (the user's list, 2026-11-16).
+  - **CAMERA > Time-lapse**:
+    - No (?) on *Camera*, *Clock runs backwards* or *Start time-lapse*.
+    - The *Test: every frame at From* tick is gone; it was never saved, so the test stays off.
+  - **Pose window > Clip**:
+    - A loaded clip now gets one short line: its name and file, its length, frames and frame rate, and how many of
+      its bones turn the character's. When it can't play on the character, the line says why.
+    - The full reading and fit reports are on hover (and in CT.log as before). The yellow *Check:* line stays.
+  - **Pose window > Voice**:
+    - No (?) on *Feeling* or *The sound is heard*.
+    - No (?) in *Settings of the living face* (Blinks, Brows, Head, Eyes, Looks away, Eyes hold their target, Take).
+  - **Pose window > Options**:
+    - *Idle movement*'s (?) is now two sentences.
+    - Most other help texts are one or two sentences: Group the face, Rings on the bone's own axes, the Joints
+      ones, the While the keyframes play ones, the path over the keyframes, Look at, Auto key and Hold the times
+      around a new keyframe.
+  - Checked by read-only agents against copies of the files from before. The critic's five notes were fixed: each
+    short text still states only what the code does, and a clip that can't play shows why.
+  - Build 00f1466ff665 (whole folder, Idle), installed with the game closed (game folder and dist, hash checked).
+    Built without errors; not tested in game.
+
+- **CAMERA > Time-lapse goes along a camera track that's playing, and can take one picture every so long** (the user, 2026-11-16: "timelapse should be able to
+  record it even if you have a camera track"; CT.log 11-16 00:15:39: Still picked, Track #1 playing, the time-lapse
+  refused with "a camera track is playing: stop it first").
+  - With Still picked, a track playing (or paused) when Start is pressed now makes the time-lapse along that track:
+    its frames spread from the track's start to its end, each at its place on it.
+  - Its time of day: the track's own when the track sets the time of day as it plays (its keyframe options' Time of day
+    tick) and has one at every frame, as when it's played; otherwise From - To.
+  - The menu says so while a track plays; CT.log: `Time-lapse: the camera track 'X' was playing, so it goes along it
+    (Still was picked), its start to its end, with ...`. The menu's own Camera setting stays Still.
+  - A track started during a Still time-lapse still stops it (it would move the held camera's game speed).
+  - **New: Pictures > One every so long of the clock** (the user: "also add a slider that takes images per x
+    minutes/seconds since it's a timelapse"): *One picture every* N game seconds or game minutes (a button switches the
+    unit; 1 s - 4 h) from From while it's within To, like a time-lapse camera's interval. The menu shows how many
+    pictures that makes, how many a game hour, and the video's length at the frame rate; over a whole day as many as fit
+    (the next would be From again); more than 20,000 is cut there (the menu says it ends early). Only with the clock
+    From - To (not the same-time test or a track's own time of day, which go by the video's length). Saved as
+    `TimelapsePictures`, `TimelapseEvery` (game seconds), `TimelapseEveryUnit`.
+  - Checked: compiled clean; the offline harness passes with the new cases (a track that sets the time, one that
+    doesn't, one that does but has no time of day on its keyframes; the interval's counts, steps, cut, whole day,
+    backwards over midnight, a run of 6 pictures 2 game minutes apart, the config, the menu soak).
+  - Build **64CB2E245EF2** (11-16 00:30, Idle priority, the whole shared tree: the staged BDA75BD9B1C2's + these).
+    STAGED in `Timelapse_2026-11-14\builds\64CB2E245EF2\`; a job installs it once the game
+    closes, only over E3F1650380FC or BDA75BD9B1C2 (result in install_result.txt there). Superseded by the fixes below
+    (they go in with the pose session's next whole-tree build, staged to land over it). Not committed.
+  - **Fixed after the user's "check about any bugs or issues and fix them no mistakes"** (the first real run's log and
+    pictures read, then a fourth skeptic review of today's changes):
+    - One picture every dropped the last picture for some minute values: the slider leaves 2.1 min as 126.0000076 s, so
+      06:00 - 20:00 gave 400 pictures and no 20:00 one. The interval is now kept in whole game seconds, and the count
+      has a small tolerance.
+    - An interval longer than From - To put the second picture after To: it's now From and To (the menu says so).
+    - The seconds / minutes button changed the value (60 min became 600 s); it only changes how it's shown now.
+    - Over a whole day with an interval that doesn't divide 24 h (7 min), the menu said it loops: it now says the gap at
+      the end isn't even.
+    - With a track playing and Still picked, the menu's count, summary and time estimate are worked out as Start will
+      make them (its own time of day only when it has one at every frame, then by the video's length); the menu line
+      says which. The same-time test along a playing track keeps every frame at From.
+    - Continue of a still time-lapse while a track plays is refused (it would have stopped at once).
+    - A hand-edited `TimelapseEvery` that isn't a number or is 0 or less falls back to 60 s.
+    - The job queue's line came every frame (its window closes 10 s after a jump; frames are ~25 s apart with the whole
+      city): now the run's first two frames and every 30th.
+    - The HUD line said the HUD *is* in the pictures; from high up none of it showed. It now says whatever of it is on
+      screen is.
+    - The install-when-closed script (`Timelapse_2026-11-14\tools\install_when_closed.ps1`): every failure caught and
+      written down, the DLL swapped in (a copy beside it, then a move over it), the old one put back if anything fails
+      after the game folder's changed. Tested on temporary files: installs, refuses another build, rolls back.
+    - Checked: compiled clean; the offline harness passes (36 runs, new cases for each fix).
+    - In **B1F4273D6225** (the pose session's whole-tree build, 11-16 02:01 at Idle, from these files as of 01:05),
+      INSTALLED 02:03 with the game closed (game folder and dist); every one of these fixes' strings checked in the DLL.
+      64CB2E245EF2 was never installed. Not tested in game. Not committed.
+  - **Measured on the first real run** (Research_Timelapse section 1): no exposure flicker (the sky smooth); at night
+    the lit city centre changes between frames (the world moves ~25 game s a frame), by day it's smooth; the job queue
+    62 - 66 % full after each frame, never full.
+
+- **GAME > Level streaming > No culling: a View margin and a Small objects range** (the user, 2026-11-15, after trying
+  it: "can we find any way to improve fps with this? right now when you enable it you get 7 fps with my pc").
+  - **Measured first** (CT.log 13:49 - 13:54): about 100 fps off, about 7 fps on. The game's Present call stayed at
+    0.2 ms, so the time goes on the CPU. The camera's view drew about 325,000 meshes instead of about 40,000; most of
+    the extra are outside the view, where they can't be seen at all.
+  - **View margin** (0 - 90 degrees, default 20; at the top, all around = the earlier behaviour): a mesh outside the view
+    is let in only within this angle past the view's edges, as seen from the camera (the game's own side and near
+    planes, moved out; the far plane keeps the game's own cut, so the draw distance stays).
+  - **Small objects** (default: at any distance; at the left, the game's own size test): a mesh the game found too
+    small is let in only out to this distance from the camera.
+  - The occlusion test stays skipped, as before.
+  - CT.log's 10-s line now splits what's let in (outside the view, within the margin / too small) and what's left to
+    the game (past the margin / small ones past their range), and counts planes that couldn't be read or weren't laid
+    out as expected (then the margin goes on all 6, the earlier rule). A changed setting is logged once it has held
+    for a second: `No culling: now view margin ..., small objects ...`.
+  - `[Misc] NoCullingViewMargin` = 20, `NoCullingSmallRange` = 2000 (any distance).
+  - **Checked:** a skeptic review (its finding that the margin also pushed out the far draw-distance cut, by 1.5x at
+    20 degrees and with no limit in the band's corners, is fixed, plus several smaller ones); the offline harness:
+    1,230,059 checks, including a geometric stand-in for the game's test with a double-precision reference over 6,000
+    random views (407,996 meshes judged), 20 fixed cases at known angles and distances (10 / 19 / 21 / 30 degrees past
+    an edge, behind the camera, past the far plane at 26 km and 37 km, 72 degrees off at 1,000 km), a broken plane, an
+    odd plane layout, 177 M calls from 8 threads with the sliders clicked under ImGui 1.61. **The fps it gives back is
+    not measured yet.**
+  - Build **A2CBA749CC53** (14:31, Idle, the whole folder: C1FAE37FBDAB's tree plus this and the road traffic
+    session's cars and walkers on the ground, cleared by that session). **INSTALLED 14:32:31** with the game closed
+    (game folder and dist, hashes checked twice; C1FAE37FBDAB kept as
+    `Culling_Off_2026-11-14\builds\A2CBA749CC53\installed_before_A2CBA749CC53.dll`).
+
+- **Road traffic: cars and walking people on the ground** (the user, 2026-11-15: "make sure that every car and traffic
+  in general are actually on the ground check for faith's pos to find what ground is"). In the shared folder 14:10.
+  Built in E883E6191F7A (14:12, Idle priority, the whole folder), which is NOT installed: its staged install was
+  stopped at 14:16 because that build also holds the culling session's CullingOff edits, held until that session's
+  review. **INSTALLED in the culling session's A2CBA749CC53** (14:31, Idle, the whole tree with these files as tested;
+  installed 14:32:31 with the game closed). **Not tested in game.**
+  - **What the ground is:** the drawn street (`Resources\GroundRoads.bin`, the road meshes' tops). It is what Faith
+    stands on in the street with Solid street: 37 of 39 of her foot positions in the last two CT.logs are within
+    1.3 cm of it.
+  - **Cars:** the game's road nodes sit on the drawn road, but a car's height ran in a straight line from node to
+    node, while the road rises and dips between them: 22% of the lanes were 0.2 - 0.89 m in the air and 21% were
+    0.1 - 0.36 m into the road. Now each lane follows the road's own height, about every metre
+    (`Camera\RoadTrafficHeights.h`, generated from the road data), and a car takes it where it is. Where road pieces
+    lie stacked, it takes the top one that goes on for a metre, so it isn't lifted by a kerb lip under its middle.
+    - Offline (the rules on every lane of the city, 300 s): cars more than 10 cm off the road 47% -> 0.011% of
+      car-frames, the worst +0.89 m -> 0.12 m. What's left is at a few steps in the road mesh itself (up to 24 cm),
+      which a car now ramps over in a metre.
+  - **Walking people:** the game's walker height also runs straight to the next node's height, and on the street a
+    fifth of the walking nodes are off the pavement. Whole placements walked 16 cm inside it, one loop 1 m under it,
+    and some nodes floated up to 1.1 m. The 218 street nodes that are off get the pavement's height
+    (`Camera\WalkersFloors.h`), so walkers walk straight between pavement heights. Walkers on roofs and walkways, P25
+    (a raised floor the data hasn't got) and a few floats with no evidence either way are left as the game has them.
+    - Offline (the walker rules with a walker on every path, 240 s): walkers more than 10 cm off the street
+      35% -> 7.2%, the lowest -1.02 m -> -0.63 m.
+  - **Faith's position as the check:** with diagnostics on, every 10 s CT.log has "Road traffic: the ground at
+    Faith (...)": her feet against the road under her, and the cars within 80 m and walkers within 40 m against the
+    road under them (the average, how many are more than 5 cm off, the worst one and where). The street-level code
+    gives that (two read-only additions to GroundLevel).
+  - **Left / not known:** the elevated highways and the underground loop have no road data (their cars as before);
+    cars don't tilt on slopes (the game keeps no pitch); where each model's soles are against its height is
+    unknown; the old car and walker tests and the game-data tools were lost in the 11-14 scratch cleanup, so this
+    was checked with new tests in `Road_Traffic_Ground_2026-11-15\` (kept in the project folder).
+  - Research_Road_Traffic_2026-11-03.md section 16.
+
+- **New: GAME > Level streaming > No culling (camera view)** (the user, 2026-11-14: "lets add a tick that disables
+  frostum culling and culling in general in the level streaming category"; the research is in
+  `Research_Culling_Off_2026-11-14.md`, its tools in `Culling_Off_2026-11-14\tools\`).
+  - **What it does:** the camera's view gets every mesh the renderer has loaded: the game's view frustum and
+    small-object (screen size) tests are passed for every instance, and its occlusion test (meshes behind other
+    things) is skipped. What's loaded doesn't change (that's the other Level streaming settings).
+  - **How:** the game culls with one of two mesh culls, picked every frame by its MeshCull HiEnable setting: its tree
+    cull (1, the game's own; read live) or its flat cull (0). While the tick is on, the setting is 0 (the game's value
+    saved first, written back when it's off), and hooks on the flat cull's camera-view tests (0x1436C7AD0 /
+    0x1436C77E0) add every instance after the game's own test, for every world view except reflection captures and
+    planar reflections (types 1, 4, 5). Bit 31 (the "not too small" mark the other views need) stays the game's.
+  - **A guard:** past WorldRenderSettings.GenericEntityMaxVisibleEntityCount (32768) visible generic entities in a
+    world view, the game's genProcessCull job (0x143714D50) would read past its list; a hook holds its count to the
+    room while on (and 3 s after), so the extra ones are dropped as the game's flush means them to be.
+  - **Not opened up** (culled by the flat cull's own tests while on, so they can differ a little from the game's
+    tree cull): shadows and the other views of the camera's world view, reflection captures, planar reflections.
+    Not part of the mesh cull, so unchanged: particles (their frustum test comes before their size and distance
+    tests), decals, lights, terrain, characters' animation culling.
+  - **Costs fps:** the flat cull tests every loaded instance every frame, and every loaded mesh is drawn. Not measured
+    yet.
+  - `[Misc] NoCulling` = false (default) / true.
+  - CT.log: `No culling: on. ...`; `No culling: the game's mesh cull was on its tree path (MeshCull HiEnable 1, ...):
+    every world view switched to its flat path (HiEnable 0) while on`; every 10 s `No culling (10 s): cull path ...;
+    ... a frame let into the camera's view that the game's frustum and size tests left out ...; the generic visible
+    list: at most N asked of a room of 32768 ...; world views: type T 'Name' at x y z ...`; `No culling: the game's
+    MeshCull HiEnable is back to 1 ...`; `No culling: off after N s. ...`.
+  - **Checked:** two adversarial reviews against the game's code (the first found the tree path: the first version
+    would have done nothing; the second the visible list's room); every finding fixed. The offline harness under the
+    tools' ImGui 1.61 with its checks live: the 45 code checks against the game's own bytes, 411,038 checks, 350 M cull
+    calls from 8 threads, the setting's switch and give-back (no renderer, a replaced renderer, the loading screen, a
+    foreign object), the guard. **Not tested in game.**
+  - Build **B325903C4079** (11-15 02:25, Idle; 644E0C3D5318's tree plus this). **INSTALLED 02:27:50** with the game
+    closed (game folder and dist, hashes checked twice; 644E0C3D5318 kept as
+    `Culling_Off_2026-11-14\builds\B325903C4079\installed_before_B325903C4079.dll`). Untested in game.
+
+- **New: CAMERA > Time-lapse, a time-lapse made a frame at a time with the light worked out for each** (the user,
+  2026-11-14: "do more research on how we can create timelapses and implement it"; the research, the three ways
+  compared and what isn't known are in `Research_Timelapse_2026-11-14.md`).
+  - **Why not just speed the clock up:** the game lights its time of day in steps (one every 8 s of game time, each lit
+    ahead), reflections take 1 - 2 s a round, and the exact reset only comes when the clock stops, so a live
+    time-lapse steps and flickers.
+  - **What it does, for each frame:** holds the time of day at the frame's time; forces the game's own reset of its
+    lighting there, at exactly that time (the same 5 passes and 2 more for every frame) with the game's own light steps
+    held; captures every reflection again with that light and waits for the nearest round; then saves the finished
+    picture (before the menu) as a PNG into `Cinematic Tools\Captures\Time-lapse <date time>\`, with `Time-lapse.txt`
+    (the settings, a line a frame, the ffmpeg line that makes the video).
+  - **Camera:** Still (held where it is, no shake) or Along the selected camera track (a hyperlapse: the frames spread
+    from its start to its end, the clock from From - To or the track's own time-of-day keyframes).
+  - **Settings:** From / To (or the same time twice for a whole day that loops), Clock runs backwards, Video length and
+    Frame rate (the number of frames), Game time between frames (even motion of people, cars and clouds), and a test
+    that makes every frame at one time to see what would flicker. Saved as `[Camera] Timelapse*`.
+  - **Start / Stop / Continue**, a progress bar, what it's doing, the time left; it waits through pauses, loading and a
+    minimized window, and stops with the reason (level changed, camera turned on or off, track changed, the light not
+    done) so Continue can carry on.
+  - **About 4 - 6 s a frame** on a normal level (much more with the whole city): a 10 s video at 30 fps takes 20 - 30 min.
+  - Supporting changes: Util/Hooks.cpp (forced and quiet resets with a per-request outcome, the game's steps held,
+    `TodManager` kept apart per level), Visuals/VisualsManager.cpp (the time-lapse's clock over all others, the
+    reflections watched), Visuals/FrameShot.cpp (no half-written file left after a failed write; a pending picture can
+    be dropped), TrackPlayer::TimeOfDayAt, CameraManager (the menu, the camera hook call, the still hold).
+  - **Checked:** compiled clean; an offline harness (the menu under the tools' ImGui 1.61 with its checks live, and the
+    whole flow against a fake game: 29 runs, freezes, pauses, failures, Continue, game speed 0.25, the config) passes;
+    three adversarial reviews (game-side code, the state machine, the design) and a second round on the fixes, every
+    finding fixed or written up. **Not tested in game.**
+  - CT.log: `Time-lapse: started, ...`, `Time of day lighting: its own steps held for the time-lapse ...`, a line every
+    frame `Time-lapse: frame N of M at HH:MM:SS (lit at HH:MM:SS): the light X s ..., the reflections Y s ...; saved as
+    0000N.png`, and `Time-lapse: Done: ...` with the ffmpeg line.
+  - Build **644E0C3D5318** (11-15 02:13, Idle priority, the shared tree built by the bodycam session with these files as
+    reviewed; the earlier 6E8DD0FA6C65 of 01:06 had a first, unreviewed version of them). INSTALLED 02:14 with the game
+    closed (game folder and dist, hashes checked; the time-lapse's strings checked in the DLL). **Not tested in game.**
+    Not committed.
+
+- **New: GAME > First person > First camera view: Default / Bodycam, the tools' own bodycam** (the user, 2026-11-14:
+  "lets add a 'First camera view' (default/bodycam) ... to the game tab", then "discard everything you did and lets
+  create our own then with better and improved features and better bodycam movement"; notes in
+  `Research_Bodycam_View_2026-11-14.md` section 14).
+  - **Replaces the port of the BODYCAM mod** (build CA197334C001, 11-14 13:29): `Camera/BodycamGraph.h` and
+    `Camera/BodycamLogic.*` are deleted, and nothing of the mod's data or logic is used. Builds since 13:29 held the
+    port or this work in progress.
+  - **A camera worn on Faith's body:** on her chest, her head (helmet) or her right shoulder (`Camera/BodycamMotion.*`,
+    pure math). Its place and facing come from her bones' world places (hips, neck, upper arms, chest, head, eyes),
+    read only from her world pose. No game code is called.
+  - **Aim:** your mouse moves it at once (*Follow your aim* sets how much), and nothing moves on after the mouse
+    stops. Her body's own turns sway it: her facing is smoothed (*Body sway*, *Settle*).
+  - **Movement:**
+    - it hangs on a strap (*Strap bounce*): it stays on its mount at a steady run whatever the frame times are, and
+      gives when she speeds up, stops, steps and lands;
+    - step jolts when her feet come down while she runs (stairs too);
+    - landing impacts after a real fall: a dip at its deepest about 70 ms after, stronger the faster she fell; not
+      on stairs or a jolt of her hips;
+    - a fine shake, more while she runs and after a hard landing;
+    - leaning into turns;
+    - *Level horizon* (a stabilized camera; it stops levelling near upside down).
+  - **Looks:** Chest bodycam (the default), Helmet cam, Shoulder cam, Action cam (steady), GoPro (head mount). Any
+    change makes it Custom; *Back to <look>* undoes the changes.
+    - **GoPro (head mount)** (the user, 2026-11-15: "can we also add a go-pro preset?"): on her forehead, the widest
+      view (100 degrees top to bottom) with the strongest fisheye, a stiff mount, the shake and jolts damped and the
+      horizon half levelled, as an action camera's stabilization does; no REC overlay, a light vignette.
+  - **Lens and picture:**
+    - field of view (80 degrees top to bottom by default);
+    - a fisheye bend through the tools' lens distortion (VISUALS' own lens distortion wins while it's on);
+    - a REC overlay (blinking REC, the date and time, CAM 01) and a vignette, drawn behind the menu's windows and not
+      bent.
+  - **Only her first-person view:** cutscenes and other cameras stay the game's, the CAMERA tab's camera wins, and at
+    health 0 it's the game's view until she's up. When it stops (Default, a cutscene, death, a loading screen, no
+    Faith), the game's camera, ForceFov and near plane are given back: ForceFov and the near plane as read before the
+    first write; the camera is the game's last if the game hasn't rewritten the view.
+  - Config `[Misc]`: `FirstCameraView` (0 Default, 1 Bodycam), `BodycamPreset` (0 Chest, 1 Helmet, 2 Shoulder, 3 Action
+    cam, 4 Custom, 5 GoPro), `BodycamBase`, `BodycamMount`
+    and one key per value (`BodycamFollow` ... `BodycamVignette`). A look's values are its own; only Custom's are read
+    from the file.
+  - CT.log, all lines start with `Bodycam:`:
+    - applied: `applied: the view is the bodycam's (look ..., FOV 80, near plane 0.03, ...; the game's ForceFov was -1
+      and its near plane 0.06, kept to give back)`;
+    - given back: `stopped writing the view (...); given back: ...the game's field of view (ForceFov -1, ...); the
+      game's near plane (0.06)`;
+    - `her bones read (...)` and `her front found over N frames (...)`, expected to say "up x right, as her rest pose
+      says".
+  - **Checked offline:**
+    - the movement: 84 checks, including steady runs with frame times 20 % off (1.5 mm), 60 vs 144 fps, landings,
+      stairs, hip jolts, the mouse alone, upside down, paused and moved, and tiny frame times;
+    - the menu and the view writes under the tools' ImGui 1.61 with its checks live: 8 runs of 30,000 - 60,000 frames
+      against a simulated game (cutscenes, shots written once, deaths, respawns, loading, pause, the free camera,
+      stale frames, both handednesses);
+    - two adversarial reviews (game side, movement math). No crash found; all their verified findings are fixed.
+  - **Not tested in game.**
+  - Build **6E8DD0FA6C65** (11-15 01:06, Idle priority): the shared tree of C1FC968E1B4A (time-lapses, culling, the UI
+    session's level streaming change) plus this session's last `Bodycam.cpp` and `LensDistortion.cpp`.
+    INSTALLED 01:06 with the game closed (game folder and dist, hashes checked); the replaced C1FC968E1B4A is kept in
+    `Bodycam_2026-11-14\builds\6E8DD0FA6C65\`. Not committed.
+  - Build **644E0C3D5318** (11-15 02:13, Idle priority) adds the GoPro (head mount) look: the whole shared tree (the
+    time-lapse session's reviewed files, the culling session's CullingOff switched off until its review). Movement
+    checks 92 (the GoPro look in every per-look test, the config numbers), the ImGui harness runs and a drawn menu with
+    the GoPro look pass. INSTALLED 02:14 with the game closed (game folder and dist, hashes checked); the replaced
+    6E8DD0FA6C65 is kept in `Bodycam_2026-11-14\builds\644E0C3D5318\`. **Not tested in game.** Not committed.
+
+- **GAME > Level streaming: *Room for the whole city* is always on** (the user, 2026-11-14). The tick is gone, and
+  a config's `[Misc] BatchSpreadChunks = 0` now counts as on too (the default spread, 1700 chunks). It still
+  switches only when the renderer's draw batches allow it. The menu shows a line while it's waiting for that, or
+  when this game build can't do it. The All to Always tooltip no longer talks about it being off. It went in with
+  the folder's later builds (in 00f1466ff665, installed 11-16, checked); not tested in game.
+
+- **Fixed: a start-up data race on the tools' hook list** (the user, 2026-11-13: "Yes, fix it").
+  - **What was wrong:** the list of hooks made (Util/Hooks.cpp) had no lock. At start-up, three threads add to it in
+    the same seconds: the tools' start-up thread, the drawing thread at the first frame, and the game's thread at a
+    first use. In CT.log 2026-11-13 21:30:52-53, the drawing thread's ReplayStore/SsrOrder hooks and the start-up
+    thread's road traffic hooks were made together. Two threads adding to the map at once can break it.
+  - **Also wrong:** CreateGameHook reported a hook as made when the list grew during its call. That counted another
+    thread's hook as its own, so a failed hook could read as made. For example, a failed RoadTrafficCarStep would turn
+    on "more by day" without the lane rules.
+  - **Now:**
+    - The list is only read or changed under its own lock, including SetHookState at exit.
+    - CreateHook returns whether its own hook was added, and CreateGameHook gives that back.
+    - With diagnostics on, a hook that takes 1 s or more to make writes `Hook timing (diagnostic): <name> took N s to
+      make, on thread <id>`. That measures the start-up wait (4 - 6 s before the first frame) in game.
+  - Two reviewers checked every thread and lock order (no cycle), and every caller. No hook is made at a different
+    time or on a different thread.
+  - Build BEB0F0C7518D (11-13 22:59, Idle priority; the folder is BB054C26265F plus this, plus the pose session's
+    PoseEditor.cpp from 22:46).
+    - INSTALLED 23:08 with the game closed (game folder and dist, hash checked). **Not tested in game.**
+
+- **Less CPU on the game's main thread, same look** (the user, 2026-11-13: "Find any way we can improve cpu usage of
+  the game", then "Tools fixes only"; the research is in `Research_CPU_Memory_2026-11-13.md`).
+  - **Shard tip:** the far-away Shard models' tip for lightning is only looked for while lightning can come (a storm,
+    or Strike now). The two walks through every model group were a 1.2 - 2.5 ms frame every 2 s in the city.
+    - The real tower's top (the Districts menu) is still looked at every 2 s.
+    - A burst of lightning can come one frame later than before. In a rare case it waits for a loading screen: Strike
+      now pressed in the very frame before one starts.
+    - CT.log: without lightning, the tip line now reads `The Shard's tip for lightning: none (not looked for while no
+      lightning can come)`. The tip line comes back on each storm start and each Strike now.
+  - **Street level (Solid street on):** a frame whose every input is the last plan's, bit for bit, takes that plan
+    again instead of planning anew. Examples: Faith still, the game paused, time frozen.
+    - A plan is still made anew at least every 250 ms.
+    - The planner's work lists are kept from frame to frame instead of being made again: about 85 heap allocations a
+      frame down to about 4.
+    - It was 0.15 - 0.21 ms of every frame. How often frames repeat while she moves is unknown.
+    - The 10-s `Street level (performance, diagnostic)` line now says how many frames took the last plan again.
+  - **Hair fix (free camera, her body shown):** her customization component's values that point at no memory are no
+    longer read again while Windows says their memory still isn't there (VirtualQuery). Each such read was an access
+    violation caught, measured at about 1.6 microseconds outside the game. Every other value is read every frame as
+    before, so a cloth is found the frame it's readable. Its timing slot, "the game's settings applied", took 0.05 -
+    0.23 ms a frame. New diagnostic line: `Faith's hair (diagnostic): ...`.
+  - **First pose Take:** the game's pose blend is now hooked at the tools' start (pose_editor::Init, last in
+    Main::Init) instead of at the first Take on the game's thread. That frame took 45 - 53 ms; that making the hook
+    caused it is inferred.
+    - The hook now exists in every session, as a pass-through (about 10 ns a call, measured outside the game) until
+      something is posed.
+    - CT.log shows `Hooked PoseOverrideBlend` and `Pose: the game's pose blend hooked ...` at every start.
+  - **Not changed:**
+    - The 4 - 6 s wait at start-up: it comes before the game's first frame, and moving the hook that waits would only
+      move the wait.
+    - A data race on the tools' hook list at start-up was found (two threads add hooks at once with no lock). Fixing
+      it is a separate change, waiting for the user.
+  - Build BB054C26265F (11-13 22:45, Idle priority; the folder is 935727C51F4B plus these, plus the pose session's
+    PoseEditor.cpp from 22:39 and VoiceEmotion from 22:16 - 22:19).
+    - INSTALLED 22:46 with the game closed (game folder and dist, hash checked). The old DLL is kept
+      (CT_MirrorsEdge_935727c51f4b.dll). **Not tested in game.**
+
+- **Reflections settle sooner after a time of day jump** (CAMERA > Time and HUD, *Light catches up with time jumps*).
+  - **What lagged:** measured on two jumps, reflections were final 4 - 5 s after the jump, against about 3 s for
+    the shade.
+    - They were captured again only once the light's reset had done its 5 passes.
+    - Then the game captures its 32 nearest reflections one at a time (1 - 2 s).
+    - Then it started them all over once more by itself, when the reset's last step moved the sky the light is worked
+      out for 8 minutes ahead.
+  - **Now:**
+    - The reset's later steps stay at the jump's time, so that sky doesn't move during it.
+    - Reflections are captured again after 3 of the 5 passes, and once more when all 5 are done, so they end with the
+      whole new light.
+  - CT.log now names what makes the game capture every reflection again during the catch-up: `Reflections: all N
+    marked to be captured again by the game's sky cubemap (its sky changed)` or `... sun test (the sun moved)`.
+  - Build D9CA6F54AFEF (11-13 16:01, Idle priority; the folder is B3846F99D215 plus this).
+    - INSTALLED 16:03 when the game closed (game folder and dist, hash checked). **Not tested in game.**
+
+- **Fixed: after dragging the time of day, the light could stay at a time you passed through** (CAMERA > Time and
+  HUD, *Light catches up with time jumps*).
+  - **What went wrong:** in the 2026-11-13 13:43 run, the light's reset ran at 11:21 while the slider was still
+    moving, the drag ended at 08:54, and the last reset was skipped ("already at 08:54"). The shade kept the 11:21
+    light until the game's own steps caught up, several seconds later.
+  - **Why:** whether a reset is needed was judged by the time the game sets at each of its own steps, which is set
+    to the clock before anything is lit for it.
+  - **Now** the tools note the time each lighting pass is worked out for, and judge by the two the picture shows. No
+    reset when both are within 10 minutes of the clock: the game's own steps light up to about 8 minutes ahead.
+  - Build B3846F99D215 (11-13 15:29, Idle priority; the folder is 08A51E9A3C59 plus this).
+    - INSTALLED 15:30 with the game closed (game folder and dist, hash checked). **Not tested in game.**
+  - When it skips one, CT.log says so with the times, for example `the light shown is for 09:02 - 09:02 (the clock
+    08:54), no reset`. When it can't tell yet (just after a level loads), it says `the light shown isn't known yet`
+    and goes by the old rule.
+
+- **GAME > Pose: "Animation clip": Mixamo animations played on a posed character** (the user, 2026-11-11: "I want a system
+  that takes a custom animation (maximo etc) and plays it via the pose system").
+  - Build 907551328CFE (11-11 02:59, Idle priority; the folder is 2.0.1 (4cdb6de) plus this).
+    - INSTALLED 03:00 with the game closed (game folder and dist, hash checked twice). **Not tested in game.**
+    - The game folder's `Cinematic Tools\Animations` has the two test clips in it ("Samba Dancing.fbx" and
+      "mixamo.fbx"). Delete them whenever you like.
+  - **How to use it:**
+    - Download the animation from Mixamo as FBX Binary, 30 frames per second, keyframe reduction none. Without Skin
+      or With Skin both work.
+    - Put the .fbx file in the game folder's `Cinematic Tools\Animations` (the tools make the folder).
+    - Take a pose, then pick the file under GAME > Pose > Animation clip. It's read in about 0.1 s and starts playing.
+    - Controls: Use the clip, Play / Pause, From the start, Loop, Time, Speed (0.05 - 4x).
+    - **Clock:** Game time follows Game speed and stops with Freeze time. Real time plays with time frozen too. The
+      camera track's time plays from Start as the track plays, through a shot sequence's cuts.
+    - **Hips:** Stay in place (only up and down) or Follow the clip's travel. Turning the Hips with the ring turns the
+      clip, and its travel goes the new way from where the character stands.
+    - **Use this frame as the pose:** makes the clip's frame now the held pose (then edit it, save it, Reset goes
+      back to it). Playing on afterwards continues the clip where it was.
+    - Your bone edits stay on top of the clip. Bones can't be grabbed while it plays; pause it first.
+  - **Works on** Faith, KrugerSec, men, women and women in heels (the full skeletons). The tools pick the men's or the
+    heeled women's rest pose by the character's own bone lengths: the two share one bone list, but the heels pose has
+    the feet 29.6 deg steeper.
+  - **How it works:**
+    - The file is read with ufbx 0.23.1 (third-party, MIT or public domain; credited in THIRD_PARTY_NOTICES.md). That
+      covers Mixamo's PreRotation (FBX 7.7), its units and axes, and its takes ("mixamo.com" is the animation).
+    - Each of Mixamo's 65 bones gives its game bone's world turn, from the clip's T-pose to the game's own rest pose (an
+      A-pose with bent elbows, from the game's skeleton files).
+    - The spine, legs, arms, hands and fingers follow the clip's directions exactly.
+    - Each bone's roll is matched through the joints:
+      - the elbows bend about the game's own elbow hinge (measured in the clip from its bent frames);
+      - the knees bend about the knee's averaged hinge;
+      - the palms face the clip's way (the knuckles).
+    - Feet and toes take the clip's turn from rest to rest, so flat feet stay flat and heels stay heels.
+    - Bones Mixamo doesn't have:
+      - ElbowRoll and KneeRoll follow the forearm and shin, as the game keeps them;
+      - Faith's forearm, upper-arm and thigh twist bones take the share of the twist her own animation gives them
+        (fitted on 4,992 of her recorded frames);
+      - Neck1 and the finger bases take the game's rest pose;
+      - the face and the other helper bones keep the pose taken's turn.
+    - The clip faces the way the character faced when it was put on. The Hips move as the clip's, scaled to the
+      character's height.
+  - **Checked offline** on two real Mixamo exports (three.js's public examples "Samba Dancing.fbx", FBX 7.4, and
+    "mixamo.fbx", FBX 7.7):
+    - Mixamo's rest pose is a T-pose, the same as the skin's bind pose. Only Hips has translation keys.
+    - The tools' C++ (a test program running PoseClips.cpp) matches a separate Python model of the retarget.
+    - On all four skeletons, the limbs point exactly along the clip (0.0000 deg), and the elbows bend about the game's
+      hinge (0.000 deg).
+    - The forearms keep the game's rest twist exactly. The knees are within 7 - 8.5 deg of their averaged hinge, because
+      the clips' own knees aren't perfect hinges.
+    - Stick figures of the clip and of Faith match frame by frame.
+  - **Reviewed:** three adversarial rounds:
+    - wf_efde6085-c1f: 3 lenses with a skeptic for each finding;
+    - wf_d75c3da4-f90: a regression check of those fixes;
+    - and the fixes' own offline checks.
+  - **Fixed in review:**
+    - a rig without finger bones left the arms 48 - 58 deg off;
+    - a mesh named like a bone could be taken as the bone;
+    - a long file name could close the game;
+    - the camera track clock jumped back at a shot sequence's cuts;
+    - turning the Hips made the character walk sideways, or swing round the clip's start;
+    - playing on after "Use this frame" turned the character twice;
+    - the elbow and knee rolls and Faith's twist bones stayed as taken;
+    - the upper arm and forearm were rolled 10 - 11 deg off the elbow's hinge;
+    - Idle movement snapped on and off at Play and Pause;
+    - smaller menu and clock issues.
+  - **Log:**
+    - "Pose: clip read: ..." (frames, fps, bones, units, the bind pose check, the hinges, any "check:" warning);
+    - "Pose: clip <file> on <who>: N of its bones turn <skeleton>'s ...".
+  - **Not known until tested in game:**
+    - How it looks.
+    - Whether the game shows its 30 Hz pose steps smoothly. It applies the pose at its own step, so playing back
+      faster than real time skips frames.
+    - Mixamo "Without Skin" files weren't seen. The tools take their bones' default pose as the rest pose, and warn if
+      it isn't a T-pose.
+  - **What it can't do:**
+    - no foot or hand contact (different body sizes mean some sliding);
+    - no faces;
+    - no crowds or knocked-down characters;
+    - it pauses while a replay records or plays, as posing does.
+  - Files:
+    - new: `Camera/PoseClips.*`, `Camera/PoseRest.h` (generated), `ufbx/` (third-party);
+    - changed: `Camera/PoseEditor.*`, `Camera/CameraManager.cpp` and `Camera/TrackPlayer.h` (the clocks), the project
+      files, `THIRD_PARTY_NOTICES.md`.
+    - Research: section 22 of `Research_Pose_Editor_2026-11-08.md` (outside the repo).
+- **GAME > Pose > Animation clip: clips from any human rig, not only Mixamo's** (the user, 2026-11-11: "can you make a
+  converter program? for the bones etc." and "not for unreal i mean in general").
+  - Build 43DB727B84D4 (12:02, Idle priority; the folder is 2.0.1 (4cdb6de) plus the clips and this).
+    - INSTALLED 12:03 with the game closed (game folder, hash checked twice). **Not tested in game.**
+  - **Which bone is which:** found by their names' words and where they hang (no list of rigs):
+    - the head, hands and feet by name; the Hips where the head and both feet hang from; the spine, legs and arms on
+      the paths between them (by words, else by order); the fingers by name. Twist, roll, IK, corrective and other
+      helper bones are passed over.
+    - Checked on Mixamo's names (`mixamorig:Hips`, and `mixamorigHips` with no colon), Unreal's mannequin (UE4 and
+      UE5: pelvis, spine_01 - 05, clavicle_l, thigh_l, calf_l, ball_l, thumb_01_l...), Unity Humanoid, 3ds Max Biped
+      (`Bip01 L Thigh`), Blender Rigify (`DEF-thigh.L`), Daz, VRoid and Character Creator.
+    - A rig whose left and right are named the other way round is found by its toes (they must point ahead) and
+      swapped back.
+    - **The bone map:** "Save its bone map to edit" writes `<the clip's name>.bones.txt` beside the clip ("Hips =
+      pelvis" and so on). Change a line and pick the clip again; while the file is there it's used instead. "Its
+      bones" lists what was found.
+  - **Its rest pose** (what each bone's turn is measured from):
+    - the skin's bind pose when the file has its mesh (FBX "With Skin");
+      - followed when the rig was moved or turned after binding;
+      - a skin that covers only part of the body (a hat on the head) isn't taken;
+      - an empty bind matrix is passed over, and of several skins the one with the most bones counts first.
+    - else the bones' default pose if it's a T- or A-pose (Mixamo "Without Skin": as before);
+    - else (an armature-only export, Blender's for one, whose default pose is just a frame of the animation) it's
+      worked out from the body and the motion. The check line says so:
+      - each bone's roll from the body over the whole clip (across the hips, across the chest, the chest's up, the
+        knuckles), in the bone's own frame;
+      - a bone aiming past one in between (UE's spine_03 at spine_05) by where that bone is over the clip;
+      - the elbows' and knees' hinges in the forearm's and shin's own frames;
+      - the feet and toes where each foot stands flattest (of the frames where that leg stands);
+      - the Hips' height standing on its legs.
+  - **Files whose settings don't match their data:** the up and the unit are checked against the body.
+    - The user's `exported-model.fbx` (ComfyUI's three.js FBX exporter) says Z up and centimetres. Its bones are in
+      metres and it stands along +Y: the installed build said "no Hips bone" for it, and with only the bone finder it
+      read as a 1 cm character upside down.
+    - The unit goes by tens when the legs come out under 10 cm or over 10 m long. (The clip plays the same at any
+      unit; it counts for the tools' cm-sized checks.)
+    - The up is only taken from the body when the rest pose doesn't stand by the settings, and then only:
+      - when the skin's bind pose stands as a T- or A-pose along another axis (a mesh isn't bound lying down);
+      - or when the settings are shown wrong already (the unit off by tens, or no axes given):
+        - a default pose that's a T- or A-pose along another axis, if it's a rest pose kept apart from the animation
+          (no frame of the clip within 10 deg of it) and the body has a floor along that axis;
+        - else the axis the body stands along in the most frames, of those along which its lowest point (the floor)
+          moves 1.2 legs at most over the clip, if that beats the settings' up.
+    - A clip with right settings that lies, falls, swims, hangs or stands on its hands keeps them.
+    - **Not always right:** from the motion alone a clip that lies can't always be told from one that stands with
+      wrong axes. Three review rounds found such cases for every rule tried. With its settings shown wrong, a clip
+      that lies more than it stands on a still floor is stood up.
+    - **The way out:** the bone map now holds the file's up and unit as read (`# Up = +Y`, `# Unit = 0.01`). Remove
+      the # and set them, and they replace the settings and all these checks. A map with only those two lines
+      leaves the bones to the finder.
+      - `Up` takes +X -X +Y -Y +Z -Z (any case). An `Up` the same as the file's own leaves the clip as it was.
+      - `Unit` is metres per file unit: a number alone (or with "m"). "1 cm" is refused and listed in the check line.
+      - A `Unit` line alone still lets the up be fixed when the file's own unit is off.
+      - Saving the map again keeps the lines that were in use, and a UTF-8 BOM is read.
+    - Checked with copies of the user's clip and of Flair and two Blender dance copies with their settings patched
+      (put right; right axes with the wrong unit; wrong axes and unit): all six read exactly like their correct
+      versions (0.00 deg, 0.0 mm). A map's Up and Unit lines read the same as the automatic result.
+  - **Checked offline** (a test program running the tools' PoseClips.cpp, on Faith):
+    - **9 rig styles x 2 Mixamo clips** (mixamo.fbx and "Samba Dancing.fbx", renamed and saved by Blender 5.2 with no
+      mesh, so no rest pose): all 65 bones found in every copy, the mirror-named copies swapped back. Against the
+      originals, relative to the Hips:
+      - upper arms, forearms, hands, thighs, Spine2 and the Hips 0.00 deg; Spine and Spine1 0.01 - 0.84;
+      - neck 0.10 / 1.97 deg, head 0.71 / 9.93, shins 0.60 - 9.36, collarbones 3.8 - 8.7;
+      - fingers 0.05 - 4.5 deg, thumbs up to 15.4, feet and toes 6.6 - 8.8;
+      - the Hips' heading 0.00 deg, their place within 1.4 / 2.8 cm.
+    - **Clips with a rest pose don't change:** mixamo.fbx and "Samba Dancing.fbx" 0.00 deg against the build before.
+      Four of the user's UE5 clips (52 bones each, found by name) read with their skin's bind pose.
+    - **UE5 fighting and death clips** saved the same way with no mesh are much worse: thumbs up to 77 deg, the head
+      36 - 76, one forearm 30 - 58. They stand far from any rest pose the whole time.
+    - **The user's three clips** from the game folder:
+      - `exported-model.fbx` ("Hit_Knockback_RM", 16 frames at 24 fps): read with +Y up and 1 m units, standing 0.92
+        m high. Faith's trunk, thigh, upper arm, shin and chest front match the clip's own to 0.01 at frames 0 and 10,
+        and her Hips' path is the clip's scaled to her height.
+      - `Flair.fbx` and `Dancing Twerk.fbx` (Mixamo Without Skin): their default pose is a T-pose, read as before.
+  - **Reviewed:** seven rounds, each finding checked by a skeptic before it was fixed:
+    - wf_9f1c4551-e65 (the rest pose: 3 reviewers): the left/right swap ran on a no-rest clip's default pose; binds
+      weren't followed when the rig moved after binding; the Hips' height when no leg stands; plus 8 smaller ones;
+    - wf_a19c70f3-8e5 (a regression check of those): a body skin without finger clusters was dropped; binds followed
+      a mesh the animation moves; a leg held up pulled the Hips' height; the floor warning one way only;
+    - wf_9047616e-e51, wf_a49aabc4-dd4, wf_29d39494-746 (the up and unit from the body): clips with right settings
+      that lie on a side, fall, swim or hang were stood up, then a fall's lying axis was taken, then a spread-out
+      lying frame passed as a T-pose (hence the rule above and the bone map's Up line);
+    - wf_9bd07548-557 (the bone map override): a Unit line alone hid the wrong unit; saving dropped lines in use; an Up
+      like the file's own re-picked the front;
+    - wf_8b1adef8-b32 (a check of those fixes): two wrong texts (a file with no axes said "its settings' up"; the menu's help after a re-save), fixed in 43DB727B84D4.
+  - **Not known until tested in game:** how the no-rest-pose clips look (their thumbs, feet and head most of all).
+  - **Known limits:** with its settings shown wrong, a clip that lies more than it stands on a still floor is stood up
+    (set `Up =`); a default pose of another take than the one played could pass as a rest pose (not seen).
+  - Files: `Camera/PoseClips.*`, `Camera/PoseEditor.cpp` (the menu's help). Research: section 23 of
+    `Research_Pose_Editor_2026-11-08.md` (outside the repo).
+- **GAME > Pose > Animation clip: Unity humanoid clips (.anim)** (the user, 2026-11-11: "Can we also make it play .anim
+  files? ... high priority", then "Approximate solver", "Like we did with Unreal pretty much").
+  - Build 7F4DEE0A428E (15:09, Idle priority; the folder is 2.0.1 (4cdb6de) plus the clips, the converter and this).
+    - INSTALLED 15:10 with the game closed (game folder, hash checked twice; usp10.dll left as it was). The user's 36
+      .anim clips were copied into `Cinematic Tools\Animations` (copies; the originals stay where they were). **Not tested in game.**
+  - **How to use it:** put the .anim file (Unity's binary asset) in the game folder's `Cinematic Tools\Animations` beside
+    the .fbx files and pick it under GAME > Pose > Animation clip, as an FBX clip.
+  - **What's read:** a humanoid clip holds no bones: Unity's 89 body muscles, the body's place and turn, and each hand's
+    and foot's IK goal. Unity's own numbers for turning muscles into bones aren't in the file, so:
+    - an approximate model of them (each bone's zero-muscle pose, fitted to the user's 36 clips' own hand and foot goals
+      on Mixamo's T-pose; Unity's default muscle limits; Unity's body frame): over the 36, the hands 8 cm, the feet 10 cm
+      off their goals and 8 deg turned (rms) before the next step; each clip's report gives its own (hands 4 - 15 cm, feet 4 - 17 cm over the 36);
+    - then each arm and leg bent to its goal (two-bone IK about the knee's and elbow's hinge), the hands and feet turned
+      as their goals, the body lowered where a foot can't reach, and the feet stood on the floor;
+    - the result plays through the FBX clips' fit (Mixamo's 65 bones, that T-pose as the rest).
+  - **Checks (offline):** the C++ against the Python prototype on all 36 clips (within 0.000006 deg); all 36 fit onto
+    Faith and sample finite values; read in 2 - 114 ms; stick figures of the reference and of Faith look right
+    (ThumbsUp, Orange Justice, Eastern Bloc).
+  - **Not known until tested in game / limits:** the spine, neck, head, fingers and thumbs have no goal to check the
+    model against; on the character (its own proportions) hand contacts can be several cm off and the feet don't stick
+    to the ground; text (YAML) .anim files aren't read (only Unity 5.6's binary format was tested on real files); props,
+    jaw and eyes aren't played; Unity's root-motion options and Mirror aren't applied; weighted tangents (2018+) play
+    unweighted (a warning says so); some hands can't reach their goals in a few frames (up to 8 cm short, the check line
+    says so).
+  - Reviews (each finding checked by a skeptic; details in research section 24):
+    - wf_816bfa10-3ae: 10 fixed (a crafted file could hang the loader for hours; a NaN key reached the game as the
+      Hips' place; the floor per foot sank a standing foot under a raised one; 1-frame poses got no floor lift; texts);
+    - wf_c1e5a3c9-646 (a check of those): 9 fixed (memory through copied names and leaf lists; an all-broken curve
+      played as 0; one bad key time dropped the keys after it; the floor rule's cliff; 1e30 values; texts);
+    - wf_227e1a4d-972 (a final check): 4 fixed (long type tree names, a broken body curve's message, scripts' curve
+      count, the broken-keys text) plus the editor copy standing in for a partly broken curve; 3 rejected.
+  - Files: new `Camera/PoseClipsUnity.cpp`, `Camera/PoseClipsUnityData.h` (generated); changed `Camera/PoseClips.*` (the
+    .anim dispatch, Clip::FromUnity, no bone map for those), `Camera/PoseEditor.cpp` (the list, help), the project
+    files. Research: section 24 of `Research_Pose_Editor_2026-11-08.md` (outside the repo).
+- **GAME > Pose > Animation clip: Faith's hair is put back on her head when a clip makes her pose jump** (the user,
+  2026-11-11, on 24 fps clips: "the hair doesn't really follow faith (simulation stops?)").
+  - Build 0AE3B15EB722 (11-11 16:40, Idle priority; the folder is 2.0.1 (4cdb6de) plus the clips, the converter, the
+    .anim clips and this).
+    - INSTALLED 16:41 with the game closed (game folder, hash checked twice). **Not tested in game.**
+  - **What the test showed** (a diagnostic "Hair watch" in CT.log, written only with `[Debug] Diagnostics = true`; the
+    user ran `exported-model.fbx` and others): the simulation never stops. On every clip her cloths were at full detail,
+    not switched off, not being reset, and the game's cloth step ran every 1/30 s. The cloth's root never moved.
+    The user's answer to "did calm 24 fps clips look wrong too?": "no it didn't".
+  - **The cause, from the watch's numbers:** the pose jumps. `exported-model.fbx` is a 0.62 s knockback that loops; her
+    head moved 3.5 - 7.6 m per second and jumped at each loop.
+  - **The fix:** at a jump of her pose the tools set the game's own "reset this cloth" flag on her cloths for 120 ms
+    (longer in slow motion: divided by the game speed), so the game puts the hair's points back on their skinned
+    places. A jump is: the clip's time going back or on by more than 0.25 s, a clip put on, taken off or changed, each
+    with her head moved 10 cm or more in that frame; or her head moved 50 cm or more in one frame, whatever did it; or
+    letting go of a pose that had a clip on.
+    - CT.log says "Hair: her hair reset at a jump of her pose" once, and with Diagnostics on a count every 10 s.
+    - The clip's help text says so ("When a clip jumps ... Faith's hair is reset to her head").
+  - **The game's code this uses** (read offline; four new byte checks, the fix stays off if one fails): the cloth
+    instance's reset byte at +0x18A (set by its own method, vtable 0x141AB6380 slot 12 = 0x142FA39F0); the simulation
+    job 0x142FA07A0 calls the reset 0x143B787A0 at 0x142FA0826 when the byte is set; the interpolation 0x142FA28F0
+    clears the byte every frame at 0x142FA29C5 (hence the tools set it again each frame for the 120 ms).
+  - **Not known until tested in game:** whether the game takes the flag in the frame the tools set it (the watch's
+    "distance of the hair's points from their skinned places" line will show it). If it doesn't, the fallback is to
+    call the game's reset itself (0x142FA5020 + 0x143B787A0), not built.
+  - `[Debug] Diagnostics = true` is still set in the game folder's `Cinematic Tools\config.ini` from that test (a
+    backup of the file as it was is kept); it is switched off again after the user's test of this fix.
+  - Reviewed: wf_3eff7c87-e85 (the watch: a stale clip flag, window labels, a stale cloth pointer check, placeholders,
+    the diagnostics gate, poses stepped aside or refused) and wf_e7026c36-55f (the reset: slow motion's hold, the count's
+    wording, the jump at Let go), each finding checked by a skeptic before it was fixed.
+  - Files: `Camera/PausedHair.cpp/.h` (KeepReset, Watch, the four checks), `Camera/PoseEditor.cpp` (the jump rule in
+    Update, the help text). Research: section 25 of `Research_Pose_Editor_2026-11-08.md` (outside the repo).
+- **GAME > Pose is now its own window, with bone keyframes and a timeline** (the user, 2026-11-11: "Make the pose
+  stuff a new window ( window can be enabled by clicking a button in game session)", "In the Pose window UX needs to be
+  proper", "bones should be keyframed and let the player keyframe each bone etc and the keyframes can be played with
+  free camera playback (or not) and/or the already loaded animation file (fbx/.anim)"; then "After planning send this
+  to deepseek for code writting").
+  - Build 36923B81816C (11-12 13:13, Idle priority, no warnings; the folder is 2.0.1 (4cdb6de) plus the clips, the
+    converter, the .anim clips, the hair reset and this).
+    - INSTALLED 13:13 with the game closed (game folder, hash checked twice; usp10.dll left as it was).
+      **Not tested in game: nothing of the window or the keyframes has been seen on screen yet.**
+    - **First run in the game (the user, 11-12 13:24 - 13:28: "It crashed find out why"): the game ended the first time
+      the timeline was drawn,** that is right after the first keyframe was made. Fixed in **92A6DABA27C6** (built 13:32 at
+      Idle priority, no warnings; INSTALLED 13:32 with the game closed, hash checked twice). Not tested in game since.
+      - What Windows recorded: MirrorsEdgeCatalyst.exe ended in CT_MirrorsEdge.dll with code 0xc0000409 (a "fail fast":
+        the C runtime's abort), and a crash dump. From the dump, with the build's PDB: abort, called by ImGui's check
+        of a window's stacks (`CheckStacksSize`, imgui.cpp 5232: "PushStyleVar/PopStyleVar Mismatch!") at the EndChild of
+        the timeline's rows (`DrawKeyTimeline`, PoseEditor.cpp 6852), from `DrawKeyframes`.
+      - The cause: the rows' child was opened as `PushStyleVar(WindowPadding, 0); BeginChild(...); PopStyleVar();`. That
+        is the usual way in today's ImGui, but the tools' ImGui 1.61 wants the style stack the same at a window's Begin and
+        End, and its checks are compiled into the release build: a failed one ends the game. The push was not even needed
+        (a child without a border has no padding there). The two lines are gone.
+      - Why four review rounds missed it: they checked that every push has its pop, not that a window's Begin and End see
+        the same stack. Nothing had been run.
+      - **So the window's code is now run offline** (a test program, the pose window harness):
+        PoseEditor.cpp itself, the keyframe module and the tools' own ImGui 1.61 with its checks, a made-up held pose and
+        a simulated mouse; what the pose editor calls of the game is stubbed. It draws every tab with and without
+        keyframes and with a clip, makes keyframes, clicks, drags and scrubs on the timeline, opens the right-click menus
+        and picks their rows, plays on each clock, loads and saves, draws 24,000 keyframes, resizes the window, lets go of
+        a pose, then 60,000 frames of random mouse input. On the build that crashed it stops at the same check with the
+        same message. On the fixed code: 10 runs (text 11 - 34 px, screens 1280x720 to 3840x2160, the user's own 29 px on
+        3840x2160 among them), 77 checks each, about 1.1 million frames, no failed check and none of ImGui's.
+      - What it does not run: Take pose and Let go against the game, the dots and rings on the picture (they need the
+        game's poses and camera), a real clip's pose, and how any of it looks.
+      - With very large text on a small screen (24 px on 1280x720) the window is shorter than its content: the timeline
+        is then below what shows until the window is scrolled.
+      - CT.log has nothing of that session (it ends one second after the start, in the offset scan). Most likely the
+        game started twice in a row, as it does through Steam (another tool's log names process 29168 at 13:24:57.1;
+        the process that crashed was 30520, started 13:24:58.0), and the second one could not open the log the first
+        still held. Confirmed from the dump and fixed: see the CT.log entry below (D5A5E10303C2).
+  - **Who wrote what:** the plan, the checks and the review rounds are Claude's; the code was written by DeepSeek
+    (through the DeepSeek harness's delegate tool, one conversation) from that plan, as the user asked. Steps 1 and 2
+    (the module, the keys in the editor) and every correction round were read line by line; of steps 3 and 4 the
+    keyframe rows, the window's frame, the timeline and the menu were read, and the reviewers read all of them.
+  - **Where it is:** GAME tab > Pose > "Open the Pose window...". The GAME tab keeps only that button and a status
+    line. The window is not saved as open: it starts closed each time.
+  - **The window, top to bottom:**
+    - **Who:** the "Near the camera" list, Take pose, Let go, Let go of all, and the status lines of the pose being
+      edited. With no pose being edited the rest of the window isn't drawn.
+    - **The bones** (left: the find field and the bone list, a "*" on an edited bone and a "K" on one with keyframes) and
+      four tabs: **Bone** (the picked bone's, face group's or weapon's sliders, Reset, Undo), **Clip** (the animation
+      clip block as it was), **Files** (saved poses; saved keyframes), **Options** (the display and drag options;
+      the keyframe options).
+    - **Keyframes:** the time buttons, Play / Pause, Time, Length, Loop; "Keyframe: the changes (N) / this bone / the
+      whole pose"; Remove keyframe, Undo keyframes (N), Clock; and the timeline.
+    - Every control and help text of the old Pose section is in the window. The bones' dots, rings and names on the
+      picture are not drawn over the window.
+  - **Keyframes, how to use them:**
+    - Pose a bone, press "Keyframe: the changes". Move the time, pose again: with "Changes are keyframed at once"
+      (Options, on by default) every change after the first keyframe is kept as a keyframe at the timeline's time.
+      Press Play.
+    - A keyframe holds one bone's turn and move at a time. Each bone has its own keyframes; a bone without keyframes
+      keeps its edit all the time.
+    - The first keyframe of a bone made in a pose that already has keyframes also keeps that bone as it was at the
+      keyframe times before and after, so the change belongs to its own time only.
+    - **To the next keyframe** a bone goes Smooth (a curve through the neighbouring keyframes; the default), Linear,
+      Ease in and out, or Hold (it jumps at the next one). Set it in the Bone tab or the keyframe's right-click menu.
+    - **Clock:** Game time (follows Game speed, stops with Freeze time), Real time (plays with time frozen too), the
+      camera track's time (the keyframes follow the free camera's track as it plays; "Begins at" in Options says where
+      on the track they start), or the animation clip's time (the keyframes follow the loaded .fbx / .anim clip, on top
+      of it).
+    - **The timeline:** one row per bone with keyframes and an "All bones" row. Click a keyframe to go to it and pick
+      its bone; drag it to move it in time (the keyframes it passes are untouched, one it is dropped on is replaced);
+      click or drag on the ruler to set the time (it snaps to a nearby keyframe, else to 0.05 s with "Times snap to
+      0.05 s"); right click a keyframe for Delete, the four eases and "Copy to the timeline's time"; right click a
+      bone's name for "Remove this bone's keyframes".
+    - **Undo keyframes** takes back the last change of the keyframes (50 steps). The pose's own Undo stays in the Bone
+      tab.
+    - **Files:** keyframes are saved by name as `Cinematic Tools\Poses\<name>.posekeys` (text) and loaded onto the pose
+      being edited, bones by name. Saved over a pose taken, they carry that pose with them, so they load onto a pose
+      taken later; saved over a clip, they are edits over that clip.
+    - **The work is kept:** letting go of a pose with keyframes (also a respawn or a level load) saves them as
+      "autosave <who>" first, and Let go asks for a second click. While you work, the same file is written again at
+      most every 30 s after a change (with the window open and nothing being dragged or typed), so a crash or closing
+      the game with a pose still held loses little. A file of that name from an earlier pose or session is kept once
+      as "autosave <who> before".
+  - **Saved in config.ini,** new section `[Pose]`: ShowBones, ShowFace, GroupFace, ShowFingers, ShowHelpers, DragBends,
+    StopAtWalls, RingsOnBone, AutoKey, SnapKeys (these options were not saved before).
+  - **Known limits:**
+    - Weapons aren't keyframed (they go with the posed bones as before).
+    - The keyframes go when the pose is let go (they are autosaved, see above; load the autosave file onto a pose
+      taken again to go on).
+    - The camera track's clock gives no time after a track ends: the keyframes hold their place then.
+    - With a clip's Hips on "Follow the clip's travel", keyframed Hips turns shift the travel at every change of
+      heading, so a loop or a scrub doesn't come back to the same place.
+    - The timeline has no zoom: a wider window or a shorter Length gives detail, the Time field exact times.
+    - Thousands of keyframes in view are thinned out on the timeline (drawn only where they don't overlap) so the menu's
+      draw limit can't be passed.
+  - **Checks (all offline; none in the game):**
+    - The keyframe module (`Camera/PoseKeys.*`: the data, the curve, the clocks, the file) builds on its own. Its
+      author's test: 11,523 checks pass. A second test written by an independent agent from the plan alone, without
+      seeing the code's test: 4,287,017 checks; its first run found 1,824 failures in 19 groups (numbers written with
+      the process's locale; times losing precision past 1000 s; files the saver wrote and the loader refused; an
+      endless Length; indented lines skipped silently), all fixed, then 0 failures.
+    - Reviews, each finding checked by a second reviewer before it was sent back:
+      - wf_e6d0544c-586: the plan itself, by three readers (code, UX, spec), before any code;
+      - wf_c12c694e-c05: steps 1 - 3 by four reviewers: 25 findings, 20 confirmed and 5 partly, 18 different fixes
+        (the track clock could stop following for good; a row-breaking helper that never broke rows; the Time field
+        moving off a keyframe on a click; the clip clock's Play button; messages nobody could see; and smaller ones);
+      - wf_c2a95f54-422: the timeline by two reviewers: 11 findings, 8 confirmed, 2 partly, 1 rejected (a keyframe
+        could not be dragged at all and scrubbing stopped after one frame; a keyframe at the end drawn as a half; the
+        rows jumping under the mouse; a draw limit that thousands of keyframes would have passed);
+      - wf_81130609-e41: a last check of the 26 corrections by two reviewers: nothing wrong in the timeline's; 2 small
+        points in the others (the Time field took the first, not the nearest, of two keyframes within 0.01 s; the
+        Time field locked before the first keyframe when the clip follows the camera track), both fixed.
+    - The autosave every 30 s and those last two fixes came after the reviews: read line by line, not seen by a
+      second reviewer.
+    - A full build at Idle priority after the last fix: no warnings.
+  - Files: new `Camera/PoseKeys.h`, `Camera/PoseKeys.cpp`; changed `Camera/PoseEditor.cpp` (6,230 to 8,600 lines),
+    `Camera/PoseEditor.h`, `UI.cpp` (the window drawn after the Hotkeys window), `Main.cpp` (the `[Pose]` section), the
+    project files. Research: section 26 of `Research_Pose_Editor_2026-11-08.md` (outside the repo).
+- **CT.log: a session can no longer run without a log, and the ends the crash lines missed are written** (the user,
+  2026-11-12, after the Pose window's crash left nothing in CT.log: "Yes, fix it").
+  - Build D5A5E10303C2 (11-12 14:40, Idle priority, no warnings; the folder is 2.0.1 (4cdb6de) plus the clips, the
+    converter, the .anim clips, the hair reset, the Pose window and this).
+    - INSTALLED 14:40 with the game closed (game folder, hash checked twice; usp10.dll left as it was).
+      **Not tested in game.**
+  - **What had happened** (from Windows' crash dump of that session): in the game process that crashed, the log's file
+    was never open (its file pointer was null). The game had been started twice within a second: another tool's log
+    names process 29168 at 13:24:57.1, the one that ran and crashed was 30520, started 13:24:58.0. Both starts load
+    the tools. The first made CT.log and still held it when the second tried to open it. So the session that mattered
+    wrote no log at all, and CT.log held the first start's 33 lines.
+  - **The log's file now:**
+    - A log that can't be opened is tried again when later lines come (at most every 0.1 s). The lines until then are
+      kept in memory (up to 1 MB) and written first, after a line that says the log was opened late and why. Nothing
+      waits: the tools' start is not held up.
+    - If CT.log is still held after 3 s (another game really running beside this one), this process writes
+      `CT.<its process id>.log` instead, and says so in its first line.
+    - A crash line or the exit lines open a file at once if none is open yet.
+    - Before every open of CT.log (opening empties it) the log that is there is kept as CT.previous.log, unless it is a
+      first start's few lines: written within the last 5 seconds and under 8 KB (a session's log passes 8 KB about 9 s
+      in, just before crash lines can first be written). The old code moved whatever was there, so in a double start
+      whose first process had already gone the first start's lines went over the real last session's log (read from
+      the code, not seen happen).
+    - Still lost: the log of a session that ended in its first seconds and was started again within 5 s.
+    - A single start writes the same log as before.
+  - **Ends that left no crash lines.** The crash lines are written by an exception filter. Three ways the tools' own
+    C runtime ends the game are no exception a filter sees (Windows' "fail fast", code 0xC0000409): a failed check
+    inside ImGui (its checks are compiled into the release build), abort() (also an uncaught C++ exception), and a call
+    the runtime refuses (a text longer than its buffer in sprintf_s, strcpy_s and the like). Each now writes first:
+    `[CRASH] ...` with what it was (for ImGui: the check's own text and line), the call chain as module+offset, and the
+    tools' state. Then the game ends exactly as before (same code, Windows' dump still made).
+    - A failed ImGui check shows the C runtime's Abort / Retry / Ignore box, as it always did here. Abort ends the
+      game. After Ignore the game goes on: the log then says so, and a later failure is written again.
+    - The abort and refused-call hooks are set at the very start of the tools (they belong to the tools' own runtime;
+      the game has another), so the start-up is covered too.
+  - **Checks (offline):**
+    - the log module itself in a test program, 10 situations, 32 checks: an old log kept as CT.previous.log; a first
+      start's lines not moved over it; lines before the start-up dropped as before; the file held for 0.6 s (the note,
+      then every line in order); held for good (the process's own file after 3 s); a crash line while held; no folder;
+      more lines than are kept (counted, a long line cut); a game still closing that held its whole log (kept, not
+      emptied); a quick restart (kept);
+    - the C runtime's behaviour with the same hooks, built like the tools, 8 cases: a failed check, abort(), sprintf_s
+      and strcpy_s overflowing, an uncaught C++ exception, and each of three ends after an ignored check: every one
+      writes its note and the process still ends with 0xC0000409;
+    - the Pose window's offline run with the new ImGui hook: stops at the same check on the crashing source, passes on
+      the fixed one (5 runs, 77 checks each).
+    - Review wf_b400f6e8-75e (two reviewers, each finding checked by a second): 5 findings, 4 confirmed and fixed
+      (a late open could empty the log of a game that was still closing; the 5 s rule alone took a quickly restarted
+      session's log for a first start's lines; after Ignore nothing more was written; the two hooks came too late to
+      cover the start-up), 1 partly and left: two threads failing within about a millisecond of each other can end the
+      game before the first has written its call chain (its first line is there; Windows' dump has the rest).
+  - **Not known until it happens in the game:** whether the game starts twice at every launch here or only sometimes
+    (seen once, in one dump); how the call chain reads in a real failure; the Abort / Retry / Ignore box itself (in
+    full screen it may sit behind the game).
+  - Files: `Util/Log.cpp`, `Main.cpp` (NoteRuntimeEnd, the two hooks, CtImGuiCheckFailed), `imgui/imconfig.h`
+    (IM_ASSERT). The full build recompiled everything and showed old warnings at 22 places in `Input/InputSystem.cpp`
+    (unchanged since 10-20; float conversions), none in these files.
+
+- **GAME > Pose window > Voice: a sound file played on a posed character, its mouth moving with it** (the user,
+  2026-11-12: "put a voice file (mp3/wav etc.) and sync it to faiths mouth or ksec mouth if it's possible implement
+  it"). In 36F6C4538534 (installed 2026-11-12 19:16, **not tested in game; nothing was heard on the PC during the work**).
+  - **What it does.** A fifth tab, Voice, between Clip and Files. It lists the sound files of the game folder's
+    `Cinematic Tools\Voices`; a picked file is read on a thread of its own and put on the held character.
+    - The mouth: the jaw, six lip bones and the two mouth corners move with the sound, as one more layer on the pose
+      after the edits, the keyframes and the idle movement. Those bones keep the user's own edits and keyframes
+      underneath, and nothing of the voice is saved into a pose or keyframes file.
+    - The sound: played by Windows (XAudio2, an engine of the tools' own beside the game's), in step with the voice's
+      time. Not placed in the world, not scaled by the game's volume, heard only while the game's window is in front.
+    - Three clocks: its own (real time: Play / Pause / From the start / Loop, a picture of where the mouth opens that
+      can be dragged, a Time slider), the keyframes' time or the camera track's time (with "Begins at").
+    - Sliders: Volume, Mouth opening, Lip shapes (starts at half), Lip closing, Mouth ahead by (0.03 s; the pose made
+      now is seen a frame or two later, the sound is aimed at when it is heard). "The mouth now" shows the five
+      shapes. "The sound is heard" off: only the mouth moves.
+  - **How.**
+    - Decoding (`VoiceDecode`): Windows' own Media Foundation, loaded when first needed. Read on the test PC: WAV in
+      its layouts, MP3, MP2, AAC in M4A / MP4 / ADTS, ALAC, FLAC, WMA, AC-3, Opus in WebM, Vorbis in MKA, a video's
+      sound track; Ogg Vorbis / Opus only with Windows' Web Media Extensions; AIFF not. Encoder lead-in silence is
+      dropped where the file says how much (tagged MP3 and M4A then start 0 samples off the source). Up to 10 minutes
+      are kept. Each block is waited for 15 s at most: Windows' AAC decoder was seen spinning for ever on some damaged
+      M4A files (7 of 600 damaged copies); such a decoder keeps a processor core busy until the game closes.
+    - The mouth's shapes (`VoiceMouth`): worked out from the sound alone (no word recognition, no libraries): five
+      curves a hundredth of a second, Open, Wide, Round, Closed, Teeth, from band levels, voicing and gaps.
+    - The face (`VoiceFace`): the face's own axes from where the bones are (corner to corner, chin to nose), the jaw
+      turned about the real hinge (9 degrees at full opening: the lower lip 15 - 16 mm down), the lips and corners
+      moved by shares of the mouth's width. The same 57 face bones are on Faith, KrugerSec, men and women.
+    - The player (`VoicePlayer`): each frame it is told where the sound should be and at what pace; small errors are
+      taken out by the playing speed, errors over 80 ms by starting again from the right place; volume goes to 0 for
+      a pass before any stop. The pitch goes with the pace; from about a quarter of the recording's pace to twice it,
+      silent outside (the tab says so when that happens).
+  - **Measured (offline, on computer-made voices only: David, Zira, Mark, a Greek voice; no recording of a person):**
+    - against Windows' own viseme timelines, on files never tuned on: the jaw 0.78 - 0.80 correlation, one opening a
+      syllable (0.98 jaw peaks per vowel), shut in every pause, 10 - 15 ms early; wide 0.69, teeth (s, sh) 0.78;
+      rounded 0.35 - 0.46 (a forward "oo" can read as "ee", an l as rounded); p / b / m only hinted (the hint is
+      sure of a third to a half; with the jaw, the mouth is seen shut on 81 - 91 % of them);
+    - music at 10 dB under the voice moves the mouth in 22 % of the pause frames; a clipped voice kept its jaw but lost
+      part of its closures and lip shapes; a made-up whisper opened the jaw about half as far;
+    - the player, by XAudio2's own count of the samples that left the voice: within 3 ms of the clock in steady play,
+      at the right place 60 - 94 ms after a start or a jump, silent 57 - 63 ms after a pause. Its output delay is
+      what XAudio2 reports (40 ms here): not checked by ear or microphone.
+  - **First run in the game** (the user's, 11-12 19:28, CT.log): a real recording (a 30.6 s MP3, 22050 Hz mono) was
+    read, its mouth analysed (the mouth moves in 78 % of it), put on Faith (her mouth's bones found) and the player
+    opened Windows' audio (XAudio2, 2 speakers, 48000 Hz). How it looked and sounded: not reported; the user then
+    asked for improvements and chose blinks, brows and head movement (the next entry when built).
+  - **Limits.** A character a replay records or plays can't be posed, so its mouth can't move this way (the sound
+    still plays). The file must be the voice alone. A loop's wrap loses the first 60 - 70 ms. Letters other than
+    Western European and Greek show as "?" in the list (the file still loads); a name with "##" in it is shown cut.
+    Not tried on Windows 10 or on a PC without the Web Media Extensions.
+  - **Checks (offline):** the face maths on five rest poses (140 checks); the real path file -> decode -> shapes on 17
+    files of 12 kinds (230 checks); each of the three researched modules merged with proof it is the same code
+    (decode: identical compiled code and 200 files' results; mouth: 223 output files byte-identical; player: token
+    diff tied to the four asked changes, its own tests rerun); the Pose window's harness with the tab, the clocks,
+    the layer on a made-up body through the real hand-over (170 checks at three sizes).
+  - **Review** wf_1bab6756-e2f (four reviewers, each batch re-tested by a second): fixed: on the camera track's clock
+    the pace told to the player was measured across two different frames (the track moves after the pose editor's
+    update), so it jumped at uneven frames and after a hitch; a voice put on while its clock ran at another pace
+    crept to it over 0.75 s; no word in the menu when the pace is outside what the player plays; two warning lines
+    that each said the other half worked; "Teeth (f, s)" (f is mostly missed), "1 min 60.0 s"; the "took the pose"
+    count ran while a voice moved the jaw; the help left out that the sound goes on while a pose steps aside.
+  - Files: `Camera/Voice.h/.cpp`, `VoiceDecode.h/.cpp`, `VoiceMouth.h/.cpp`, `VoicePlayer.h/.cpp`, `VoiceFace.h/.cpp`
+    (new), `Camera/PoseEditor.cpp` (VoicePlay, KeepVoice, AddVoice, the load job, the tab), `UI.cpp` (Greek letters
+    in the menu's font), the project files. Research: `Research_Pose_Editor_2026-11-08.md` section 28.
+
+- **GAME > Pose: every skeleton: "skeleton not known: can't be posed" fixed at its cause** (the user, 2026-11-12:
+  "find a way to find every skeleton and you can decompile all the necessery systems to find them so we can fix the
+  'Skeleton not know: can't be posed' issue"). In 36F6C4538534 (installed 2026-11-12 19:16, **not tested in game: the cause
+  is from the game's code and data, the game was closed during the work**).
+  - **The cause (decompiled, two independent readings).** When the game makes a body's pose manager it copies the
+    skeleton's parent list and writes "no parent" for every bone the body's animation rig has no channel for
+    (0x142FC9197). The pose editor compared that list exactly with its tables, so such a body never matched a
+    skeleton that was in the tables. By the game's data the only character bones in no rig are bone 161 of the men's
+    skeleton (BlendshapeDriver) and of the women in heels' (FacePosesAnimation): every man and every woman in heels.
+    It fits the record: only Faith, women on the other skeleton and KrugerSec were ever held.
+  - **What changed.**
+    - A body's skeleton is read from the game itself (`Camera/PoseSkeletonLive`): its own parent list (now also
+      used for the pose, as the game's pose pass does), which bones have a rig channel, and the SkeletonAsset its pose
+      manager was made from (manager + 0x00) with its name and its bones' names. The names are taken only when
+      proven: the asset's vtable, as many names as bones, every name hashing (FNV-1) to the hash the game keeps
+      beside it. If a check fails the tables are used alone and CT.log says which check failed.
+    - A bone without a rig channel is never handed to the game: the game's blend would write its pose into the first
+      channel, another bone's (decompiled: 0x142FCF743, 0x142FC921E). Such a bone and what hangs on it are left out
+      of the pose, and the log names them.
+    - The tables hold every skeleton of the game's data now: 22 assets found by type over all 43,704 data files
+      (patched ones included), 18 different bone layouts (the first 9 unchanged; new: weapons, pigeon, rat, animated
+      props, the mechanical arm, ropes, three trees). An asset the tables don't have gets a skeleton made from the
+      game's own names.
+    - Listed too: the plain actors with a body (by the data: bear mascots, pigeons, drones without AI).
+    - Still refused, with a reason in the list: a skeleton whose movable bones don't hang on one bone (animated
+      props, ropes), and a body whose main bone the game doesn't animate.
+    - Pose and keyframes files carry the body's own asset name (a man's file is no longer a woman in heels' "own
+      skeleton": their bones are other lengths).
+    - CT.log, once a pose manager: "Pose: a body's skeleton, N bones ...: the game's asset ..., found as ..., bones
+      with no parent ...". A body that stays unknown gets its whole parent list written.
+  - **Checks (offline):** the reader against made-up memory laid out as the decompile says, with every way the asset
+    can be wrong or gone (258 checks); the pose editor's real Take, per-frame hand-over and Let go on made-up bodies
+    (a man, a woman in heels, a KrugerSec without ankle channels, a body with no readable asset, a prop, a skeleton
+    the tables don't have): the made-up game took every frame, and no bone ever went through another bone's channel
+    (about 30,000 pose passes a run).
+  - **Review** (the same workflow): fixed: Take pose ended the game for a made skeleton whose label was 64
+    characters or more (none of the game's own); a man's file loaded on a woman in heels gave her his bone lengths;
+    a weapon could be offered a grip bone the pose doesn't hold; the skeleton log was keyed by address only.
+  - **First run in the game** (the user's, 11-12 19:25, CT.log): Faith's skeleton was read from the game as
+    decompiled: "the game's asset Characters/Skeletons/Skeleton_Faith, its 182 bone names proven by the game's own
+    hashes, the body's data names the same asset; found as: Faith; bones with no parent: 0; rig channels 184", and
+    she was held (174 bones from the Hips, her box pose too). So the asset, its names, the hashes and the channel
+    lists are where the code reads them.
+  - **Still not known:** that men and women in heels are the bodies that showed the message (no man was near in that
+    run: the first one seen writes the line that says so); the plain actors' list; the new tables' labels (working
+    names from the data's file names).
+  - Files: `Camera/PoseSkeletonLive.h/.cpp` (new), `Camera/PoseSkeletons.h` (regenerated), `Camera/PoseEditor.cpp`
+    (SkeletonOf, LogSkeleton, Take, WalkDrones, the list's notes). Research: section 29.
+
+- **GAME > Pose window > Voice: blinks, brow raises and head movement from the voice** (the user, 2026-11-12, of seven
+  suggestions for better lip sync: "Let's do number 4 for now": blinks, brows that lift on stressed words, small head
+  nods, all taken from loudness and pitch). In 1647CAFCA8A9 (installed 2026-11-13 01:21 with the game closed, hash
+  checked twice; **not tested in game; nothing was heard on the PC during the work; nobody has seen it on a face**;
+  not committed).
+  - **What it does.** A tick in the Voice tab, "Blinks, brows and head" (on), with three sliders:
+    - Blinks (0 - 1): how far the eyes close. The upper lid goes down in 0.08 s and up in 0.17 s; blinks come every
+      2 to 6 s, now and then two in a row, drawn to the ends of phrases, to the pause before a phrase and to strong
+      nods.
+    - Brows (0 - 2): a raise on the syllables that stand out most by their pitch (3 mm at the brow's middle at 1),
+      2 s apart at least.
+    - Head (0 - 2): a small nod on the syllables that stand out by loudness and length (up to 3.5 degrees), a chin dip
+      into the end of a phrase, a slow drift with the voice's pitch and loudness, a small new turn and tilt for a
+      phrase (about 2 degrees at most); 30 % of it on the upper neck (Neck1).
+    - The tab says what was found in the sound ("8 blinks, 4 brow raises, ...") and when to doubt it (no speech found:
+      blinks only; noise, music or a hum under the voice); "The face now" shows what the face does this moment.
+    - Worked out once when the file is read, so it stays in step when the voice is scrubbed, looped or slowed, and is
+      the same every time for the same file. The user's own edits and keyframes of the lids, brows, head and neck stay
+      underneath.
+  - **How.**
+    - The analysis (`VoiceLife`, no libraries): a loudness track and a pitch tracker of its own (60 - 400 Hz),
+      syllables and phrases, a stress score per syllable against its neighbours (level, pitch over the running pitch,
+      rise, length). Brow raises lean on pitch, nods on loudness and length. Silence, noise, tones, held notes,
+      beats, a murmur of many voices and the made-up whispers tried get blinks only.
+    - The face (`VoiceLifeFace`), sized from the game's own animation in the tools' saved replays (Faith's face never
+      moves there; 20 men and KrugerSec have face bones, five blinks were found): the game's blink is the upper lid
+      alone, one turn of its skin about a line 4 - 7 mm behind the eye bone; the lower lid does not rise. The head's own
+      axes are taken from the eyes and HeadEnd (the mouth's lean 23 - 38 degrees forward of them).
+    - Each frame the bones are found again on the pose as it is then, so a lid the user has moved part closed is shut
+      from where it stands, a lid turned part shut (people's lid bones at the eye's middle) only the rest of the way,
+      and the nod goes about the head's own right as the edits, keyframes or a clip turned it. A Face bone turned by
+      the user changes nothing of it. A part (eyelids, eyebrows, head) is on only if every one of its bones is held
+      (no wink).
+  - **Measured (offline):** the user's recording (30.6 s): 8 blinks, 4 clear brow raises (the strongest at 17.3 s),
+    nods up to 2.7 degrees, turns up to 2.2. The blink put through three recorded people's own skins lands 0.5 - 0.7 mm
+    (mean) from the game's own blink. Pitch: 97.5 % and 94.3 % of voiced frames within 5 % of two other estimators on
+    the user's recording; 99.5 - 100 % on made-up voices with a known pitch. 41,860 hostile edge runs of the analysis:
+    no fault, every value in range.
+  - **Limits.** It hears stress, not words. Music, noise or a hum 10 dB under the voice puts about a third of the
+    brow raises and nods elsewhere; singing is taken for speech; a voice above 400 Hz is tracked an octave down.
+    A pose taken with the eyes shut blinks from there as if open (set Blinks to 0); lid bones on the lid's edge
+    (Faith's) that are turned, not moved, get the whole blink on top (whether such a turn closes the lid is not known). Faith's own skin and animated face
+    are in no recording: her blink was checked on her bones only (her right lid goes a little further than her left:
+    39.5 / 34.1 degrees, as her bones stand).
+  - **Checks (offline):** the face module's own test on the five rest poses, recorded poses and every skeleton (507
+    checks; the merged module gives the same output line for line outside the new lid band); the real path file ->
+    decode -> mouth and life on 17 files of 12 kinds and the user's recording (445 checks); the Pose window's harness
+    with a made-up voice through the real KeepVoice and hand-over (228 checks at three sizes: blink, brows, head,
+    the amounts, lids moved or turned part shut by edits, lids drawn through the 6.5 - 9.5 mm band, the head and the
+    Face bone turned by edits, a man, a lid bone not held, a faceless skeleton, a face edited out of shape).
+  - **Review** wf_4b66c1c7-723 (three reviewers, each re-checked by a skeptic; about 690,000 hostile frames, 24
+    hostile sound files, all 18 skeletons): no crash, nothing not a number reached a bone, no lid past 60 degrees.
+    Fixed: a Face bone turned by the user sent the brows and the nod off the face's axes and from 40 - 60 degrees
+    dropped the blink and the head; lids at the eye's middle already turned shut were turned 35 degrees more; the lid
+    jumped 6 - 12 degrees in one frame where its bones cross 8 mm from the eye (now mixed over 6.5 - 9.5 mm); "The
+    face now" ignored the sliders; "its head bone" was said of characters without face bones; the noise note came up
+    on clean lines with no pause in them (now says so); the help's blink rhythm and what it promised; "1 blinks";
+    head poses named that don't show; an empty field in a log line; "The sound is heard" help still said only the
+    mouth moves.
+  - **Fix check** wf_8611e268-ef9 (two checkers): every finding's own evidence re-run against the fixed code (all
+    nine changes hold) and the new code attacked. Found and fixed: the lower lid could still move 1.4 mm in one frame
+    in two cases between the arrangements; the band's 9.5 mm end was one float short of exact; "The face now" kept
+    its lines with the voice off, showed a whole blink where lids already turned shut take none, and dropped parts
+    the edited pose gives no directions for without a word (now a line says so); "-0.0" in the head line. After
+    them the checker's scan (11 bodies, about 52,000 lid poses) gives every offset outside the band bit for bit the
+    checked module's.
+  - Files: `Camera/VoiceLife.h/.cpp`, `Camera/VoiceLifeFace.h/.cpp` (new), `Camera/Voice.h/.cpp` (the analysis in
+    Load, LifeAt, the tab's texts), `Camera/VoiceFace.h` (MaxDriven 32), `Camera/PoseEditor.cpp` (VoicePlay,
+    KeepVoiceLoad, KeepVoice, the tab), the project files. Research: section 30.
+
+- **GAME > Pose window > Voice: a living face (eyes, varied blinks, breathing, a head that never stops) and a feeling
+  made of the game's own face poses** (the user, 2026-11-13, after trying the blinks, brows and head: "ok it works but
+  still needs more human expression now it looks more like a animatronic. We need more feeling no mistakes"). In
+  935727C51F4B (installed 2026-11-13 18:56 with the game closed, hash checked twice, over D9CA6F54AFEF, the Time of day session's build installed at 16:03: built from the same folder, it also holds that session's reflection fixes A and B and B3846F99D215, untested in game and uncommitted; **not tested in game; nothing was heard on the PC during the work; nobody has seen it on a
+  face**; not committed).
+  - **What it does.** "Blinks, brows and head" is now "A living face" (on):
+    - Eyes: they look at the listener (where the eyes are posed) with small movements about the listener's face, look
+      away at the start of phrases and now and then inside long ones (about two fifths of the speaking time on the
+      recording), are back before a line ends, and dip a little in a blink. While the voice moves the head they keep
+      looking at the same place ("Eyes hold their target", on). The upper lids follow the eyes' movements up and down
+      (eyes the user turns are left with the user's own lids).
+    - Blinks: each eye its own, each blink different (part way, long, two in a row), about 20 - 30 a minute while
+      speaking. Brows: each side its own, varied raises, small flickers, a slow movement that never stops, drawn
+      together where the voice thinks or stresses a word loudly and low. Breathing: a breath in before each group of
+      words (the lips part a little), slow breathing in silence, a small lift of the head. Head: a slow drift that
+      never stops on top of the nods.
+    - New sliders: Eyes (0 - 1), Looks away (0 - 2), Take (1 - 99: another take of the same line; two characters given
+      one file start on different takes).
+    - "Feeling" (None by default): Calm, Happy, Tender, Sad, Worried, Afraid, Surprised, Angry, Tense, Disgusted,
+      Contempt, with Strength (0 - 2), Follows the voice (0 - 1, 0.3) and Uneven (0 - 0.3). Made of the game's own face
+      poses (decoded from its animation bank: Faith's library for Faith and the woman's skeleton, Gabriel's for
+      everyone else) as FACS action units; the voice only sets how strongly it shows. A new feeling comes in over
+      0.6 s.
+  - **How.** `VoiceAlive` (the research's checked prototype, renamed), `VoiceFeel` / `VoiceFeelFace` /
+    `VoiceFeelTables` (the checked feeling prototype, its parts split and the life's blink handed in), `VoiceGaze`
+    (new: the eyes' counter-turn worked out from the turns the layer lays on Neck1 and Head), `VoiceLifeFace` (each
+    side's blink and brows, the lid's follow), `VoiceFace` (MaxDriven 64), `Voice` (the analysis' data kept for each
+    character's take and the feeling's energy). The middle-lid cap of the blink reads the lid's turn against the
+    game's bind, so a pose taken mid-blink there isn't shut 35 degrees further.
+  - **Measured (offline):** the user's recording, take 0: 12 blinks (23.1 a minute talking), 8 looks away (37 % of
+    the speaking time), 52 small eye movements; on the voices tried the head nods up to about 4 degrees down and 2 up,
+    turns up to about 5. The eyes hold their place within 0.0001 degrees against the layer's own head at the Head
+    amounts 0 - 2 (with the feeling's nod and tilt, and with the Face bone turned by the user); at most 54 bones in the
+    layer on every body.
+  - **Limits.** Not seen on a face. The feeling is one per voice (not keyed on the timeline). Faith's own smile pose
+    turns her mouth corners 41 degrees (others' about 12). Women's faces were not tried (Faith's library is used for
+    them). The target is taken as far away (a near one is missed by 1 - 2 degrees while the head turns). The feeling's
+    lid poses on lid bones at the eye's middle (people) are converted, not the game's own middle-lid poses.
+  - **Checks (offline):** the alive module's own test (364,222 checks, byte-identical curves); the feeling's (8,500);
+    the life face module's (507, line for line); the eyes and the whole order on 11 bodies (1,776); the real path on
+    17 files and the user's recording (700); the Pose window's harness through the real KeepVoice (270 at three
+    sizes); the menu checker's harness with ImGui's IDs hooked (329 at three sizes).
+  - **Review** wf_f756d95b-0a5 (wiring, modules, menu and texts; each re-checked by a skeptic who reproduced every
+    finding). Confirmed and fixed: the eyes didn't hold their target with the Face bone turned by the user (1 - 9
+    degrees off: the head's counter-turn was taken in the Face's taken frame); the lids followed the user's own eye
+    edits on top of the user's own lid edits (a hand-posed look down went 86 % shut) and so changed the old path for a
+    sound without a take (now the lids follow only what the voice does to the eyes); the lid's upward follow opened
+    nearly shut eyes (a pose taken mid-blink from 2 % to 41 - 47 % open) and snapped shut 14.8 degrees as a lid closed
+    (now cut at 0.8 of the way left too); eyes near the 35-degree limit lost the head's counter-turn (up to 7.6 degrees
+    off) and two eyes posed at different side angles ended 4 - 7 degrees apart in height (now the look is brought back
+    onto the limit by its side angle only, its height kept: 0.98 degrees off where the limit needs 0.96, the eyes
+    within 0.5 degrees); a feeling held back the voice's brow raises even at Strength 0 (now by its strength); the
+    tab gave two blink counts; the Feeling list sat 2.5 - 3.4 panel heights down (the face part now comes before the
+    sound's and the mouth's sliders, the living face's sliders folded); texts: women in heels take Gabriel's poses,
+    a feeling's own head posture and its hold on the brow raises, one feeling per voice, 41 against 16 degrees, two
+    fifths of the speaking time looking away, the no-speech note, the "Eyes" line now shows what was laid.
+    Fix check wf_81033aff-09e (three checkers re-running each finding's own programs on the fixed code): all held but
+    the eye limit's first cure, which had its own fault (near the limit in height eyes posed up flicked 5 - 6 degrees
+    in one frame and converged eyes went parallel); now the height is kept only well inside the limit and mixed
+    smoothly into the nearest point on it (every case of the checker's program at gain 1); and a wide-eyed feeling's
+    lid popped 2 - 9 degrees as a lid was closed by hand (now its lid moves fade in over 5.7 degrees above shut: 0.02
+    at most). The Feeling list is on the tick's row now (in sight without scrolling at 17 and 29 px). Left as known:
+    two eyes both posed past 35 degrees at different angles can end a few degrees apart in height; a cut at the limit
+    can roll the eye about its look by a degree or two.
+  - Files: `Camera/VoiceAlive.h/.cpp`, `Camera/VoiceFeel.h/.cpp`, `Camera/VoiceFeelFace.h/.cpp`,
+    `Camera/VoiceFeelTables.h`, `Camera/VoiceGaze.h/.cpp` (new), `Camera/VoiceLifeFace.h/.cpp`, `Camera/VoiceFace.h`,
+    `Camera/Voice.h/.cpp`, `Camera/PoseEditor.cpp`, the project files. Research: section 31.
+
+- **GAME > Pose window > Voice: "From the voice": the feeling read from the voice itself, stretch by stretch** (the
+  user, 2026-11-13: "emotions should apply automatically depending on the sound file expressions"; they chose a trained
+  emotion model, EmoDB + RAVDESS for testing only, and the model as an optional download). In 49AEFCF2E9C9 (installed
+  2026-11-13 23:41 with the game closed, over BEB0F0C7518D, the camera session's build with its CPU fixes and the
+  hook-list lock, which this build also holds; every file hash checked twice), with the optional
+  `Cinematic Tools\EmotionModel` folder installed beside it (EmotionHelper.exe, emotion_feel.onnx, its README and
+  licence). **Not tested in game; nobody has seen it on a face; nothing was heard on the PC during the work**; not
+  committed.
+  - **What it does.** A tick, "From the voice", under the Feeling list. Each stretch of the voice (each phrase; one over
+    6 s in parts of 3 - 4.5 s) gets the feeling a trained model hears in it, over the feeling picked, as far as the
+    model is sure of it (Sureness needed, 0.55: smoothstep from it to 0.4 above it, or to a chance of 1). The model's 8
+    feelings show as Calm, Happy, Sad, Angry, Afraid, Disgusted and Surprised; neutral keeps the feeling picked. A
+    lively feeling heard in the voice shows a little stronger or weaker by how stirred up the voice is (0.85 - 1.15
+    times; only its own part). The face changes over about 0.6 s around where a stretch begins, across a loop's end too
+    (a voice of 0.6 s or more), and the same time in the voice always gives the same face. Each stretch can be set by
+    hand (from the voice, the feeling picked, none, any preset) in "The voice's feeling, stretch by stretch"; a change
+    there or of the sureness eases in over the same 0.6 s. "The face now" says what shows.
+  - **The model** (the optional download, about 660 MB, CC BY-NC-SA 4.0: non-commercial; audeering's card says "for
+    research purpose only"): audeering's wav2vec2-large-robust-12 emotion model, written out in plain torch (checked
+    against its card's own numbers: within 2.3e-7, and 6.9e-9 for its pooled states), with a small head trained on the
+    RAVDESS recordings that gives the chances of 8 feelings; exported to ONNX (opset 17) and run by Windows' own Windows
+    ML. `tools\emotion_model` holds the scripts and steps that make it from the public downloads; `build.ps1` now also
+    builds EmotionHelper.exe into `dist\EmotionModel` with the README and licence (the model is added by hand).
+  - **How right it is**, measured on short acted studio recordings it never heard, one whole recording at a time:
+    English actors (RAVDESS, each actor left out of the training in turn) 77 % of 8 feelings, 92 % when it is 80 % sure
+    or more; German actors (EmoDB, never used to fit) 54 %, 74 % at 90 % sure or more. On game dialogue: not measured.
+    What the face shows at 0.55, the mean over the feelings: English 57 % right, 5 % wrong, 38 % the feeling picked;
+    German 44 / 18 / 38. Through the shipped helper the same as through PyTorch.
+  - **EmotionHelper.exe** reads it outside the game: idle priority, 2 CPU threads, about 1.7 GB while it runs, about
+    1.2 s to start and 1.5 - 1.9 s for each 10 s it hears with the game closed (up to 2.9 s measured while the game
+    ran); one voice at a time; ended with the game; its answers kept in `EmotionModel\cache`, so the same voice is read
+    once (another helper or model reads it anew).
+  - **Reviewed** (4 reviewers and their skeptics: 27 findings confirmed and fixed; a fix check with 3 more and their
+    skeptics: 17 confirmed and fixed). Offline: 79,430,938 checks of `VoiceEmotion.cpp` with the real helper; the Pose
+    window's harness 330 checks at three window sizes with the real helper and 20,000 - 30,000 random-input frames each.
+  - **Also in this work:** the living face's changelog entry was put under Version 2.0.2 by mistake (that section is road
+    traffic only); it is moved here to Unreleased.
+  - **Not known until it runs in the game:** how it looks on a face; how right it is on game voices; other Windows
+    (Windows ML comes with Windows 10 1809 and later; whether its version reads this model was tested only on Windows 11
+    build 26300).
+  - Files: `Camera/VoiceEmotion.h/.cpp` (new), `Camera/PoseEditor.cpp` (VoicePlay, Release / FinishRelease,
+    KeepVoiceLoad, KeepVoice, FeelShapeNow, the Voice tab, the help texts), `EmotionHelper/` (new project),
+    `tools/emotion_model/` (new), `build.ps1`, the project files. Research: section 32.
+
+- **GAME > Pose window > Voice: a smoother mouth, and "Mouth smoothing"** (the user, 2026-11-14: "i think mouth
+  animations should be smoothed out they are too harsh right now"). In 604FAA183C96 (installed 2026-11-14 02:13 with the game closed, over 49AEFCF2E9C9 (which also holds the camera session's CPU fixes and hook-list lock, as this build does); every file hash checked twice, 30 s apart). **Not tested in game;
+  nobody has seen it on a face; nothing was heard on the PC during the work**; not committed.
+  - **What changed.** The mouth's curves are now smoothed three ways when the file is read, and a new slider, **Mouth
+    smoothing** (0 - 2, 1 by default, kept when another file replaces the voice), picks one or mixes two neighbours:
+    0 is the mouth as before, exactly; 1 eases the jaw and lips into and out of each shape; 2 is softer still, the
+    closures eased too. The Voice tab's picture of the file follows the setting.
+  - **How (VoiceMouth.cpp).** At 1 the closures go into the jaw before it is smoothed (before, they were multiplied in
+    afterwards, so the jaw shut at the lips' speed), and the whole jaw is smoothed by penalised least squares
+    (Whittaker - Henderson, second differences, zero phase) that holds it to its raw curve in closures and where it was
+    shut before; the lips' shapes by Gaussians of 20 - 35 ms. At 2 the jaw is stiffer and held less hard in closures.
+  - **Measured** offline on 31 recorded voices (the user's 4 files, EmoDB, RAVDESS), the jaw as the face turns it at
+    Mouth opening 1: its speed's 95th percentile and maximum 146 and 368 degrees a second before, 106 and 225 at 1, 85
+    and 149 at 2; its moves of 0.3 or more from 10 to 90 % in a median 43 - 49 ms before, 59 at 1, 70 at 2. On
+    computer-made test voices p / b / m are seen as shut about as often as before at 1 (92 against 91 % on clean
+    voices, 82 against 84 % in fast speech); the cost is quick syllables that run together: the jaw opens to a fifth
+    on 91 % of vowels before, 87 % at 1 and 81 % at 2 (fast speech 84, 75, 65 %).
+  - **Checked.** At 0 the curves are the old module's, number for number, on 437 of 437 files; at 1 and 2 within 5e-7
+    of the study's Python reference. The mouth test suite passes (unit, 9,120 odd-size runs, threads, out of memory);
+    the real `voice::Load` / `MouthAt` / `OverviewOf` 840,236 checks; the Pose window's harness 341 checks at three
+    window sizes. Reviewed: 3 reviewers and 2 skeptics (6 findings confirmed, all fixed: the picture showed setting 1
+    only, the rest words), a fix check with 2 checkers and a skeptic (7 confirmed, all words, fixed).
+  - **If it still looks harsh:** raise Mouth smoothing towards 2, or lower Mouth opening (the jaw opens wider than
+    people's in typical speech on these lines; a smaller opening also moves slower).
+  - Files: `Camera/VoiceMouth.h/.cpp`, `Camera/Voice.h/.cpp`, `Camera/PoseEditor.cpp` (VoicePlay, the Voice tab's
+    slider, picture and help texts). Research: section 33.
+
+- **GAME > Pose > Idle movement keeps going on other characters** (the user, 2026-11-14: "Idle animations on other
+  units don't loop properly"; asked: "Stops, then restarts"). In 8685390F4504 (installed 2026-11-14 04:47 with the game closed, over A44C4B10CD4E (a 03:38 build of the shared tree, which already held this change's first, unreviewed version); it holds the camera session's fixes too; every file hash checked twice, 30 s apart). **Not tested in game**; not
+  committed.
+  - **Why it stopped.** The idle faded out whenever any body bone was more than 10 degrees off where its animation had
+    been over the last 3 s. Measured on the people in three of the tools' replay recordings: standing NPCs' gesture
+    idles move their arms, hands and heads up to 93 degrees from that, so the gate was shut much of the time (on one
+    man it opened about 1.1 s in each 11.6 s loop of his idle; which man the user held isn't known). Why Faith's own
+    idle wasn't stopped as often isn't known (the recordings never have her still for more than 2 s).
+  - **Now, on people** (every human skeleton of the game): it stops while they walk or run (the root faster than 0.3
+    m/s over half a second) or their hips or legs move far or fast (Hips or a leg 40 degrees off, or the hips, legs or
+    spine turning faster than 200 degrees a second), and comes back about a second after they stand still again. Run
+    in the change's own code over the 79 recorded tracks: standing men and low-detail people kept their idle all the
+    time from about 1.5 s after Take; standing guards (during chases) about 60 %; walking and running people 0.2 - 0.4
+    % of the time. Drones, animals and props keep the 10-degree rule.
+  - The 15-degree limit on each bone is now soft (an arm whose animation goes far still moves, more slowly); the gate
+    goes by the game's time, so slow motion and fast game speeds are judged alike (tested from 0.01x to 4x, and at 12
+    and 20 frames a second).
+  - The 10 s CT.log line says what the gate did (open in how many captures, which limits were passed, what the
+    10-degree turn rule would have shut). The tick has a help text now.
+  - **Under Freeze time** the game's animation doesn't move: the idle movement eases out over a few seconds, then holds
+    still (as before).
+  - Checked: the real code driven by the 79 recorded tracks at 0.01x - 4x, at 12, 20 and 115 frames a second and under Freeze time; the Pose window's harness 348 checks at three sizes (a new scenario runs the gate in the window); reviewed (3 reviewers and their skeptics: 10 findings confirmed and fixed; a fix check: 14 confirmed and fixed).
+  - File: `Camera/PoseEditor.cpp`. Research: section 34.
+
+- **GAME > Pose window: the keyframes made easier** (the user, 2026-11-15: the Pose tab's keyframes "feel too bad"; of
+  ten suggestions they chose "Start with 1-3"). In C88E5C29DB9E (installed 2026-11-15 16:53 with the game closed, over
+  A2CBA749CC53, the culling session's 14:31 build of the shared tree, so it holds every session's work of then; game
+  folder and dist, hashes checked twice, 30 s apart). **Not tested in game**; not committed.
+  - **Smooth eases, as Blender's, Maya's and Unity's default keyframes do (auto-clamped).** A bone's first and last
+    keyframe ease in and settle; a hold between two equal keyframes stays still (it drifted 7 - 11 degrees); a fast
+    move into a rest no longer goes past it (60 degrees in 0.2 s went 7.5 degrees past); where the motion turns back it
+    stops at the keyframe; between Smooth keyframes the speed carries on through them; next to a Linear segment its
+    speed carries on. A turn is worked out as one rotation: a steady spin stays steady (at 120 degrees a keyframe it
+    pulsed 100 - 132 degrees a second, now 120.0), and a turn about several axes never passes its keyframes (up to 8
+    degrees before). With Loop on, a bone keyed at 0 s and at the end carries on through the wrap instead of stopping
+    there. Linear, Ease in and out and Hold are exactly as before.
+  - **One Undo and Redo for the pose and its keyframes**, in two places (under the bone's controls and in KEYFRAMES).
+    A change and the keyframe Auto key makes of it are one step. A dot drag put back with a right click, a keyframe let
+    go where it was, or a click that changed nothing (a ring held but not turned, a field clicked) leaves no step and
+    keeps Redo. Undo of a keyframes file's load puts the clock, speed, loop, Use the keyframes and the playhead back
+    too. Up to 50 steps.
+  - **Hotkeys**, while the tools' menu and the Pose window are open (rebind them in the tools' Hotkeys window; by
+    default on the numpad with Num Lock on: keys the camera's and the game's saved binds don't use; the game's own
+    default keys aren't known): Num 0 play / pause,
+    Num 8 keyframe the changes, Num 2 keyframe the whole pose, Num . remove the picked bone's keyframe at the playhead,
+    Num 4 / Num 6 to the keyframe before / after, Num 7 / Num 9 one frame (a 30th of a second) back / on, Num / undo,
+    Shift + Num / redo. The buttons' and the Time field's tips name them.
+  - **Auto key shows what it does.** A red Auto key tick in the KEYFRAMES row (the same switch as Options), dimmed
+    while it can't keyframe (the keyframes off, or playing). It now keyframes from the first change (before, only once
+    the pose had a keyframe). A line under the row says what was keyframed, for example "Auto key: keyframed
+    RightForeArm at 1.00 s, held as it was at the keyframe time around it (1 hollow)". The keyframes that hold a bone
+    as it was at the keyframe times around its first keyframe are drawn hollow; Options > Hold the times around a new
+    keyframe turns them off; Keyframe: this bone on a hollow one makes it the user's own.
+  - **Reset asks** when the bones it resets have keyframes (the keyframes put a reset back when the time moves):
+    keyframe the reset at the playhead, or reset and remove their keyframes. With Use the keyframes off it resets at
+    once and says which bones the keyframes will put back.
+  - **Keyframes at one time only (a still) aren't autosaved**, and Let go doesn't ask about them: a still no longer
+    pushes an animation's autosave out ("autosave <name> before" was the only copy kept). The Files tab says so.
+  - Ticking Loop or changing Length makes the pose again from the keyframes at once (the curve depends on them).
+    Clicking a drag field (the root's or a weapon's Move, Length, Begins at) no longer changes its value by rounding it.
+  - The texts say what really happens: a bone without keyframes keeps its pose when the time moves; only a bone with
+    keyframes goes back to them; what Auto key does while the keyframes are off, playing, or their time is held.
+  - Checked offline: the curve test (22 checks: the new curve against what it must do and the other eases against the
+    file as it was); the Pose window's harness, rebuilt (159 checks at three window sizes, two new scenarios for all of
+    the above, random input; no ImGui check fired). Reviewed by 4 reviewers and their skeptics (13 findings confirmed
+    and fixed), a fix check (3 checkers, 3 skeptics: 12 confirmed and fixed), a last check (2 checkers, 2 skeptics: 8
+    confirmed and fixed). Found on the way and fixed: the first one-rotation curve made the turning speed jump at
+    keyframes for turns about several axes (median 28 % of the speed); now as smooth there as before (0.4 % at most).
+  - Not checked offline: the hotkeys themselves (they run on the input's thread, which the harness doesn't have), the
+    dots and rings (no camera view offline), and anything in the game.
+  - Files: `Camera/PoseKeys.h/.cpp`, `Camera/PoseEditor.cpp/.h`, `Input/ActionDefs.h`, `Input/InputSystem.cpp` (the
+    pose hotkeys called with the camera's). Research: section 35.
+- **GAME > Pose: Idle movement goes on while the keyframes play** (the user, 2026-11-15: "idle animation should be
+  going on even when there are key frames animating"). Before, it faded out at Play and started again from scratch at
+  Pause (`UpdateIdle`'s want had `!PlayingKeys(h)`, copied from the clips' rule when the keyframes were made; no
+  reason of its own found). Now it's laid over the keyframes as over a still pose: what it adds is the game's own
+  animation under the pose, whatever the pose is, and channels the game doesn't write (they hold the tools' pose) are
+  left out as before. A clip playing still fades it out (a whole animation of its own), so on the clip's clock, where
+  the keyframes play only with the clip, it stays off. The tick's help says so. In E757C34B6728 (built from the whole
+  tree at 22:22, staged; it installs over C0B0D70F6B69 when the game closes). Not tested in game; not committed.
+  - Checked offline: the Pose window's harness, new scenario 3d (the real `UpdateIdle` on made-up captures as the
+    game's blend hook writes them: Spine1 swaying 3.4 degrees, the keys playing a looped arm on the Real clock, 9
+    checks): the idle movement fades in and stays while they play (weight 1.000; Spine1 up to 3.55 degrees off its
+    keyed pose, the keyed arm, which the made-up animation holds still, 0.0000 off its keys), Pause and Play don't
+    start it again, unticked it fades out while they play on. The whole harness: 168 checks at three window sizes, 0
+    failed. Not checked offline: the real captures from the game's blend.
+  - File: `Camera/PoseEditor.cpp` (UpdateIdle, the Idle movement help).
+- **GAME > Pose: the kinematics expanded** (the user, 2026-11-15: "We also need to expand the kinematic system feels to
+  basic and movements are robotic"; 2026-11-16: "do all" of the twelve suggestions in
+  PoseKeys_Work_2026-11-15\kinematics_suggestions.md). New files `Camera/PoseKinematics.inl` (the solver) and
+  `Camera/PoseMotion.inl` (the layers over the handed pose), included in `PoseEditor.cpp`. In B1F4273D6225 (built 02:01
+  from the whole tree; INSTALLED 11-16 02:03 over BDA75BD9B1C2, game folder and dist, hashes checked twice). Not tested in
+  game; not committed.
+  - **Elbows and knees bend like real joints** (Options > Joints, on; with "A dragged bone bends" at 2 or more): a
+    dragged hand or foot bends its elbow or knee about the joint's own hinge (from the game's rest pose of the
+    skeleton, all five bent the natural way; else from the pose taken), at most 150 degrees (eased over the last part;
+    a joint already bent further can stay so), the upper arm or thigh rolled about its own length so the joint stays a
+    hinge. Fixes a bug: the old two-bone bend kept its *side*, which flipped when the drag direction passed it (a
+    standing leg's foot lifted forward over the hip bent the knee backwards). Every two-bone bend now carries its
+    plane's normal by the limb's swing, so it doesn't flip (the review found that the first version, a projection,
+    still flipped when a hand was raised out to the side past shoulder height).
+  - **Dragged hands and feet keep their angle** (on): a dragged hand or foot keeps its turn in the world (with 1 bone
+    bending too).
+  - **Feet stay where they stand when the Hips move** (on): the Hips' dot, rings and Turn sliders bend the legs so the
+    feet stay put (past the legs' reach they straighten; more than 25 cm past it the feet go with the Hips); the Hips'
+    Move field still moves the whole body. **Pin the hand / foot where it is** (Bone tab, a hand or foot picked): it
+    stays while the rest is posed (dots, rings, sliders); editing its own limb or a toe takes the pin with it, and so
+    does anything else that moves it (Undo, a reset, the keyframes' time: the pin is in Undo's steps and follows a
+    hand moved by something else); a magenta square on the picture. The Bone tab's sliders now make each frame's
+    change from the pose they were taken in, like the rings, so held feet and pins don't drift.
+  - **Elbow / Knee direction** (Bone tab, an arm's or leg's bone picked; not while that limb's keyframes play): drag it
+    sideways to swing the elbow or knee round the line from the shoulder or hip to the hand or foot, which stay where
+    they are.
+  - **Back and neck bend in a curve** (on): a chest (Spine2) or head drag with 2 bones or more turns each spine or neck
+    bone below it the same share.
+  - **Collarbone joins an arm raise** (on): a dragged hand or elbow turns its collarbone 30 % of its upper arm's swing
+    (half with "A dragged bone bends" taking the collarbone in), at most 25 degrees from the pose taken. An elbow
+    dragged with 2 bones or more is now aimed by its upper arm with that share, not bent as a collarbone - upper arm
+    pair (so it no longer reaches the cursor exactly, as a knee never did).
+  - **A far reach bends the back** (off): a hand dragged past its arm's reach bends the spine towards it, at most 35
+    degrees.
+  - A toe dragged with 3 bones or more moves its foot (the leg about its knee) and points the foot, instead of the
+    free three-bone bend.
+  - **Roll and twist bones follow** (on): the elbow and knee rolls take their forearm's or shin's turn; Faith's forearm,
+    upper arm and thigh twist bones their share of their driver's (her rules, as the clips use them), laid last so
+    they follow the layers below too. The dots don't show it.
+  - **While the keyframes play** (Options): **Loose timing** (0.5): the head and arms follow the chest a moment later, the
+    hands later still (0.02 s a joint at 1; the Hips and legs never). **Follow-through** (0.5): the arms, hands and head
+    lag and settle on springs in the character's frame, by the keyframes' own time, each joint at most 8 - 20 degrees
+    off (the head left to a voice that moves it). **Feet stay put between keyframes** (on): a foot in the same place
+    (3 cm, 10 degrees) at the keyframes either side of the playhead is kept there between them (eased over 0.15 s at a
+    stand's ends, not at a key between two stands). All three only while the keyframes' time moves (faded over
+    0.25 s): paused, the pose is exactly as keyed. No holds or pins while the keyframes play.
+  - **Look at** (Options, per character): the camera (also with the menu closed: its place is read then too while a
+    pose looks at it) or a point (a ringed dot to drag, placed 1.5 m in front of the face): the eyes look at it, the
+    chest, neck and head turn part of the way (Amount, 0.7), measured from the face's own way (its rest pose's eyes, in
+    the pose before the voice: a voice's nods and glances go on over it), at most 70 degrees round and 40 up or down,
+    eased (0.12 s); a place 110 - 150 degrees round behind the head fades the look out (no swing from side to side);
+    the eyes at most 35 degrees from the face's way.
+  - **On the picture** (Options): the picked bone's path over the keyframes (an orange line, a dot per keyframe time, at
+    most 120: on) and ghost poses at the keyframe times either side (off). Shown with the bones.
+  - **More eases**: Ease in (starts slow), Ease out (ends slow), Overshoot and settle (goes 10 % past the next key and
+    comes back). A Smooth key next to them carries their speed across the key. In the keyframes file as easein,
+    easeout, overshoot: such a file doesn't load in an older build.
+  - **Between its keyframes** (Bone tab, a keyed bone between two of its keys): set it between them (0 % the one
+    before, 100 % the one after, past either end overshoots); Auto key keyframes it.
+  - Reviewed (workflow wf_4166313b-153: three reviewers, a skeptic each trying to refute every finding): 18 findings,
+    15 confirmed (12 issues: Look at's camera place frozen with the menu closed, the Hips' Move field dragging the
+    legs, sliders taking the holds again each frame, pins left out of Undo and the cancel, a pinned foot's toe undone,
+    the hinge flip past shoulder height, Look at flipping with a place behind the head and fighting a voice's glances,
+    the helpers laid before the layers, the foot lock's edges, the swivel while keys play, a cut-off help text, help
+    texts promising more than the code did), all fixed; 3 not confirmed (handled anyway: the look point placed when the
+    world comes, the trail's dots capped, the overlay's items shown with the bones).
+  - Checked offline: the Pose window's harness, new scenarios 3e (Faith's limbs on her rest pose: the rig found, the
+    knees' hinges along +X, the old side of the "foot over the hip" drag down and the new knee 0.337 m up on its hinge,
+    the hand dragged five ways on its hinge with its turn kept and at most 150 degrees, the hand raised out to the side
+    from -60 to +60 degrees with the elbow's biggest step 9.2 mm per 2 degrees, a hold at its own place turning nothing,
+    the Hips moved and turned with the feet 0.00 mm off, a 5 m move taking the feet along, a slider there and back
+    leaving the legs as they were, a pin holding a hand to 0.00 mm while Spine1 turns 25 degrees, a pin put back by a
+    cancel, a pinned hand moved by something else not pulled back, a pinned foot's toe dragged, the head's neck curve
+    32.9 / 32.9 degrees, the collarbone, a far reach, the swivel, a toe), 3f (the helpers to 0.01 degrees and the
+    elbow's roll on its sprung forearm, loose timing 12 degrees behind on a 120 degrees a second key and exact when
+    paused, follow-through up to 44 degrees on a 280 degrees a second swing at 1 and settled after, a foot 0.00 mm off
+    where it stands between keys whose own curves slide it 20.4 mm, the eyes 0.02 degrees off the camera, the camera
+    orbiting behind at 240 degrees a second with the head's biggest step 2.0 degrees a frame and the look gone straight
+    behind), 3g (the eases' shapes, Overshoot's peak 1.100, Ease in arriving at 90 degrees a second and the Smooth key
+    after it leaving at 90, the file's words). Not checked offline: the game's own poses and skeletons other than
+    Faith's rest pose, a voice with Look at, the game taking the layered pose, how any of it looks.
+  - Files: `Camera/PoseKinematics.inl`, `Camera/PoseMotion.inl` (new), `Camera/PoseEditor.cpp`, `Camera/PoseKeys.cpp`,
+    `Camera/PoseKeys.h`.
+- **GAME > Pose: drag the dots of the picked bone's path** (the user, 2026-11-16: "make it so that you are able to move
+  the dotted orange nodes of the movement"). In 08EDCB33575C (INSTALLED 11-16 05:23 over DDB153D9AFEE, game folder and dist). Not tested in
+  game; not committed.
+  - A press on a dot of the orange path puts the playhead at its time and the pose there at once (a click alone does
+    only that); the bone is then held like its own dot (the bones above it bend as "A dragged bone bends" says; Shift,
+    the wheel, the arrows, Bones stop at walls and a right click work as for its dot). Let go after a drag, the change
+    is keyframed at that time, with Auto key off too (only the bones the drag changed then), in one Undo step with the
+    drag. While held, the path, the dragged dot and the ghost poses show the keyframes as they'll be made (hollow holds
+    included), so the dot stays under the cursor. The dot under the cursor or dragged is drawn bigger with its time.
+  - The dot at the playhead's time lies under the bone's own dot, which takes the click (and drags as usual). With Loop
+    on, the dots at 0 s and the Length are one place when the bones are the same at both ends: a drag of it keyframes
+    each such bone at both ends (the loop stays seamless); the playhead's own end is the one taken. With the playhead
+    at that end the dot is under the bone's own dot, which drags as usual and keyframes that end only.
+  - Not taken (the label says why): while the camera track holds the keyframes' time (their Track clock), past their
+    Length, and with Auto key off while a bone with keyframes has a change not keyframed yet (at another time: any
+    such bone, moving the time would drop the change; at the playhead's time: a bone of the path, the dot isn't where
+    the bone is). A ring under the cursor takes such a click instead. Not while the keyframes play.
+  - Reviewed three times (workflows wf_2c6de33f-dd6, wf_653979bf-bdc, wf_6b9fdbbe-aba): fixed the drag starting from
+    the bone instead of the dot, two Undo steps, a thinned path's dragged dot vanishing, a copy of the keyframes every
+    frame, ghost poses not following, a click near the rings dropping changes not keyframed, the path's drags with the
+    Pose window closed not autosaved, the loop's two ends, the stacked dots, a refused click leaving a text field
+    active, the loop's other end added as a dot for nothing, the dot at the playhead with a change of a bone above it,
+    and Bones stop at walls sweeping from the dot instead of the bone.
+  - Files: `Camera/PoseMotion.inl` (MakeTrail, DrawKinTrail, DrawKinPins, TrailRefusal, KeyTrailDrag, LoopOtherEnd),
+    `Camera/PoseEditor.cpp` (DrawOverlay, ApplyKeysNow split out of KeepKeys, KeyBoneIn split out of KeyBone).
+- **GAME > Pose window: Save, Save as and Load in the keyframes bar** (the user, 2026-11-16: "also make it possible to
+  save the keyframes to a file"; asked which, they chose the buttons by the timeline and the Windows file window for
+  any folder, on its own thread). In 08EDCB33575C (installed 05:23). Not tested in game (the file window has never been opened in the
+  game); not committed.
+  - **Save** writes the keyframes into the file they were last saved in by hand; with none yet, or after a Load, it
+    asks where first (so a loaded file is never written over without asking). **Save as** opens the Windows file
+    window (a .posekeys file anywhere, overwrite asked by the window). **Load** lists Cinematic Tools\Poses' files
+    (names past the ANSI code page too) and "Another file..." (the file window). A load is one Undo step. The window and
+    the file's writing or reading run on a thread of their own, so neither holds the game up; the buttons wait while
+    one is under way. The window has no owner window (the game's belongs to another thread): it can open behind the
+    game (Alt+Tab; the note under the bar says so). A press that comes as the window closes with a button down (a
+    double-click on a file; seen by the window's OnFileOk, before it closes) isn't taken by the menu or anything on the
+    picture (`pose_editor::QuietMouse`, called in `UI.cpp` right after ImGui's NewFrame). A load waits while a bone, a
+    ring, a keyframe on the timeline or a field is held. A Save as answered after a load (from the Files tab while the
+    window was open) doesn't make Save write there unasked. The KEYFRAMES help says that with the Pose window closed
+    Auto key waits (it always did) until the window is open again.
+  - A saved file now takes the old one's place in one step (MoveFileEx), for the Files tab and the autosave too: a
+    failed replace loses neither, the new keyframes stay in the .tmp beside it (a read-only file there: no tries again,
+    no wait).
+  - Reviewed twice (wf_c562cb29-cc2, wf_6b9fdbbe-aba): fixed Save writing over a loaded file after an Undo of the load
+    (and over an autosave or a lossy load's file), the old file deleted before the new one was in place, the file I/O
+    on the game's frame, mangled non-ANSI names in the list, the double-click click-through (twice: its guard was set
+    too late), a load landing during a timeline drag, a late Save as answer after a load, retries on a read-only file.
+  - Checked offline: the Pose window's harness, scenario 3i (a whole path past ASCII saved, saved over and loaded back;
+    the bar's Save clicked with no file (asks in Cinematic Tools\Poses with the pose's name, written), again (written
+    there, nothing asked); the Load menu's file named past ASCII clicked (loaded, Save's file let go of); Undo of the
+    load, then Save (asks, the earlier file untouched); Load > Another file; a load answered while a bone is held
+    waiting; the window failing; the pose let go; a press quieted as after a double-click and the next one taken; a
+    Save as answered after a load; let go and taken again), with the window's stand-in on the real worker thread. Not checked offline: the real Windows file window in the game (focus, a fullscreen game, behind the
+    game, shell extensions in the game's process).
+  - Files: `Camera/PoseEditor.cpp`, `Camera/PoseEditor.h`, `Camera/PoseKeys.cpp`, `Camera/PoseKeys.h`, `UI.cpp` (one
+    line).
+- **GAME > Pose window > Voice: the emotions engine improved** (the user, 2026-11-16: "find any improvements for the
+  emotions engine and implement them no mistakes"). Found by four finders (the reading, the face, bugs, use), each
+  answered by a skeptic (workflow wf_2c4a1261-10a: 22 proposals, 18 upheld with corrections, 4 refuted); reviewed by four
+  reviewers, each answered by a verifier (wf_b8913a25-0bf: 15 findings, 14 confirmed, 1 real but practically unreachable;
+  all fixed), and the fixes checked again (wf_b65e9509-a64: all 15 fixed, 4 small new ones found and fixed). In
+  A05EDC98DFD2 (installed 2026-11-16 15:19 by the PC's clock, over A6D8984E12FF). Tried in the game 16:31 - 16:41
+  (CT.log: Faith's lines read anew with the shared windows, CS05 kept from its earlier reading, a reading stopped by
+  another voice, cached readings taken, a 4 min 15 s voice of 48 stretches read in 11 s, no warning); the user:
+  "Everything seems fine". Not committed.
+  - **From the voice: phrases the model hears together share one reading.** A short phrase is heard with the voice
+    around it (3 s); a short phrase that begins inside that window now joins it (the group heard as one: 3 s around it
+    or its whole span, under 6 s), each phrase keeping its own row and setting. Before, on Faith's lines, two windows
+    sharing 98 % of their samples were heard as different feelings (fearful 38 % against calm 29 %), and one 3 s window
+    was read twice. The helper hears each window once (on the five voices tried: 79.8 s heard become 63.0 s). A voice
+    with no shared windows keeps its cached reading (A_VO_CS05_Faith: the same key); the others are read once more.
+  - **A voice already read is taken at once**, also while another voice's reading runs (it waited for that reading
+    before). A Stop during its hashing is taken (checked between 8 MB chunks).
+  - **Memory**: a reading doesn't start while Windows has under about 5.7 GB of memory left to give (1.7 GB for the
+    reading, 4 GB kept for the game, which ends itself when Windows has none left), and a running one is stopped if that
+    falls under 2 GB; both, and the helper ending out of memory, keep Try again (before, an out-of-memory end said "no
+    Try again" and blamed Windows ML). The messages round down and state the rule.
+  - **Stop**: a Stop button while the voice's feeling is read (also when From the voice is unticked while it runs); the
+    progress says "starting the model" until its first stretch, and the seconds so far.
+  - **Why a stretch shows what it shows**: the mouse on a row of "The voice's feeling, stretch by stretch" (or on the
+    new strip along the voice picture's top) shows all 8 chances, the model's arousal / dominance / valence, what it was
+    heard with (the phrases heard together), and why: shown, partly, not sure enough (with the Sureness at which it would
+    show), heard as neutral, too short, set by hand. The summary line counts them by reason. On the voice's own clock a
+    row's time is a button that takes the voice there.
+  - **The log** says when a reading starts (its windows, the seconds heard, the memory left), ends (with its cache
+    file, its own time and the wait for another voice's reading apart), stops or fails (one warning), and, as diagnostic
+    lines, what each stretch was heard as (its top three chances and A/D/V).
+  - **A sound whose phrases were never looked for** (outside 8,000 - 192,000 Hz, or its analysis failed) says so, not
+    "No speech was found".
+  - **The same file loaded again while its reading runs** keeps that reading (not stopped and begun again); one still
+    waiting for its turn is begun again on the new read (not to hold a second copy of the sound).
+  - **The face**: a feeling picked while another change is still going no longer moves the face faster than a change
+    (it could move it up to 3.8 times as fast: 0.105 of the face in one frame); **Surprised drops the jaw a little and
+    Afraid parts the lips** (about 3 and 2 degrees in a pause, under the speech's own jaw, scaled by Mouth opening, gone
+    where the lips close for p, b and m: the closure taken over 80 ms either way, so it goes no faster than the speech's
+    own jaw moves; measured on the five voices tried, no closure left apart at Lip closing 0.5 - 2 and every Mouth
+    smoothing; with Lip closing 0, p, b and m left out, it stays); **"Smile comes and goes"** (1 by default; 0: held as before): a smile rises a
+    little before speech, is at its fullest 4 s at most, eases to 85 % while the speech goes on, and to half between
+    stretches of speech (felt smiles last about 0.5 - 4 s; one held at its fullest about 5 s looked more fake:
+    Krumhuber and Kappas 2005, smiles alone on made-up faces; the times and levels are designed within that).
+  - Refused by the skeptics, not built: eased (slow in, slow out) changes, the left side stronger by default, keeping
+    stretch settings across files. Not done, for later: measuring how right the reading is as the tools hear it
+    (phrases in their windows, about 3 - 4 h of computing with the game closed), which decides two changes to the helper
+    (hearing a stretch with silence around it as the model was trained, averaging four starts).
+  - Checked offline: Emotion_Tests_2026-11-16 (emotion_test: the stretch rule on the five real voices and 100,000
+    random ones, the looks, the parser and why on the 24 real readings, the reading thread against a stand-in helper:
+    2,365,900 checks; face_test: the smile, ShapeOf bit for bit the old one with the smile all there, the jaw: 6,186,586
+    checks; jaw_gate: the jaw at every closure of the five voices), and the Pose window's harness (new scenario 3j with
+    the stand-in: the reading, Stop, Try again, the carry and the waiting one not carried, the rows' and the strip's
+    tooltips, the time buttons, the smile, the jaw and its closure over time, a change picked mid-change, no phrases:
+    59 checks; the whole harness at three sizes).
+  - Files: `Camera/VoiceEmotion.h/.cpp`, `Camera/VoiceFeel.h/.cpp`, `Camera/VoiceFeelFace.h/.cpp`, `Camera/PoseEditor.cpp`.
+
 ## Version 2.0.2
 
 Road traffic only: 2.0.1 with the change below and nothing else.

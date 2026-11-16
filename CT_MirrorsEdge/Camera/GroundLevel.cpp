@@ -263,6 +263,7 @@ namespace
   const ULONGLONG ProbeEveryMs = 2000;
   const ULONGLONG GoneWorldMs = 3000;             // a world not flushed for this long is taken as gone
   const ULONGLONG RepublishMs = 100;              // a plan not all made yet is handed over again this often
+  const ULONGLONG PlanMemoMs = 250;               // a plan taken again (PlanMemo) is made anew at least this often
   const ULONGLONG FaithGoneMs = 1500;             // Faith not there for this long (a load, a respawn): all let go
   const float NearMadeRadius = 8.f;               // g_PlanAllMade: the plan's items this near her made
 
@@ -285,6 +286,9 @@ namespace
   tPhysicsFlush oPhysicsFlush = nullptr;
 
   bool g_Available = false;
+  SRWLOCK g_FeetLock = SRWLOCK_INIT;      // Faith's feet as UpdateGates last had them (LastFeet)
+  float g_LastFeet[3] = {};
+  ULONGLONG g_LastFeetAt = 0;
   std::atomic<bool> g_Broken{ false };          // a Havok call faulted: the tools' bodies stay off until the game restarts
   std::atomic<bool> g_SolidStreet{ false };
   std::atomic<bool> g_NoFallDeath{ false };
@@ -1095,6 +1099,13 @@ namespace
       now.Havok == d.Havok;
   }
 
+  // Every field the same (a plan carries the donor it was made with: PlanMemo)
+  bool SameDonor(Donor const& a, Donor const& b)
+  {
+    return a.World == b.World && a.Havok == b.Havok && a.Body == b.Body && a.Record == b.Record &&
+      a.UserData == b.UserData && a.Filter == b.Filter && a.Material == b.Material && a.Quality == b.Quality;
+  }
+
   // ---- What the camera hook wants in the game's physics, taken by the flush
   struct Item
   {
@@ -1113,22 +1124,36 @@ namespace
     std::vector<unsigned> SortedItems;          // the item of each of SortedKeys (its index in Items)
   };
 
+  // The sorts' work lists (RadixOrder, KeyOrder, NearestFirst), kept by their caller from call to call: cleared, not
+  // freed and made again each frame (2026-11-13, "tools fixes only"). Update's thread has its own; PublishMade (the
+  // flush, on the game's threads) makes one each time, as before
+  struct SortWork
+  {
+    std::vector<unsigned> Count, Other;                               // RadixOrder's
+    std::vector<unsigned> Low, LowAt, HighAt, LowOrder, HighOrder;    // KeyOrder's
+    std::vector<unsigned __int64> High;
+    std::vector<unsigned> Bits, Order;                                // NearestFirst's
+    std::vector<Item> Sorted;
+  };
+
   // The order a stable sort of n keys (unsigned integers) puts them in, as their indexes: a radix sort, a byte a pass
   // (least significant first), the bytes every key has the same left out (2026-11-03: std::sort and std::stable_sort
   // of the plan's ~3,000 items and keys took ~0.3 ms of the planning, this ~0.03)
   template <class K>
-  void RadixOrder(K const* key, size_t n, std::vector<unsigned>& order)
+  void RadixOrder(K const* key, size_t n, std::vector<unsigned>& order, SortWork& work)
   {
     order.resize(n);
     for (size_t i = 0; i < n; ++i)
       order[i] = (unsigned)i;
     if (n < 2)
       return;
-    std::vector<unsigned> count(sizeof(K) * 256, 0);     // (not on the stack: the flush runs on the game's threads)
+    std::vector<unsigned>& count = work.Count;          // (not on the stack: the flush runs on the game's threads)
+    count.assign(sizeof(K) * 256, 0);
     for (size_t i = 0; i < n; ++i)
       for (int b = 0; b < (int)sizeof(K); ++b)
         ++count[b * 256 + ((key[i] >> (8 * b)) & 0xFF)];
-    std::vector<unsigned> other(n);
+    std::vector<unsigned>& other = work.Other;          // (each pass writes all n of it before they're read)
+    other.resize(n);
     for (int b = 0; b < (int)sizeof(K); ++b)
     {
       unsigned* c = &count[b * 256];
@@ -1149,10 +1174,18 @@ namespace
 
   // The order n keys are sorted in (RadixOrder): those under 2^32 (the props' box indexes, three bytes) as 32-bit
   // numbers, then the others (the tiles') as 64-bit
-  void KeyOrder(unsigned __int64 const* keys, size_t n, std::vector<unsigned>& order)
+  void KeyOrder(unsigned __int64 const* keys, size_t n, std::vector<unsigned>& order, SortWork& work)
   {
-    std::vector<unsigned> low, lowAt, highAt, lowOrder, highOrder;
-    std::vector<unsigned __int64> high;
+    std::vector<unsigned>& low = work.Low;
+    std::vector<unsigned>& lowAt = work.LowAt;
+    std::vector<unsigned>& highAt = work.HighAt;
+    std::vector<unsigned>& lowOrder = work.LowOrder;
+    std::vector<unsigned>& highOrder = work.HighOrder;
+    std::vector<unsigned __int64>& high = work.High;
+    low.clear();
+    lowAt.clear();
+    highAt.clear();
+    high.clear();
     low.reserve(n);
     lowAt.reserve(n);
     for (size_t i = 0; i < n; ++i)
@@ -1166,8 +1199,8 @@ namespace
         low.push_back((unsigned)keys[i]);
         lowAt.push_back((unsigned)i);
       }
-    RadixOrder(low.data(), low.size(), lowOrder);
-    RadixOrder(high.data(), high.size(), highOrder);
+    RadixOrder(low.data(), low.size(), lowOrder, work);
+    RadixOrder(high.data(), high.size(), highOrder, work);
     order.clear();
     order.reserve(n);
     for (unsigned k : lowOrder)
@@ -1196,10 +1229,13 @@ namespace
   // The items nearest first, ties in the order planned: what std::stable_sort by distance gives, by a radix sort of the
   // distances' bits (as unsigned integers they're in the floats' order, all being +0 or more), or std::stable_sort
   // itself if one is a NaN or has its sign bit
-  void NearestFirst(std::vector<Item>& items)
+  // (sorted, swapped with items, keeps their buffer from before: a plan's list from before it's handed over, never
+  // one that's out)
+  void NearestFirst(std::vector<Item>& items, SortWork& work)
   {
     size_t n = items.size();
-    std::vector<unsigned> bits(n);
+    std::vector<unsigned>& bits = work.Bits;
+    bits.resize(n);
     for (size_t i = 0; i < n; ++i)
     {
       memcpy(&bits[i], &items[i].Distance, sizeof(unsigned));
@@ -1209,9 +1245,10 @@ namespace
         return;
       }
     }
-    std::vector<unsigned> order;
-    RadixOrder(bits.data(), n, order);
-    std::vector<Item> sorted;
+    std::vector<unsigned>& order = work.Order;
+    RadixOrder(bits.data(), n, order, work);
+    std::vector<Item>& sorted = work.Sorted;
+    sorted.clear();
     sorted.reserve(n);
     for (unsigned i : order)
       sorted.push_back(items[i]);
@@ -1312,7 +1349,8 @@ namespace
     for (auto const& kv : g_Bodies.ByKey)
       unsorted.push_back(kv.first);
     std::vector<unsigned> order;
-    KeyOrder(unsorted.data(), unsorted.size(), order);
+    SortWork work;              // (its own: the flush runs on the game's threads)
+    KeyOrder(unsorted.data(), unsorted.size(), order, work);
     auto keys = std::make_shared<std::vector<unsigned __int64>>();
     keys->reserve(order.size());
     for (unsigned i : order)
@@ -2250,7 +2288,10 @@ namespace
     static Cover s_cover;       // the camera hook's only
     Cover& cover = s_cover;
     cover.Reset(fx, fz);
-    std::vector<Tile> planned;  // the tiles added, as items[first + i]
+    // (its work lists are kept from call to call as cover is: cleared, not freed and made again)
+    static std::vector<Tile> s_planned;
+    std::vector<Tile>& planned = s_planned;   // the tiles added, as items[first + i]
+    planned.clear();
     size_t first = items.size();
     // Each one the flush may make only if it's away from her or its top is at or under her feet near her: one kept
     // because it's made isn't made again near her (if it went in a flush between)
@@ -2275,8 +2316,14 @@ namespace
       unsigned __int64 Key;
       float Distance;
     };
-    std::vector<Kept> nearMade, farMade;
-    std::vector<unsigned __int64> letGo;
+    static std::vector<Kept> s_nearMade, s_farMade;
+    static std::vector<unsigned __int64> s_letGo;
+    std::vector<Kept>& nearMade = s_nearMade;
+    std::vector<Kept>& farMade = s_farMade;
+    std::vector<unsigned __int64>& letGo = s_letGo;
+    nearMade.clear();
+    farMade.clear();
+    letGo.clear();
     for (unsigned __int64 key : made)
     {
       Kept k;
@@ -2307,7 +2354,9 @@ namespace
 
     // 2. The tiles the road wants within TileRadius: each point of a square takes the highest road no higher than her
     //    feet + the reach at its distance
-    std::vector<unsigned __int64> wanted;
+    static std::vector<unsigned __int64> s_wanted;
+    std::vector<unsigned __int64>& wanted = s_wanted;
+    wanted.clear();
     int cx0 = (int)floorf((fx - TileRadius) / TileCell), cx1 = (int)floorf((fx + TileRadius) / TileCell);
     int cz0 = (int)floorf((fz - TileRadius) / TileCell), cz1 = (int)floorf((fz + TileRadius) / TileCell);
     for (int cz = cz0; cz <= cz1; ++cz)
@@ -2354,7 +2403,9 @@ namespace
       }
       add(key, t, distance);
     }
-    std::vector<unsigned __int64> wantedIn;
+    static std::vector<unsigned __int64> s_wantedIn;
+    std::vector<unsigned __int64>& wantedIn = s_wantedIn;
+    wantedIn.clear();
     for (size_t i = first; i < items.size(); ++i)
       wantedIn.push_back(items[i].Key);
     std::sort(wantedIn.begin(), wantedIn.end());
@@ -2672,10 +2723,37 @@ namespace
     }
   }
 
+  // The last plan and what it was made from (2026-11-13, "tools fixes only": the planning took 0.15 - 0.21 ms of every
+  // frame, the same plan again with Faith still or the game paused). A frame whose every input is the last plan's, bit
+  // for bit, takes that plan instead of planning anew, which would give the same: her feet and her fall, what the flush
+  // has made (the same list: one handed over is never changed, and this one is held so its memory can't become
+  // another's), the level tiles at her feet asked for (g_PlannedLowered), the prop groups on, the body whose ids the
+  // plan carries, and the props' cache as the planning left it (only a group change drops it between plans). The road
+  // and prop data don't change once loaded, and the planning reads no time. A plan that wrote to CT.log isn't taken
+  // again (planning anew would write the line again), and one is made anew at least every PlanMemoMs (a safety net).
+  // Update's thread only
+  struct PlanMemo
+  {
+    bool Valid = false;
+    ULONGLONG At = 0;                     // when it was planned
+    float Feet[3] = {};
+    float Fall = 0.f;
+    std::shared_ptr<std::vector<unsigned __int64> const> Made;
+    std::vector<unsigned __int64> Lowered;
+    bool GroupOn[GroupCount + 1] = {};
+    Donor From;
+    std::shared_ptr<Plan const> Last;     // never changed once planned (it can be the one handed over)
+    PlanNotes Notes;
+  };
+  PlanMemo g_PlanMemo;
+
   void WantNone(char const* status)
   {
     g_PlanAllMade = false;
     g_PlanAllMadeSince = 0;
+    // (the next plan is made anew)
+    if (g_PlanMemo.Valid || g_PlanMemo.Last)
+      g_PlanMemo = PlanMemo();
     if (g_PlanOut)
     {
       PublishPlan(nullptr);
@@ -5161,27 +5239,59 @@ void ground::Update(bool hasFaith, float const* feet)
   std::shared_ptr<std::vector<unsigned __int64> const> madeKeys = TakeMade();
   static const std::vector<unsigned __int64> s_none;
   std::vector<unsigned __int64> const& made = madeKeys ? *madeKeys : s_none;
-  auto plan = std::make_shared<Plan>();
-  plan->From = g_Donor;
+  // The last plan again when nothing it's made from has changed (PlanMemo), else a new one
+  PlanMemo& memo = g_PlanMemo;
+  bool reused = memo.Valid && now - memo.At < PlanMemoMs && !memcmp(memo.Feet, feet, sizeof(memo.Feet)) &&
+    !memcmp(&memo.Fall, &fall, sizeof(fall)) && memo.Made == madeKeys && memo.Lowered == g_PlannedLowered &&
+    !memcmp(memo.GroupOn, g_GroupOn, sizeof(g_GroupOn)) && SameDonor(memo.From, g_Donor) &&
+    (!g_PropsLoaded || g_PropCache.Valid);
+  std::shared_ptr<Plan const> plan;
   PlanNotes notes;
-  PlanTiles(feet, fall, made, plan->Items, notes);
-  planLap(PartTiles);
-  if (g_PropsLoaded)
-    PlanProps(feet, made, plan->Items, notes);
-  planLap(PartProps);
-  NearestFirst(plan->Items);
-  planLap(PartOrder);
+  if (reused)
   {
-    size_t n = plan->Items.size();
-    std::vector<unsigned __int64> keys(n);
-    for (size_t i = 0; i < n; ++i)
-      keys[i] = plan->Items[i].Key;
-    KeyOrder(keys.data(), n, plan->SortedItems);
-    plan->SortedKeys.resize(n);
-    for (size_t i = 0; i < n; ++i)
-      plan->SortedKeys[i] = keys[plan->SortedItems[i]];
+    plan = memo.Last;
+    notes = memo.Notes;
   }
-  planLap(PartKeys);
+  else
+  {
+    static SortWork s_work;     // (Update's thread only)
+    int letGoLogged = g_LetGoLogged, loweredLogged = g_LoweredLogged;
+    auto fresh = std::make_shared<Plan>();
+    fresh->From = g_Donor;
+    fresh->Items.reserve(memo.Last ? memo.Last->Items.size() : 0);   // (room for as many as the last: grown once)
+    PlanTiles(feet, fall, made, fresh->Items, notes);
+    planLap(PartTiles);
+    if (g_PropsLoaded)
+      PlanProps(feet, made, fresh->Items, notes);
+    planLap(PartProps);
+    NearestFirst(fresh->Items, s_work);
+    planLap(PartOrder);
+    {
+      size_t n = fresh->Items.size();
+      static std::vector<unsigned __int64> s_keys;
+      std::vector<unsigned __int64>& keys = s_keys;
+      keys.resize(n);
+      for (size_t i = 0; i < n; ++i)
+        keys[i] = fresh->Items[i].Key;
+      KeyOrder(keys.data(), n, fresh->SortedItems, s_work);
+      fresh->SortedKeys.resize(n);
+      for (size_t i = 0; i < n; ++i)
+        fresh->SortedKeys[i] = keys[fresh->SortedItems[i]];
+    }
+    planLap(PartKeys);
+    // (what it was made from: nothing above changes any of it)
+    memo.Valid = g_LetGoLogged == letGoLogged && g_LoweredLogged == loweredLogged;
+    memo.At = now;
+    memcpy(memo.Feet, feet, sizeof(memo.Feet));
+    memo.Fall = fall;
+    memo.Made = madeKeys;
+    memo.Lowered = g_PlannedLowered;
+    memcpy(memo.GroupOn, g_GroupOn, sizeof(g_GroupOn));
+    memo.From = g_Donor;
+    memo.Last = fresh;
+    memo.Notes = notes;
+    plan = std::move(fresh);
+  }
   // One to make that isn't made: the plan's sorted keys gone through alongside the made ones
   bool toMake = false;
   for (size_t i = 0, j = 0; i < plan->SortedKeys.size() && !toMake; ++i)
@@ -5222,12 +5332,14 @@ void ground::Update(bool hasFaith, float const* feet)
   {
     // The timing (see TimingMs): this frame's planning, and every TimingMs the line (diagnostics only)
     static long long s_planTicks = 0, s_planMost = 0;
-    static unsigned s_frames = 0, s_gathers = 0, s_searches = 0;
+    static unsigned s_frames = 0, s_reused = 0, s_gathers = 0, s_searches = 0;
     static ULONGLONG s_since = 0;
     long long spent = Ticks() - planStart;
     s_planTicks += spent;
     s_planMost = (std::max)(s_planMost, spent);
     ++s_frames;
+    if (reused)
+      ++s_reused;
     if (!s_since)
     {
       s_since = now;
@@ -5246,12 +5358,14 @@ void ground::Update(bool hasFaith, float const* feet)
       long long fp[FlushParts];
       for (int p = 0; p < FlushParts; ++p)
         fp[p] = g_FlushPartTicks[p].exchange(0);
-      util::log::Write("Street level (performance, diagnostic): %u frames in %.0f s. Planning %.3f ms a frame (most %.2f; "
+      util::log::Write("Street level (performance, diagnostic): %u frames in %.0f s, %u of them taking the last plan "
+        "again (nothing it's made from had changed). Planning %.3f ms a frame (most %.2f; "
         "the tiles %.3f, the props %.3f, nearest first %.3f, the keys sorted %.3f, compared and handed over %.3f; the "
         "props round her gathered %u times, searched whole %u times). The physics flush's part %.3f ms a flush (most "
         "%.2f, %u flushes, %u of them the bodies' world's: in each of those checking the bodies %.3f, destroying %.3f, "
         "making %.3f, after the game's work %.3f); bodies made %u, destroyed %u; %d bodies now", s_frames,
-        (now - s_since) / 1000.0, s_planTicks / perMs / s_frames, s_planMost / perMs, s_partTicks[PartTiles] / perFrame,
+        (now - s_since) / 1000.0, s_reused, s_planTicks / perMs / s_frames, s_planMost / perMs,
+        s_partTicks[PartTiles] / perFrame,
         s_partTicks[PartProps] / perFrame, s_partTicks[PartOrder] / perFrame, s_partTicks[PartKeys] / perFrame,
         s_partTicks[PartCompare] / perFrame, g_PropGathers - s_gathers, g_PropSearches - s_searches,
         flushes ? flush / perMs / flushes : 0.0, flushMost / perMs, flushes, ofBodies, fp[PartCheck] / perFlush,
@@ -5259,7 +5373,7 @@ void ground::Update(bool hasFaith, float const* feet)
       s_planTicks = s_planMost = 0;
       for (long long& p : s_partTicks)
         p = 0;
-      s_frames = 0;
+      s_frames = s_reused = 0;
       s_since = now;
       s_gathers = g_PropGathers;
       s_searches = g_PropSearches;
@@ -5297,6 +5411,13 @@ bool ground::SkyCityHolds()
 
 void ground::UpdateGates(bool hasFaith, float const* feet)
 {
+  if (hasFaith && feet)
+  {
+    AcquireSRWLockExclusive(&g_FeetLock);
+    memcpy(g_LastFeet, feet, sizeof g_LastFeet);
+    g_LastFeetAt = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_FeetLock);
+  }
   if (!hasFaith || !feet)
     return;
   bool wanted = g_Available && !g_Broken.load() && g_SolidStreet.load();
@@ -5329,4 +5450,20 @@ const char* ground::GetStatus(char* buffer, size_t size)
   strncpy_s(buffer, size, g_Status, _TRUNCATE);
   ReleaseSRWLockShared(&g_StatusLock);
   return buffer;
+}
+
+bool ground::RoadHeightUnder(float x, float z, float top, float& height)
+{
+  float normal[3];
+  return g_Roads.Height(x, z, top, height, normal);   // (only read after Init)
+}
+
+bool ground::LastFeet(float* feet)
+{
+  AcquireSRWLockShared(&g_FeetLock);
+  bool fresh = g_LastFeetAt != 0 && GetTickCount64() - g_LastFeetAt < 1000;
+  if (fresh)
+    memcpy(feet, g_LastFeet, sizeof g_LastFeet);
+  ReleaseSRWLockShared(&g_FeetLock);
+  return fresh;
 }

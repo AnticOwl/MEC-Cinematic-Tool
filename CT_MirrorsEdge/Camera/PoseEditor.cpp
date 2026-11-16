@@ -1,15 +1,27 @@
 #include "PoseEditor.h"
 #include "PoseSkeletons.h"
+#include "PoseSkeletonLive.h"
 #include "AttachTargets.h"
 #include "CameraCollision.h"
 #include "PausedHair.h"
+#include "PoseClips.h"
+#include "PoseKeys.h"
+#include "PoseRest.h"
+#include "Voice.h"
+#include "VoiceAlive.h"
+#include "VoiceFeel.h"
+#include "VoiceGaze.h"
+#include "VoiceEmotion.h"
+#include "VoicePlayer.h"
 #include "../Main.h"
+#include "../inih/cpp/INIReader.h"
 #include "../Util/Util.h"
 #include "../imgui/imgui.h"
 #include "../imgui/imgui_internal.h"
 #include "../Util/ImGuiEXT.h"
 #include "../Visuals/Panini.h"
 #include <Windows.h>
+#include <ShObjIdl.h>
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cfloat>
@@ -17,11 +29,17 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+// The keyframes' file window (COM's file dialog, SHCreateItemFromParsingName; 2026-11-16)
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // See PoseEditor.h and Research_Pose_Editor_2026-11-08.md
 namespace
@@ -47,6 +65,7 @@ namespace
   const __int64 AnimatableTypeInfoRva = 0x27EEE10;   // ClientAntAnimatableEntity
   const __int64 WeaponTypeInfoRva = 0x284FB60;       // PamClientCharacterWeaponEntity
   const __int64 DroneTypeInfoRva = 0x2855C20;        // PamClientDroneActorEntity
+  const __int64 ActorTypeInfoRva = 0x27BCC10;        // ClientActorEntity (its base class; decompiled 2026-11-12)
   const int TypeInstanceListsOffset = 0x60;          // a class's 4 instance lists, 0x10 apart
   const int EntityLinkOffset = 0x40;
   const int MaxPerList = 4096;
@@ -85,6 +104,7 @@ namespace
   const int FloatsPerBone = 8;
   const int MaxBones = 512;
   const int MaxHeld = 8;
+  static_assert(MaxBones == pose_clips::MaxBones, "PoseClips.h sizes its arrays by the pose editor's MaxBones");
   const int MaxCandidates = 40;
   const float ScanRadius = 30.f;                     // m around the camera: people
   const float DroneScanRadius = 60.f;                // drones
@@ -96,6 +116,7 @@ namespace
   const float TakenDistance = 0.01f;
   const float TakenDot = 0.9995f;
   const size_t MaxUndo = 50;
+  const ULONGLONG AutosaveMs = 30000;
   const char* const PoseFolder = "Cinematic Tools\\Poses";
 
   // The game's code this relies on, byte for byte (Faith's size checks the
@@ -473,33 +494,106 @@ namespace
     }
   }
 
-  // The skeleton in the tools' tables with this bone count and these parents
-  // (the live manager's, + 0xF0); -1 if none
-  int MatchSkeleton(int bones, unsigned int const* parents)
+  // ---- A body's skeleton (pose_skeleton_live: read from the game itself, see PoseSkeletonLive.h) ----
+
+  // Why a body whose skeleton is known still can't be posed
+  enum Cant { Cant_No, Cant_Unknown, Cant_NoRoot, Cant_RootUnanimated };
+
+  // The body last read (ScanCandidates and Take: the game's thread, under g_Mutex)
+  pose_skeleton_live::Body g_Body;
+  // The pose managers whose skeleton was written to the log (once each; the last 64)
+  __int64 g_LoggedManagers[64];
+  int g_LoggedAs[64];                        // what was written of each: its skeleton and bone count
+  int g_LoggedManagerCount = 0;
+
+  // A skeleton whose movable bones sit side by side (an animated prop's, a rope's): there is no one bone to hold
+  bool HasSeveralTops(int skeleton)
   {
-    static unsigned int copy[MaxBones];
-    if (bones <= 0 || bones > MaxBones)
+    for (pose_skeletons::TopJoints const& tops : pose_skeletons::SeveralTopJoints)
+      if (tops.Skeleton == skeleton)
+        return true;
+    return false;
+  }
+
+  // What was read of a pose manager's skeleton, into the log, once a manager: the asset's name as the game has it
+  // (or which check kept it from being taken), the skeleton it was found as, and the bones its rig lacks. A body
+  // that stays unknown gets its whole parent list written, so the next one explains itself.
+  void LogSkeleton(__int64 manager, pose_skeleton_live::Body const& body, int skeleton)
+  {
+    // (a known skeleton's lines are research: only with [Debug] Diagnostics on; an unknown one's are always written,
+    // the Pose menu's "skeleton not known" points to them)
+    if (skeleton >= 0 && !util::DiagnosticsOn())
+      return;
+    // (written again when the same address reads as another skeleton: after a level load a new manager can be
+    // made where an old one was)
+    int as = skeleton + (body.Bones << 16);
+    int kept = g_LoggedManagerCount < 64 ? g_LoggedManagerCount : 64, at = -1;
+    for (int k = 0; k < kept && at < 0; ++k)
+      if (g_LoggedManagers[k] == manager)
+        at = k;
+    if (at >= 0 && g_LoggedAs[at] == as)
+      return;
+    if (at < 0)
+    {
+      at = g_LoggedManagerCount++ % 64;
+      if (g_LoggedManagerCount >= 128)
+        g_LoggedManagerCount = 64;
+      g_LoggedManagers[at] = manager;
+    }
+    g_LoggedAs[at] = as;
+    char const* found = skeleton >= 0 ? pose_skeleton_live::At(skeleton).Label : "NOT KNOWN";
+    char asset[pose_skeleton_live::AssetBytes + 96];
+    if (body.AssetOk)
+      _snprintf_s(asset, sizeof(asset), _TRUNCATE, "the game's asset %s, its %d bone names proven by the game's own "
+        "hashes%s", body.Asset, body.Bones, body.DataAgrees == 1 ? ", the body's data names the same asset" :
+        (body.DataAgrees == 0 ? ", the body's data names ANOTHER asset" : ""));
+    else
+      _snprintf_s(asset, sizeof(asset), _TRUNCATE, "its asset wasn't taken (%s)", body.Why[0] ? body.Why : "not read");
+    std::string lacking;
+    int listed = 0;
+    for (int i = 1; body.ParentsOk && i < body.Bones; ++i)
+      if (body.Parents[i] == -1 && listed < 12)
+      {
+        char one[pose_skeleton_live::NameBytes + 16];
+        char const* name = skeleton >= 0 ? pose_skeleton_live::At(skeleton).Names[i] : (body.AssetOk ? body.Names[i] : "");
+        _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%d %s", listed ? ", " : ": ", i, name);
+        lacking += one;
+        ++listed;
+      }
+    util::log::Write("Pose: a body's skeleton, %d bones (pose manager 0x%I64X): %s; found as: %s; bones with no parent "
+      "in its pose manager (its rig has no channel for them): %d%s%s; rig channels %s", body.Bones, manager, asset, found,
+      body.Unparented, lacking.c_str(), body.Unparented > listed ? ", ..." : "", body.ChannelsOk ?
+      std::to_string(body.Channels).c_str() : "not read");
+    if (skeleton >= 0 || !body.ParentsOk)
+      return;
+    // Not known: its parents, 32 a line
+    for (int from = 0; from < body.Bones; from += 32)
+    {
+      std::string line;
+      for (int i = from; i < body.Bones && i < from + 32; ++i)
+        line += (i > from ? " " : "") + std::to_string((int)body.Parents[i]);
+      util::log::Write("Pose:   its bones' parents from bone %d: %s", from, line.c_str());
+    }
+  }
+
+  // A body's skeleton: its index for pose_skeleton_live::At(), or -1 (not known). cant: why it can't be posed
+  // although it's known (Cant_No: it can). body: what was read of it.
+  int SkeletonOf(__int64 animatable, LiveSlot const& slot, pose_skeleton_live::Body& body, int& cant)
+  {
+    cant = Cant_Unknown;
+    bool read = pose_skeleton_live::Read((__int64)g_gameHandle, animatable, slot.Manager, slot.Bones, body);
+    int skeleton = read ? pose_skeleton_live::Find(body) : -1;
+    LogSkeleton(slot.Manager, body, skeleton);
+    if (skeleton < 0)
       return -1;
-    __try
-    {
-      memcpy(copy, parents, (size_t)bones * sizeof(unsigned int));
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-      return -1;
-    }
-    for (int k = 0; k < (int)_countof(pose_skeletons::Skeletons); ++k)
-    {
-      pose_skeletons::Skeleton const& s = pose_skeletons::Skeletons[k];
-      if (s.Bones != bones)
-        continue;
-      bool same = true;
-      for (int i = 0; i < bones && same; ++i)
-        same = (int)copy[i] == (int)s.Parents[i];
-      if (same)
-        return k;
-    }
-    return -1;
+    pose_skeletons::Skeleton const& s = pose_skeleton_live::At(skeleton);
+    if (s.HeldRoot <= 0 || s.HeldRoot >= s.Bones || HasSeveralTops(skeleton))
+      cant = Cant_NoRoot;
+    else if (!pose_skeleton_live::MayPose(body, s.HeldRoot))
+      cant = Cant_RootUnanimated;
+    else
+      cant = Cant_No;
+    return skeleton;
   }
 
   // ---- The main view, for the dots (read after the free camera is written,
@@ -513,6 +607,7 @@ namespace
   };
   std::mutex g_ViewMutex;
   View g_View{};
+  std::atomic<bool> g_LookCameraWanted{ false };   // a held pose looks at the camera (Update; OnViewWritten reads it)
   __int64 g_ppGameRenderer = 0;
 
   bool ReadMainView(float* transform, float* projection)
@@ -570,7 +665,8 @@ namespace
     int Kind;
     float Distance;
     int Bones;
-    int Skeleton;           // in pose_skeletons::Skeletons, -1 none
+    int Skeleton;           // for pose_skeleton_live::At(), -1 not known
+    int Cant;               // why it can't be posed though its skeleton is known (Cant_No: it can)
     int Animated;           // AnimatedByGame
     bool OtherOverride;     // its slot holds an override not the tools'
     bool Held;
@@ -584,8 +680,28 @@ namespace
     std::vector<float> Turns;   // Bones x 4
     std::vector<float> Moves;   // Bones x 3
     std::vector<float> Weapons; // per weapon WeaponSnapshotFloats: its frame (a bone), offsets and edit
+    double KeysTime = 0.0;      // the keyframes playhead when it was taken
+    std::vector<float> Pins;    // per limb PinSnapshotFloats (2026-11-16): put back for the pins that are on (Undo, a
+                                // drag starting again from its press each frame); whether one is on stays as it is
   };
   const int WeaponSnapshotFloats = 1 + 8 + 8 + 3 + 4;
+
+  // A step of the pose's Undo / Redo: the pose and its keyframes as they were (2026-11-15: one history for both),
+  // and each bone's keyframe reference then (KeyRefTurn / KeyRefMove: which changes weren't keyframed yet)
+  struct HistoryStep
+  {
+    Snapshot Pose;
+    std::vector<pose_keys::Channel> Keys;
+    double Length = 5.0;
+    std::vector<float> RefTurns, RefMoves;
+    // The keyframes' settings then; put back only by a step with Settings (the one a keyframes file's load pushes:
+    // the load replaces them; the ticks and the clock push no step, so another step's Undo leaves them be)
+    bool Settings = false;
+    bool On = true, Loop = false;
+    float Speed = 1.f;
+    int Clock = 0;
+    double Start = 0.0, Time = 0.0;
+  };
 
   // The face's bones in groups (GAME > Pose's "Group the face"), by their
   // names under the Face bone: the same 57 face bones in Faith's, KrugerSec's,
@@ -726,6 +842,196 @@ namespace
     int DrawFailures;
   };
 
+  // An animation clip on a held pose (GAME > Pose > Animation clip;
+  // PoseClips.h). While it's on, its pose takes the place of the pose taken
+  // (Base): each frame the bones it turns get the clip's world rotations,
+  // faced the way the pose taken's Hips faced when the clip was put on; the
+  // elbow and knee rolls follow the forearm and shin, Faith's twist bones
+  // take their fitted share, Neck1 and the finger bases take the game rest's
+  // local, the other helpers (and the face) keep the pose taken's; and the
+  // Hips move as the clip's do (scaled to the skeleton). The user's edits
+  // (Turn, Move) stay on top of it.
+  enum ClipClock { ClipGameTime, ClipRealTime, ClipTrackTime };
+  enum ClipHips { ClipStay, ClipTravel };
+  struct ClipPlay
+  {
+    std::shared_ptr<pose_clips::Clip const> Clip;   // null: none
+    pose_clips::Fit Fit;                     // the clip on this skeleton
+    bool On = false;                         // its pose is the base
+    bool Playing = false;
+    bool Loop = true;
+    double Time = 0.0;                       // seconds into the clip
+    float Speed = 1.f;
+    int Clock = ClipGameTime;
+    double TrackStart = 0.0;                 // the camera track's clock: the clip's time at the track's 0 s
+    int Hips = ClipStay;
+    float Facing[4] = { 0.f, 0.f, 0.f, 1.f };  // the clip's front turned onto the pose taken's Hips' (bone 1's frame)
+    float Anchor[2] = { 0.f, 0.f };          // the Hips across the ground (x, z) when the clip was put on
+    // The travel's way: the heading last made (radians about up) and the shift
+    // that keeps the Hips where they are when it changes (the Hips' turn)
+    float TravelYaw = 0.f;
+    float TravelShift[2] = { 0.f, 0.f };
+    bool TravelYawOk = false;
+    float Local[MaxBones][FloatsPerBone];    // its locals now (see above for each kind of bone)
+    bool LocalOk = false;
+  };
+
+  // A voice on a held pose (the Pose window's Voice tab; the user, 2026-11-12: "put a voice file (mp3/wav etc.) and
+  // sync it to faiths mouth or ksec mouth"): a sound file's mouth shapes (voice::Sound, worked out from the sound when
+  // it's read) laid over the mouth's bones as one more layer on the handed pose, after the edits, the keyframes and
+  // the idle movement (voice_face: the jaw's turn, the lips' and the corners' moves), and the sound itself played in
+  // step with the voice's time (voice_player). The edits and keyframes of those bones stay under it.
+  enum VoiceClock { VoiceOwnTime, VoiceKeysTime, VoiceTrackTime };
+  struct VoicePlay
+  {
+    std::shared_ptr<voice::Sound const> Sound;   // null: none
+    voice_face::Rig Rig;                     // the mouth's bones in this pose (Ok false: it has none; the sound still plays)
+    bool On = false;                         // the mouth follows the voice and the sound is played
+    bool Playing = false;                    // its own clock runs
+    bool Loop = false;
+    double Time = 0.0;                       // seconds into the sound
+    int Clock = VoiceOwnTime;
+    double Start = 0.0;                      // the keyframes' / the camera track's clock: that clock's time at the voice's start
+    bool Heard = true;                       // the sound is played (off: only the mouth moves)
+    float Volume = 1.f;                      // 0 - 2
+    // How much of the shapes (voice_face::Amounts), 0 - 2. The jaw is what the sound gives best; the lips' shapes are
+    // soft hints from it (measured on test voices, Research_Pose_Editor section 28), so they start at half
+    float Jaw = 1.f, Lips = 0.5f, Closure = 1.f;
+    // How smoothly the mouth goes from shape to shape (voice::MouthAt): 1 eased (the default since 2026-11-14, after
+    // the user: "i think mouth animations should be smoothed out they are too harsh right now"), 0 as before, 2 softer
+    float Smoothing = 1.f;
+    // The Voice tab's picture of the file at another Mouth smoothing than 1 (DrawVoicePicture, under g_Mutex): made
+    // again when the smoothing or the sound changes (at 1 the sound's own Overview is drawn)
+    std::vector<float> Overview;
+    float OverviewSmoothing = 1.f;
+    std::weak_ptr<voice::Sound const> OverviewSound;
+    // The life around the mouth (the user, 2026-11-12, of seven suggestions: "Let's do number 4 for now": blinks,
+    // brows that lift on stressed words, small head nods, all taken from loudness and pitch): voice::Sound's Life
+    // curves laid on the eyelids, the eyebrows and the Head bone as more of the same layer (voice_face::LifeRig)
+    // Which of its parts this body has, found when the voice is put on: a part is on only if ALL its bones are held
+    // (half a part would be a wink, a lopsided brow). The moves themselves are made each frame from the pose as it
+    // is then (KeepVoice).
+    voice_face::LifeRig LifeRig{};
+    bool LifeEyesNow = false, LifeBrowsNow = false, LifeHeadNow = false;   // the parts moved this frame (KeepVoice)
+    bool LifeTried = false;                  // this frame's pose was looked at for them (the menu: a part that stops)
+    float LifeBlinkTaken = 1.f;              // the share of the blink the lids take this frame (less: already turned shut)
+    bool Life = true;
+    float Blinks = 1.f, Brows = 1.f, Head = 1.f;   // amounts: 0 none, 1 as made, up to 2 (a blink never past shut)
+    voice_face::LifeShape LifeShape{};       // this frame's (the menu shows it)
+    // [ALIVE] A living face (the user, 2026-11-13, after trying the blinks, brows and head: "it works but still needs
+    // more human expression now it looks more like a animatronic. We need more feeling"): VoiceAlive's eyes (looks
+    // away, small eye movements), each eye's own varied blinks, each side's brows, breathing and a head that never
+    // stops, worked out for this character from the sound's analysis (a take of its own); VoiceGaze's eyes held
+    // against the head; the feeling the user picks, made of the game's own face poses (VoiceFeel, VoiceFeelFace).
+    std::shared_ptr<voice_alive::Track const> Alive;   // this character's take (null: not made yet, or it couldn't be)
+    int AliveTake = 0;                       // the take and the looks away it was made with
+    float AliveLookAway = -1.f;
+    std::string AliveFound;                  // the menu's line about it ("12 blinks, 8 looks away, ...")
+    ULONGLONG AliveWantedAt = 0;             // when the menu last changed the take or the looks away (made once it rests)
+    int Take = 1;                            // 1 - 99: another take of the same line (other blinks, glances, drift)
+    float LookAway = 1.f;                    // 0 - 2: how much the eyes look away while speaking
+    float Eyes = 1.f;                        // 0 - 1: how far the eyes move with the voice
+    bool HoldGaze = true;                    // the eyes hold their target while the voice moves the head
+    bool EyesNow = false;                    // the eyes were turned this frame (KeepVoice; the menu)
+    float GazeNow[2] = { 0.f, 0.f };         // the gaze given this frame against the head as posed (degrees: right, down)
+    int Feel = -1;                           // the feeling picked: -1 none, else a voice_feel::Feeling
+    float FeelStrength = 1.f;                // 0 - 2
+    float FeelFollow = 0.3f;                 // 0 - 1: how much it follows the voice (weaker in pauses, stronger on stress)
+    float FeelUneven = 0.f;                  // 0 - 0.3: one side stronger
+    bool FeelLeftStronger = false;
+    // [SMILE] 0 - 1: how much the feeling's smile comes and goes with the speech (0: held all through, as before
+    // 2026-11-16), and when it does (from the voice's phrases, made when the voice is put on)
+    float FeelComes = 1.f;
+    voice_feel::SmileTimes SmileTimes;
+    float FeelSmileNow = 1.f;                // this frame: the smile's share shown (the menu)
+    float FeelJawNow = 0.f;                  // [JAW] this frame: the feeling's jaw laid (the menu)
+    bool FeelJawOn = false;                  // this frame: the feeling has a jaw at all (the menu's line, also at 0)
+    // [EMOTION] The feeling read from the voice itself (voice_emotion; the user, 2026-11-13: "emotions should apply
+    // automatically depending on the sound file expressions"): over the feeling picked, stretch by stretch, as far as
+    // the model is sure of it; each stretch can be set by hand
+    bool FeelAuto = false;                   // the menu's "From the voice"
+    float FeelSure = voice_emotion::SureDefault;   // the model's chance at which the voice's feeling starts to show
+    std::vector<voice_emotion::Stretch> EmotionStretches;   // this voice's stretches (its phrases, long ones in parts)
+    std::vector<int> FeelSetting;            // per stretch: voice_emotion::FromVoice, AsPicked, NoFeeling or a preset
+    std::shared_ptr<voice_emotion::Request> Emotion;        // its reading by the helper (null: not asked yet)
+    std::shared_ptr<std::vector<voice_emotion::Reading> const> EmotionReadings;   // what it heard (null: not yet)
+    float FeelAutoNow = 0.f;                 // the voice's share of the feeling as shown (eased in and out)
+    int FeelStretchNow = -1;                 // this frame: the stretch shown (the menu)
+    float FeelVoiceShareNow = 0.f;           // this frame: the share of the face the voice's feelings (or the stretches'
+                                             // own settings) have; the feeling picked has the rest (the menu)
+    float FeelStretchWeightNow = 0.f;        // this frame: FeelStretchNow's weight in the mix (under 1: changing; the menu)
+    // [REVIEW] The stretches' looks as shown: eased towards what they are now over FeelChangeSeconds (a stretch's own
+    // setting or the sureness changed never jumps the face in one frame), made anew for a new reading
+    std::vector<voice_emotion::Look> FeelLooks;
+    void const* FeelLooksFor = nullptr;      // the readings they were made for
+    // The feeling as shown, moving to the one picked over FeelChangeSeconds ([0] none, [1 + f] feeling f), and the
+    // strength as shown, eased to the one set: a change never jumps the face in one frame
+    float FeelWeights[voice_feel::FeelingCount + 1] = { 1.f };
+    float FeelStrengthNow = 1.f;
+    voice_face::FeelRig FeelRig{};           // the feeling's bones in this pose, found when the voice is put on
+    bool FeelNow = false;                    // the feeling's layer was laid this frame (KeepVoice; the menu)
+    float FeelKeep = 1.f;                    // this frame: the share of the voice's brow raises the feeling keeps (the menu)
+    float FeelNod = 0.f, FeelTilt = 0.f;     // this frame: the feeling's own nod and tilt of the head, radians (the menu)
+    float Lead = 0.03f;                      // s: the mouth is this far ahead of the sound (a mouth that lags looks wrong)
+    int Player = -1;                         // its sound in voice_player (-1: none)
+    float Rate = 1.f;                        // how fast its time moved over the last frames (1 = real time), for the player
+    float Pace = 1.f;                        // the measure Rate is taken from (KeepVoice)
+    bool Moving = false;                     // its time moved by itself this frame (the sound is wanted)
+    bool Paced = false;                      // a pace was taken since its time began to move on this clock (KeepVoice)
+    bool WasOn = false;                      // the frame before it was on,
+    int LastClock = -1;                      // and on this clock: its time then was this clock's
+    ULONGLONG SetByHandAt = 0;               // when the menu last held its time (its own clock waits meanwhile)
+    voice_face::Shape Shape;                 // the mouth's shape this frame (the menu shows it)
+    voice_face::Offsets Layer;               // this frame's offsets (Count 0: none)
+  };
+
+  // The kinematics' rig (PoseKinematics.inl, PoseMotion.inl; 2026-11-16): each held pose's limbs, spine, neck, eyes
+  // and helper bones by their names (FindKinRig, at Take)
+  enum { Limb_LeftArm = 0, Limb_RightArm, Limb_LeftLeg, Limb_RightLeg, LimbCount };
+  enum { Look_Off = 0, Look_Camera, Look_Point };
+  const int MaxKinChain = 4, MaxKinRolls = 4, MaxKinTwists = 12, MaxKinSprung = 8;
+  const unsigned char MaxLooseSteps = 7;
+  struct KinLimb
+  {
+    int Upper = -1, Mid = -1, End = -1;      // arm: Arm, ForeArm, Hand; leg: UpLeg, Leg, Foot (-1: not found)
+    int Collar = -1;                         // an arm's Shoulder (the collarbone; -1 none)
+    bool Arm = false;
+    float Hinge[3] = { 0.f, 0.f, 0.f };      // the elbow's or knee's hinge in the upper bone's own frame (ab x bc: unit)
+    int HingeFrom = 0;                       // 0 none (straight), 1 the game's rest pose, 2 the pose taken
+  };
+  struct KinTwist
+  {
+    int Bone = -1, Driver = -1;
+    unsigned char Kind = 0;                  // 0 the driver's twist about X, 1 its Euler X (z y x), 2 (x y z)
+    float Share = 0.f;
+  };
+  struct KinRig
+  {
+    bool Found = false;
+    KinLimb Limbs[LimbCount];
+    int Spine[MaxKinChain] = {}, SpineCount = 0;   // from the Hips up
+    int Neck[MaxKinChain] = {}, NeckCount = 0;
+    int Head = -1;
+    int Eye[2] = {}, Iris[2] = {}, EyeCount = 0;
+    bool FaceOk = false;                     // the face's way (the eyes' gaze straight ahead) and the eyes' middle in the
+    float FaceGaze[3] = {}, FaceMiddle[3] = {};   // head's own frame (the rest pose's, else the pose taken's): the look
+    int Rolls[MaxKinRolls][2] = {}, RollCount = 0;  // (roll, its driver): an elbow's or knee's roll
+    KinTwist Twists[MaxKinTwists];
+    int TwistCount = 0;
+    unsigned char Steps[MaxBones] = {};      // loose timing: joints above the spine's first bone (0: not delayed)
+    bool UpperBody[MaxBones] = {};
+    int Sprung[MaxKinSprung] = {}, SprungCount = 0;   // follow-through's bones, parents first
+  };
+  struct KinPin
+  {
+    bool On = false;
+    float Place[3] = { 0.f, 0.f, 0.f };      // in the frame of the held root's parent (where the game has the character)
+    float Turn[4] = { 0.f, 0.f, 0.f, 1.f };
+    float Seen[3] = { 0.f, 0.f, 0.f };       // where its end was after its last hold (short of Place out of reach): moved
+                                             // from there by anything else, the pin goes with it (StartHold)
+  };
+  const int PinSnapshotFloats = 1 + 3 + 4 + 3;   // a pin in a Snapshot: on, Place, Turn, Seen
+
   struct Held
   {
     bool Used;
@@ -773,6 +1079,7 @@ namespace
     float World[MaxBones][FloatsPerBone];  // this frame's world pose: the game's, the held bones from the pose
     bool WorldOk;
     char Label[64];
+    char Asset[pose_skeleton_live::AssetBytes];   // its own SkeletonAsset's name (lower case), for the files
     char Status[200];
     bool Aside, Refused, BoxRefused, NoBoxLogged;
     // Whether the game took the pose: frames with time running / frozen
@@ -797,10 +1104,35 @@ namespace
     bool IdleRefOk;
     bool IdleActive;                         // Idle is laid over the handed pose (by IdleWeight)
     float IdleWeight;                        // 0 - 1, fading in and out (IdleFadeSeconds)
-    ULONGLONG IdleWeightAt;
+    double IdleWeightAt;                     // the frame it was last faded at (performance counter, s; 0: none)
     bool IdleGateOpen;                       // the character standing (see UpdateIdle)
     float IdleRoot[FloatsPerBone];           // where it was at the last capture (its root's parent)
     bool IdleRootOk;
+    // The gate's bones (FindIdleBones, at Take pose): 1 Hips or a leg (hips, thighs, shins, feet), 2 the spine
+    // (Spine, Spine1, Spine2); IdlePeople: all ten found (a person: the people's gate, else the 10-degree one)
+    unsigned char IdleGroup[MaxBones];
+    bool IdlePeople;
+    float IdlePrev[MaxBones][4];             // each held bone's rotation at the capture before (its turn speed)
+    bool IdlePrevOk[MaxBones];
+    double IdleCaptureAt;                    // the capture last used: when the game's animation made it (s)
+    double IdleGameClock;                    // the game's time at that capture (s from the wanting; see UpdateIdle)
+    double IdleCalmSince;                    // the gate shut: since when (IdleGameClock) all has been calm (-1: not calm)
+    // The root's places and the hips', legs' and spine's turn speeds (degrees a second of the game's time,
+    // IdleSpinBones in order) at the last IdleRingSize captures (8.5 s at 30 a second), with their IdleGameClock
+    static const int IdleRingSize = 256;
+    static const int IdleSpinBones = 10;
+    double IdleRootTime[IdleRingSize];
+    float IdleRootAt[IdleRingSize][3];
+    int IdleRootHead, IdleRootCount;
+    double IdleSpinTime[IdleRingSize];
+    float IdleSpin[IdleRingSize][IdleSpinBones];
+    int IdleSpinHead, IdleSpinCount;
+    int IdleSpinBone[IdleSpinBones];         // Hips, LeftUpLeg, LeftLeg, LeftFoot, RightUpLeg, RightLeg, RightFoot, Spine, Spine1, Spine2
+    // Since the last log line (the 10 s idle line): captures with the gate open, and those where each of its
+    // limits was passed; those the 10-degree rule before 2026-11-14 would have shut; the most each came to
+    int IdleOpenCaptures, IdleOverSpeed, IdleOverLegs, IdleOverSpin, IdleOldRule;
+    float IdleMostSpeed, IdleMostLegs, IdleMostSpin, IdleMostStep;
+    int IdleMostLegsBone, IdleMostSpinBone, IdleMostStepBone;
     // Letting go (KeepLettingGo): its overrides out, held on until the game's
     // own pass of its slots put back what the game doesn't animate
     bool Restoring;
@@ -809,9 +1141,57 @@ namespace
     char RestoreWhy[96];
     unsigned int IdleGen;                    // its wanting (IdleCapture::Gen)
     unsigned int IdleSeen;                   // the capture's count last read
-    ULONGLONG IdleAt, IdleNewAt;
+    double IdleAt, IdleNewAt;                // the frame a capture was last used at (performance counter, s; 0: none)
     int IdleFrames;                          // captures used since the last log line
-    std::vector<Snapshot> Undo;
+    // Undo and Redo (2026-11-15, the user: the keyframes "feel too bad"; there was one Undo for the pose and another
+    // for its keyframes): the pose and the keyframes before each change (History, at most MaxUndo) and what each
+    // Undo took back (Future). HistoryHasKeys: the last step was pushed before a change of the pose and holds the
+    // keyframes as they still are, so keyframing that change (auto key after a drag) is part of the same step.
+    std::vector<HistoryStep> History;
+    std::vector<HistoryStep> Future;
+    bool HistoryHasKeys;
+    // What the last push cleared (the Redo steps) and trimmed (the oldest step, past MaxUndo), kept until that
+    // push's step proves a change: put back if it's dropped (a drag put back, a click that changed nothing:
+    // DropLastStep, SettleLastStep), so Redo and the oldest step aren't lost to nothing
+    std::vector<HistoryStep> FutureStash;
+    HistoryStep TrimmedStash;
+    bool TrimmedOk;
+    bool StashOk;
+    bool KeysTimeMoved;                      // the keyframes' time moved this frame (KeepKeys, after Advance)
+    pose_keys::Anim Keys;                    // this pose's keyframes
+    double KeysAppliedTime;                  // the keys' time the pose was last made from
+    unsigned KeysAppliedRevision;             // their Revision then
+    bool KeysAppliedOk;                      // false: make the pose from them next frame
+    unsigned KeysSavedRevision;               // the keys' Revision at the last autosave
+    ULONGLONG KeysSavedAt;                    // when
+    bool KeysAutosaveStarted;                 // whether this pose has written its autosave file yet
+    std::wstring KeysFile;                    // its keyframes' file: the one they were last saved in by hand (the
+                                              // keyframes bar's Save writes there; "": none, Save asks), a whole path
+    std::wstring KeysSuggest;                 // the file last saved or loaded by hand: where Save as starts (2026-11-16)
+    unsigned KeysLoads;                       // how many keyframes files were loaded onto it (TakeKeyFileAnswer)
+    float KeyRefTurn[MaxBones][4];            // each bone's edit when the playhead last moved or it was keyed
+    float KeyRefMove[MaxBones][3];            // (ChangedBones measures against these)
+    double KeyTrackTimeBefore;                // the camera track's time last frame (is it moving?)
+    bool KeyTrackMoving;                     // the track moved this frame (PlayingKeys' Clock_Track)
+    ClipPlay Clip;                           // an animation clip on it (none: Clip.Clip null)
+    VoicePlay Voice;                         // a voice on it (none: Voice.Sound null)
+    // The kinematics (PoseKinematics.inl, PoseMotion.inl; 2026-11-16, ResetKinematics at Take)
+    KinRig Kin;                              // its limbs, spine, neck, eyes and helper bones
+    KinPin Pins[LimbCount];                  // a hand or foot pinned (the Bone tab's Pin)
+    float MotionWeight;                      // the keyframes' playing layers (loose timing, follow-through, the feet): 0 - 1
+    double KeysDt;                           // how far the keyframes' time moved this frame (KeepKeys; a loop's wrap taken out)
+    float SpringTurn[MaxBones][4];           // follow-through: each sprung bone's turn in the character's frame,
+    float SpringSpin[MaxBones][3];           // and its turning speed (radians a second of the keyframes' time)
+    bool SpringOk[MaxBones];
+    int LookMode;                            // Look at: Look_Off, Look_Camera, Look_Point
+    float LookPoint[3];                      // Look_Point's place (world)
+    bool LookPointOk;
+    float LookAmount;                        // how much of the way the chest, neck and head turn (the eyes look all of it)
+    float LookWeight;                        // 0 - 1, fading in and out
+    float LookTarget[3];                     // where it looked last (it fades out from there)
+    bool LookTargetOk;
+    float LookYaw, LookPitch;                // the look's turn as laid (radians: about the character's up, then across),
+    bool LookAngleOk;                        // eased towards the place's (LookAt)
   };
 
   std::mutex g_Mutex;                        // everything below (the menu and the game's thread)
@@ -845,19 +1225,102 @@ namespace
   bool g_WeaponsFollow = true;               // a posed character's guns and batons go with its posed bones (KeepWeapons)
   bool g_IdleOn = false;                     // the game's own animation's small movements over the pose (UpdateIdle)
   float g_IdleAmount = 1.f;                  // how much of them
+  bool g_AutoKey = true;                     // Auto key: every change is keyframed at once, from the first one
+                                             // (AutoKeyChanges; the KEYFRAMES row's red tick and Options)
+  bool g_KeyAnchors = true;                  // a bone's first keyframe holds it as it was at the keyframe times
+                                             // around it (KeyBone; Options: Hold the times around a new keyframe)
+  bool g_ConfigWanted = false;               // a setting changed where DrawWindow's configChanged doesn't reach
+  char g_KeyNote[512] = "";                  // what the last keyframing did (NoteKeys; under the Keyframe: row)
+  ULONGLONG g_KeyNoteAt = 0;                 // when
+  int g_KeyNoteHeld = 0;                     // the held pose's Id it was for
+  const ULONGLONG KeyNoteMs = 8000;          // shown bright this long, then dim
+  bool g_SnapKeys = true;                    // times snap to 0.05 s (step 3)
+  bool g_WindowOpen = false;                 // the Pose window (step 3)
   const float IdleSmoothSeconds = 3.f;       // each bone's movement is taken about where it has been this long
-  const float MaxIdleTurn = 15.f * 3.14159265f / 180.f;  // and kept small: at most this turn
-  const float MaxIdleMove = 0.08f;           // and this move (m)
+  const float MaxIdleTurn = 15.f * 3.14159265f / 180.f;  // and kept small: a turn eased towards this (SoftTurn)
+  const float MaxIdleMove = 0.08f;           // and this move (m): at most
   const float IdleFadeSeconds = 0.4f;        // it fades in and out this fast
-  const float IdleGateTurn = 10.f * 3.14159265f / 180.f;  // a body bone this far off where its animation has been: not idle
-  const float IdleGateSpeed = 0.3f;          // m/s: the character moving faster than this: not idle
-  const ULONGLONG IdleStaleMs = 500;         // no capture this long: it fades out
+  // When it isn't idle. A person (Hips, the legs and the spine found): its root moving, its hips or legs far off
+  // where their animation has been, or those and the spine turning fast; open again once all of them have been
+  // calm for a while. All of it in the game's time (UpdateIdle). Measured on the people in three of the tools'
+  // replay recordings (2026-11-14, Research_Pose_Editor section 34): gesture idles move the arms, hands and head up
+  // to 93 degrees off where they have been (calmer ones stay within about 8), and the 10-degree gate before shut the
+  // standing men's idle in about 70 % of the captures, all standing people's in about half; standing, the hips and
+  // legs stayed within 29 degrees and the root didn't move; run through UpdateIdle, the gate shut at walk starts at
+  // once or within half a second.
+  const float IdleGateSpeed = 0.3f;          // m/s, its root over IdleSpeedWindow: walking
+  const float IdleOpenSpeed = 0.15f;
+  const double IdleSpeedWindow = 0.5;
+  const float IdleGateLegs = 40.f * 3.14159265f / 180.f;   // Hips or a leg this far off where its animation has been
+  const float IdleOpenLegs = 25.f * 3.14159265f / 180.f;
+  const float IdleGateSpin = 200.f;          // degrees a second: Hips, a leg or the spine turning this fast (its mean
+  const float IdleOpenSpin = 120.f;          // over IdleSpinWindow, the fastest of them)
+  const double IdleSpinWindow = 0.2;
+  const double IdleCalmSeconds = 0.5;        // all calm this long before it opens again
+  // Any other skeleton (no hips and legs: drones, animals, props): the gate before 2026-11-14, a body bone this far
+  // off where its animation has been, or its root faster than IdleGateSpeed
+  const float IdleGateTurn = 10.f * 3.14159265f / 180.f;
+  const double IdleStaleSeconds = 0.5;       // no capture this long (longer at a slow game speed): it fades out
+  // This frame's clocks (set in Update): the performance counter (s) when they were read, this frame's real time (s,
+  // 0 - 0.25) and the game's time scale (the idle movement, the clips and the voices go by them)
+  double g_ClipCounterSeconds = 0.0;
+  double g_ClipRealDt = 0.0;
+  float g_ClipGameScale = 1.f;
   char g_Filter[64] = "";
   char g_SaveName[64] = "";
   std::vector<std::string> g_PoseFiles;
   ULONGLONG g_FilesListedAt = 0;
-  char g_FileMessage[200] = "";
+  std::vector<std::wstring> g_KeyFiles;    // the .posekeys files' names (ListKeyFiles; wide since 2026-11-16: Save as
+                                           // can name one past the ANSI code page)
+  ULONGLONG g_KeyFilesListedAt = 0;
+  char g_FileMessage[512] = "";              // (512 since 2026-11-16: a file anywhere is said with its path)
+  char g_LetGoMessage[200] = "";
+  bool g_AutosaveFailLogged = false;
   bool g_SlidersWereActive = false;
+  // The pose when the Bone tab's slider in use was taken (DrawPosePanel; 2026-11-16): each frame's edit is made from it
+  // (SliderHold), so a hold's feet and pins are taken once, not again from the frame before
+  Snapshot g_SliderPress;
+  int g_SliderPressHeld = 0;
+  bool g_WindowFocus = false;                 // open the Pose window and bring it to the front next frame
+  ImVec2 g_WindowMin, g_WindowMax;            // its rectangle last frame (for the overlay to keep out of)
+  bool g_WindowRectOk = false;
+  int g_PoseTab = 0;                          // Bone, Clip, Voice, Files, Options
+  char g_KeySaveName[64] = "";
+  bool g_LengthWasActive = false;             // the Length field pushes one key undo when it starts
+  int g_BoneListBone = -2, g_BoneListGroup = -2;  // the selection last scrolled to in the bone list
+  // The timeline's keyframe menu and mouse state (PLAN.md 3.3)
+  int g_KeyMenuHeld = 0;
+  int g_KeyMenuBone = -1;
+  double g_KeyMenuTime = -1.0;
+  bool g_KeyMenuOpen = false;
+  // A Reset button's question when bones it resets have keyframes (RequestReset; the popup DrawResetAsk)
+  struct ResetAsk
+  {
+    int HeldId;
+    bool Bones[MaxBones];      // the bones it resets
+    bool Weapons;              // Reset all: the weapons too
+    int Keyed;                 // how many of them have keyframes
+    int First;                 // the first of those
+    char What[48];             // "this bone", "this group", ...
+  };
+  ResetAsk g_ResetAsk{};
+  bool g_ResetAskOpen = false;
+  struct KeyDragState
+  {
+    bool Pending, On;
+    int Held, Bone;
+    double StartTime, Length;
+    double LastTime;
+    ULONGLONG LastTick;
+    float PressX;
+  };
+  KeyDragState g_KeyDrag{};
+  bool g_KeyScrub = false;
+  std::vector<double> g_KeyTimes;
+  int g_KeyTimesHeld = 0;
+  unsigned g_KeyTimesRevision = 0;
+  size_t g_KeyTimesChannels = 0;
+  int g_KeyTimelineBone = -2;                 // the selected bone last scrolled to in the timeline
   // The ring being dragged
   struct RingDrag
   {
@@ -872,6 +1335,7 @@ namespace
     float GroupParents[MaxGroupMembers][4];
     float GroupTurns[MaxGroupMembers][4];
     int Weapon = -1;         // a weapon's ring (Bone and Group -1): its edit turned (Parent: its frame's rotation)
+    Snapshot Pose;           // the pose when taken (a bone's ring: each frame from it, the pins and planted feet kept)
   };
   RingDrag g_Drag{};
   // A bone's dot held with the mouse: pressed on it (Pending), then moving it
@@ -909,14 +1373,72 @@ namespace
     float AxisLength;
     int Weapon = -1;         // a weapon's dot (Bone and Group -1): its edit's move
     float WeaponFrame[FloatsPerBone];  // its frame (its bone's posed place, or the world's) when pressed
+    bool Trail = false;      // a dot of the picked bone's path (2026-11-16): the playhead put at its time when pressed,
+                             // the change keyframed there when let go after a drag (KeyTrailDrag)
+    double TrailMirror = -1.0;   // its time a looping keyframes' end: the other end's time (LoopOtherEnd), else -1
+    float PressedPlace[3];   // a path's dot: where the bone was when pressed (Start is where its dot was)
   };
   MoveDrag g_Move{};
+  // Look at's point held with the mouse (2026-11-16): moved across the picture at its distance from the camera
+  struct LookDrag
+  {
+    bool On;
+    int Held;
+    float Base[3];           // the plane it moves on goes through here
+    float Offset[2];         // the dot's place on the screen less the cursor's when pressed
+  };
+  LookDrag g_LookDrag{};
   const float MoveStartPixels = 3.f;
   const float MaxFaceMove = 0.15f;           // m: a face bone's move
   const float MoveWheelStep = 0.9f;          // the distance from the camera a wheel notch
   const float DepthSpeed = 1.5f;             // Shift held: a pixel up moves it this many pixels' worth farther
   const float DotReach = 0.75f;              // font sizes: how near the cursor has to be to a dot to take it
   int g_MoveBones = 2;                       // a moved bone bends this many bones above it
+  // The kinematics (2026-11-16; the Options tab, saved with the tools' config; PoseKinematics.inl, PoseMotion.inl)
+  bool g_JointHinges = true;                 // elbows and knees bend about their hinge, to their natural side, within limits
+  bool g_KeepEndTurn = true;                 // a dragged hand or foot keeps its angle in the world
+  bool g_FeetPlanted = true;                 // moving or turning the Hips keeps the feet where they stand
+  bool g_CollarFollows = true;               // the collarbone takes a share of an arm's raise
+  bool g_SpineCurve = true;                  // a dragged chest or head bends the spine or the neck in a curve
+  bool g_FarReach = false;                   // a hand dragged past the arm's reach bends the back towards it
+  bool g_HelpersFollow = true;               // roll and twist bones follow their elbow, knee, hand or upper bone
+  float g_LooseTiming = 0.5f;                // while the keyframes play: the head and arms follow the chest a moment later
+  float g_FollowThrough = 0.5f;              // while the keyframes play: the head, arms and hands lag and settle
+  bool g_FootLock = true;                    // while the keyframes play: a foot still at the keys either side stays put
+  bool g_ShowTrail = true;                   // the picked bone's path over the keyframes, on the picture
+  bool g_ShowGhosts = false;                 // the pose at the keyframes before and after the playhead, on the picture
+  void FindKinRig(Held& h);
+  void ResetKinematics(Held& h);
+  void MakeHandedPose(Held& h, float* buffer, bool worldOk);
+  char const* KeyEaseLabel(int ease);
+  // The keyframes (PLAN.md 2.2 - 2.5); all called under g_Mutex.
+  bool PlayingKeys(Held const& h);
+  bool ClipUsable(Held const& h);
+  bool TrackHoldsTime(Held const& h);
+  bool KeysCurrent(Held const& h);
+  void PushKeyUndo(Held& h, bool merge = false);
+  int ChangedBones(Held const& h, int* out);
+  void KeysMatchPose(Held& h);
+  int KeyBone(Held& h, int bone);
+  int KeyBones(Held& h, int const* bones, int count, bool automatic, bool merge);
+  void SameLineIfFits(char const* nextLabel, bool checkbox = false);
+  int KeyChanges(Held& h, bool automatic = false);
+  int KeySelection(Held& h);
+  int KeyWholePose(Held& h);
+  int SelectedKeysAtPlayhead(Held const& h);
+  int RemoveSelectedKeys(Held& h);
+  bool UndoStep(Held& h, bool redo);
+  void RemoveAllKeys(Held& h);
+  void SetPlayhead(Held& h, double t);
+  void AutoKeyChanges();
+  void KeepKeys(Held& h);
+  void ApplyKeysNow(Held& h);
+  bool SaveKeys(Held const& h, char const* name, bool quiet = false);
+  int KeysFileOf(Held const& h, pose_keys::File& file);
+  bool LoadKeys(Held& h, char const* name);
+  void ListKeyFiles();
+  bool CleanName(char const* in, char* out, size_t size);
+  std::wstring Widen(char const* text);
   // The game's thread
   std::once_flag g_Checked;
   bool g_Available = false;
@@ -971,17 +1493,17 @@ namespace
   char const* BoneName(Held const& h, int bone)
   {
     static char buffer[16];
-    if (h.Skeleton >= 0 && bone >= 0 && bone < h.Bones)
-      return pose_skeletons::Skeletons[h.Skeleton].Names[bone];
+    if (h.Skeleton >= 0 && h.Skeleton < pose_skeleton_live::Count() && bone >= 0 && bone < h.Bones)
+      return pose_skeleton_live::At(h.Skeleton).Names[bone];
     sprintf_s(buffer, "bone %d", bone);
     return buffer;
   }
 
   int BoneByName(int skeleton, char const* name)
   {
-    if (skeleton < 0)
+    if (skeleton < 0 || skeleton >= pose_skeleton_live::Count())
       return -1;
-    pose_skeletons::Skeleton const& s = pose_skeletons::Skeletons[skeleton];
+    pose_skeletons::Skeleton const& s = pose_skeleton_live::At(skeleton);
     for (int i = 0; i < s.Bones; ++i)
       if (!strcmp(s.Names[i], name))
         return i;
@@ -992,21 +1514,30 @@ namespace
   {
     if (kind == Kind_Faith)
       return "Faith";
-    if (skeleton >= 0)
-      return pose_skeletons::Skeletons[skeleton].Label;
-    return kind == Kind_Drone ? "drone" : "character";
+    if (skeleton >= 0 && skeleton < pose_skeleton_live::Count())
+      return pose_skeleton_live::At(skeleton).Label;
+    // (Kind_Drone: any actor with a body of its own; a drone when its skeleton says so)
+    return kind == Kind_Drone ? "actor" : "character";
   }
 
   // The held bone's local pose as the editor has it (the 4th float always 1:
   // the game's blend takes it as the bone's scale and never puts it back)
+  // The pose a bone's edits are on: an animation clip's while one is on
+  // (ClipPlay), else the pose taken
+  float const* BaseOf(Held const& h, int bone)
+  {
+    return h.Clip.On && h.Clip.LocalOk ? h.Clip.Local[bone] : h.Base[bone];
+  }
+
   void EditedLocal(Held const& h, int bone, float* out)
   {
-    memcpy(out, h.Base[bone], FloatsPerBone * sizeof(float));
+    float const* base = BaseOf(h, bone);
+    memcpy(out, base, FloatsPerBone * sizeof(float));
     for (int k = 0; k < 3; ++k)
       out[k] += h.Move[bone][k];
     out[3] = 1.f;
     float q[4];
-    QMul(h.Turn[bone], h.Base[bone] + 4, q);
+    QMul(h.Turn[bone], base + 4, q);
     QNorm(q);
     memcpy(out + 4, q, sizeof(q));
   }
@@ -1767,6 +2298,9 @@ namespace
   }
 
   void IdleUnwanted(int index);              // see Idle movement, below
+  void ForgetIdleRefs(Held& h);
+  void FindIdleBones(Held& h);
+  void ResetIdleCounts(Held& h);
   bool BlendHook();
 
   // ---- What the game's blend writes ----
@@ -1921,11 +2455,89 @@ namespace
       util::log::Warning("Pose: the tools' part of the game's pose blend faulted in %d passes (the rest of each skipped)",
         faults);
     IdleUnwanted(index);
+    h.Clip.Clip.reset();
+    h.Clip.On = h.Clip.Playing = h.Clip.LocalOk = false;
+    // Its voice goes with it (the sound stops, a reading of its feeling too)
+    if (h.Voice.Player >= 0)
+      voice_player::Close(h.Voice.Player);
+    voice_emotion::Cancel(h.Voice.Emotion);   // [EMOTION] [REVIEW]
+    h.Voice = VoicePlay();
     h.Restoring = false;
     h.Used = false;
-    h.Undo.clear();
-    h.Undo.shrink_to_fit();
+    h.History.clear();
+    h.History.shrink_to_fit();
+    h.Future.clear();
+    h.Future.shrink_to_fit();
+    h.HistoryHasKeys = false;
+    h.FutureStash.clear();
+    h.FutureStash.shrink_to_fit();
+    h.TrimmedStash = HistoryStep();
+    h.TrimmedOk = h.StashOk = h.KeysTimeMoved = false;
+    h.Keys = pose_keys::Anim();
+    h.KeysFile.clear();
+    h.KeysSuggest.clear();
     Unpick(index);
+  }
+
+  void AutosaveName(Held const& h, char* out, size_t size)
+  {
+    int index = (int)(&h - g_Held);
+    bool sameLabel = false;
+    for (int j = 0; j < MaxHeld; ++j)
+      if (j != index && g_Held[j].Used && !strcmp(g_Held[j].Label, h.Label))
+        sameLabel = true;
+    char raw[128];
+    if (sameLabel)
+      _snprintf_s(raw, sizeof(raw), _TRUNCATE, "autosave %s %d", h.Label, index + 1);
+    else
+      _snprintf_s(raw, sizeof(raw), _TRUNCATE, "autosave %s", h.Label);
+    char clean[64];
+    if (!CleanName(raw, clean, sizeof(clean)))
+      _snprintf_s(out, size, _TRUNCATE, "%s", raw);
+    else
+      _snprintf_s(out, size, _TRUNCATE, "%s", clean);
+  }
+
+  // The pose's keyframes written to its autosave file. The file of that name left by an earlier pose or session is
+  // kept once as "<name> before" (the first time this pose writes its own).
+  bool WriteAutosave(Held& h, bool quiet)
+  {
+    char name[128];
+    AutosaveName(h, name, sizeof(name));
+    if (!h.KeysAutosaveStarted)
+    {
+      char path[MAX_PATH];
+      char before[MAX_PATH];
+      _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s.posekeys", PoseFolder, name);
+      _snprintf_s(before, sizeof(before), _TRUNCATE, "%s\\%s before.posekeys", PoseFolder, name);
+      if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        MoveFileExA(path, before, MOVEFILE_REPLACE_EXISTING);
+      h.KeysAutosaveStarted = true;
+    }
+    bool saved = SaveKeys(h, name, quiet);
+    h.KeysSavedRevision = h.Keys.Revision;
+    h.KeysSavedAt = GetTickCount64();
+    return saved;
+  }
+
+  // Keyframes at more than one time: an animation. Keyframes at one time only hold a still (Auto key keyframes a
+  // pose's first change since 2026-11-15): no autosave and no Let go question for those, so a still doesn't push an
+  // animation's autosave out (the review, 2026-11-15)
+  bool KeysSpanTime(pose_keys::Anim const& a)
+  {
+    return pose_keys::KeyCount(a) > 0 && pose_keys::LastKeyTime(a) - pose_keys::FirstKeyTime(a) > pose_keys::TimeEpsilon;
+  }
+
+  void AutosaveKeysNow()
+  {
+    for (int i = 0; i < MaxHeld; ++i)
+    {
+      Held& h = g_Held[i];
+      if (!h.Used || h.Restoring || !KeysSpanTime(h.Keys) ||
+          h.Keys.Revision == h.KeysSavedRevision || GetTickCount64() - h.KeysSavedAt < AutosaveMs)
+        continue;
+      WriteAutosave(h, true);
+    }
   }
 
   // Let go: its overrides out at once, and (see BlendWatch) the pose held on
@@ -1936,6 +2548,26 @@ namespace
   void Release(Held& h, char const* why, bool gone = false)
   {
     int index = (int)(&h - g_Held);
+    if (!h.Restoring && KeysSpanTime(h.Keys))
+    {
+      char name[128];
+      AutosaveName(h, name, sizeof(name));
+      if (WriteAutosave(h, false))
+      {
+        _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE,
+          "%s was let go: its keyframes are saved as \"%s\" (Files tab)", h.Label, name);
+        _snprintf_s(g_LetGoMessage, sizeof(g_LetGoMessage), _TRUNCATE, "%s", g_FileMessage);
+      }
+      else
+      {
+        char reason[200];
+        _snprintf_s(reason, sizeof(reason), _TRUNCATE, "%s", g_FileMessage);
+        _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE,
+          "%s was let go: its keyframes could NOT be saved (%s)", h.Label, reason);
+        _snprintf_s(g_LetGoMessage, sizeof(g_LetGoMessage), _TRUNCATE, "%s", g_FileMessage);
+        util::log::Warning("Pose: %s", g_FileMessage);
+      }
+    }
     if (h.Restoring)
     {
       // Gone, or let go again while it waits (the menu)
@@ -1946,6 +2578,11 @@ namespace
     bool there = !gone && (h.Kind != Kind_Person || StillThere(h.Entity, h.VTable, h.BodyOffset, h.Animatable));
     LetGoWeapons(h, there);
     IdleUnwanted(index);
+    // Its voice ends here (the sound stops at once, not when the game's pass is through; a reading of its feeling too)
+    if (h.Voice.Player >= 0)
+      voice_player::Close(h.Voice.Player);
+    voice_emotion::Cancel(h.Voice.Emotion);   // [EMOTION] [REVIEW]
+    h.Voice = VoicePlay();
     TakeBack(h.Body, h.BodyTable, h.BodyTableHandle);
     TakeBack(h.Box, h.BoxTable, h.BoxTableHandle);
     BlendWatch& w = g_Watches[index];
@@ -2061,11 +2698,21 @@ namespace
       util::log::Warning("Pose: %s 0x%I64X: its pose slot isn't found any more, not taken", kind, c.Entity);
       return;
     }
-    int skeleton = MatchSkeleton(body.Bones, body.Parents);
+    int cant = Cant_Unknown;
+    int skeleton = SkeletonOf(animatable, body, g_Body, cant);
     if (skeleton < 0)
     {
-      util::log::Warning("Pose: %s 0x%I64X: its skeleton (%d bones) isn't one the tools know the bones of, not taken",
-        kind, c.Entity, body.Bones);
+      util::log::Warning("Pose: %s 0x%I64X: its skeleton (%d bones) isn't one the tools know the bones of, and its "
+        "bones' names couldn't be read from the game (%s), not taken", kind, c.Entity, body.Bones,
+        g_Body.Why[0] ? g_Body.Why : "its asset wasn't read");
+      return;
+    }
+    kind = KindName(c.Kind, skeleton);
+    if (cant != Cant_No)
+    {
+      util::log::Warning("Pose: %s 0x%I64X: %s, not taken", kind, c.Entity, cant == Cant_NoRoot ?
+        "its bones don't hang on one bone a pose could hold" : "its animation rig has no channel for the bone a pose "
+        "holds, so the game couldn't take a pose of it");
       return;
     }
     int animated = AnimatedByGame(animatable);
@@ -2098,10 +2745,24 @@ namespace
     h.BoxHandle = boxOk ? box.Handle : 0xFFFFFFFFu;
     h.Bones = body.Bones;
     h.Skeleton = skeleton;
-    pose_skeletons::Skeleton const& s = pose_skeletons::Skeletons[skeleton];
+    pose_skeletons::Skeleton const& s = pose_skeleton_live::At(skeleton);
     h.Root = s.HeldRoot;
+    // Its own asset's name for the files (a table stands for several assets, whose bones are other lengths: a man's
+    // file must not count as a woman in heels' own)
+    if (g_Body.AssetOk && !pose_skeleton_live::IsMade(skeleton))
+    {
+      _snprintf_s(h.Asset, sizeof(h.Asset), _TRUNCATE, "%s", g_Body.Asset);
+      _strlwr_s(h.Asset);
+    }
+    else
+      _snprintf_s(h.Asset, sizeof(h.Asset), _TRUNCATE, "%s", s.Asset);
     // Held: the root and every bone below it (a bone's parent always comes
-    // before it in the game's skeletons)
+    // before it in the game's skeletons). The parents are the body's own pose
+    // manager's, not the table's: they are what the game's pose pass goes by,
+    // and a bone the body's animation rig has no channel for has none there
+    // (the game draws it and what hangs on it apart from the body). Such a
+    // bone is never listed: the game's blend would write its pose into
+    // another bone's channel (pose_skeleton_live::MayPose).
     int face = BoneByName(skeleton, "Face");
     int leftHand = BoneByName(skeleton, "LeftHand"), rightHand = BoneByName(skeleton, "RightHand");
     // A hand's children are its fingers, and Wep_Root (the grip): that one isn't
@@ -2109,11 +2770,26 @@ namespace
     for (int g = 0; g < FaceGroupCount; ++g)
       h.GroupSize[g] = 0;
     h.Count = 0;
+    int leftOut = 0;
+    char leftOutNames[240] = "";
+    static bool byTable[MaxBones];
     for (int i = 0; i < h.Bones; ++i)
     {
-      int p = s.Parents[i];
+      int p = g_Body.Parents[i];
       h.Parents[i] = (short)p;
-      h.InHeld[i] = i == h.Root || (p >= 0 && p < i && h.InHeld[p]);
+      h.InHeld[i] = (i == h.Root || (p >= 0 && p < i && h.InHeld[p])) && pose_skeleton_live::MayPose(g_Body, i);
+      // What the skeleton itself would have held and this body's rig can't: said in the log
+      int tableParent = s.Parents[i];
+      byTable[i] = i == h.Root || (tableParent >= 0 && tableParent < i && byTable[tableParent]);
+      if (byTable[i] && !h.InHeld[i])
+      {
+        if (leftOut < 8)
+        {
+          size_t used = strlen(leftOutNames);
+          _snprintf_s(leftOutNames + used, sizeof(leftOutNames) - used, _TRUNCATE, "%s%s", leftOut ? ", " : "", s.Names[i]);
+        }
+        ++leftOut;
+      }
       h.Depth[i] = (unsigned char)(i == h.Root || p < 0 ? 0 : (h.Depth[p] < 250 ? h.Depth[p] + 1 : 250));
       h.Face[i] = i == face || (p >= 0 && h.Face[p]);
       h.Finger[i] = i != grip && p >= 0 && (p == leftHand || p == rightHand || h.Finger[p]);
@@ -2173,27 +2849,54 @@ namespace
     h.CheckSince = GetTickCount64();
     h.CheckLine[0] = 0;
     h.Status[0] = 0;
-    h.Undo.clear();
+    h.History.clear();
+    h.Future.clear();
+    h.HistoryHasKeys = false;
+    h.FutureStash.clear();
+    h.TrimmedStash = HistoryStep();
+    h.TrimmedOk = h.StashOk = h.KeysTimeMoved = false;
+    h.Keys = pose_keys::Anim();
+    h.KeysAppliedTime = 0.0;
+    h.KeysAppliedRevision = 0;
+    h.KeysAppliedOk = true;
+    h.KeysSavedRevision = 0;
+    h.KeysSavedAt = 0;
+    h.KeysAutosaveStarted = false;
+    h.KeysFile.clear();
+    h.KeysSuggest.clear();
+    h.KeysLoads = 0;
+    for (int i = 0; i < h.Bones; ++i)
+    {
+      QIdentity(h.KeyRefTurn[i]);
+      h.KeyRefMove[i][0] = h.KeyRefMove[i][1] = h.KeyRefMove[i][2] = 0.f;
+    }
+    h.KeyTrackTimeBefore = -1.0;
+    h.KeyTrackMoving = false;
     h.SelfHit = -1;
-    h.IdleRefOk = h.IdleActive = h.IdleGateOpen = h.IdleRootOk = false;
-    memset(h.IdleRefTurn, 0, sizeof(h.IdleRefTurn));
-    memset(h.IdleRefMove, 0, sizeof(h.IdleRefMove));
+    h.IdleActive = false;
+    ForgetIdleRefs(h);
+    FindIdleBones(h);
+    ResetIdleCounts(h);
+    ResetKinematics(h);
     h.IdleWeight = 0.f;
-    h.IdleWeightAt = h.IdleAt = h.IdleNewAt = 0;
+    h.IdleWeightAt = h.IdleAt = h.IdleNewAt = 0.0;
     h.IdleGen = h.IdleSeen = 0;
     h.IdleFrames = 0;
     h.Restoring = false;
     h.RestoreSince = 0;
     h.RestoreWaitLogged = false;
+    h.Clip = ClipPlay();
+    voice_emotion::Cancel(h.Voice.Emotion);   // [EMOTION] [REVIEW] (none is expected here)
+    h.Voice = VoicePlay();
     // Its slots' records watched from its first blend (see BlendWatch)
     if (!Watch(h))
       util::log::Warning("Pose: the game's pose blend isn't hooked, so letting go won't put back what the game doesn't "
         "animate (free-moved bones stay moved)");
-    sprintf_s(h.Label, "%s", kind);
+    _snprintf_s(h.Label, sizeof(h.Label), _TRUNCATE, "%s", kind);
     // Its weapons: each on the bone it's on now (the pose is the game's yet).
     // In the grip's hand if it's near the grip, else with the nearest body
     // bone (a holster), else left where the game has it.
-    h.GripBone = grip;
+    h.GripBone = grip >= 0 && h.InHeld[grip] ? grip : -1;
     h.WeaponCount = 0;
     h.WeaponsCheckedAt = 0;
     char weaponText[200] = "";
@@ -2237,16 +2940,18 @@ namespace
           Relative(takeWorld[w.Bone], world, w.OffsetWorld);
           memcpy(w.TakenOffsetLocal, w.OffsetLocal, sizeof(w.TakenOffsetLocal));
           memcpy(w.TakenOffsetWorld, w.OffsetWorld, sizeof(w.TakenOffsetWorld));
-          sprintf_s(line, "%s%s on %s (%.0f cm)", weaponText[0] ? ", " : "", w.Name, s.Names[w.Bone], nearest * 100.f);
+          _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s on %s (%.0f cm)", weaponText[0] ? ", " : "", w.Name,
+            s.Names[w.Bone], nearest * 100.f);
         }
         else
-          sprintf_s(line, "%s%s left to the game (no bone within %.0f cm)", weaponText[0] ? ", " : "", w.Name,
-            CarryReach * 100.f);
+          _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s left to the game (no bone within %.0f cm)",
+            weaponText[0] ? ", " : "", w.Name, CarryReach * 100.f);
         strncat_s(weaponText, line, _TRUNCATE);
         h.Weapons[h.WeaponCount++] = w;
       }
     }
     g_Active = index;
+    g_LetGoMessage[0] = '\0';
     g_SelectedBone = h.Root;
     g_SelectedGroup = -1;
     g_SelectedWeapon = -1;
@@ -2256,7 +2961,11 @@ namespace
     else if (c.Kind == Kind_Faith)
       strcpy_s(boxText, ", her box pose not found");
     util::log::Write("Pose: holding %s 0x%I64X (%s, %d bones, %d held from %s; pose slot 0x%X%s%s%s)", h.Label, h.Entity,
-      s.Asset, h.Bones, h.Count, s.Names[h.Root], h.Handle, boxText, weaponText[0] ? "; its weapons: " : "", weaponText);
+      h.Asset, h.Bones, h.Count, s.Names[h.Root], h.Handle, boxText, weaponText[0] ? "; its weapons: " : "", weaponText);
+    if (leftOut)
+      util::log::Write("Pose: %s 0x%I64X: %d bones below %s are left out of the pose, its animation rig has no channel "
+        "for them or for a bone they hang on: %s%s", h.Label, h.Entity, leftOut, s.Names[h.Root], leftOutNames,
+        leftOut > 8 ? ", ..." : "");
   }
 
   // ---- Idle movement ----
@@ -2327,6 +3036,7 @@ namespace
     std::atomic<unsigned int> Seq;           // odd while it's written
     std::atomic<unsigned int> Count;         // captures made
     unsigned int CapturedGen;                // the Gen the records were taken for (written inside Seq)
+    double At;                               // when (the performance counter, s; written inside Seq)
     float Records[MaxBones][12];             // per skeleton bone: scale, rotation, translation (Ant's)
     unsigned char Kept[MaxBones];            // per skeleton bone: 1 its rotation, 2 its translation not the game's (3: both, or not known)
   };
@@ -2338,6 +3048,19 @@ namespace
   bool g_IdleHooked = false;
   char g_IdleUnavailable[160] = "";
 
+  // The performance counter in seconds, on any thread (the same clock as g_ClipCounterSeconds)
+  double CounterSeconds()
+  {
+    static double const unit = []()
+    {
+      LARGE_INTEGER frequency;
+      return QueryPerformanceFrequency(&frequency) && frequency.QuadPart ? 1.0 / (double)frequency.QuadPart : 0.0;
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * unit;
+  }
+
   // A channel (4 floats) bit for bit the same
   bool SameBits(float const* a, float const* b)
   {
@@ -2347,8 +3070,10 @@ namespace
   // Inside the pose job, before our blend of the body's slot: the held
   // pose's records copied for its idle movement, each bone's rotation and
   // translation the game didn't write since the slot's last pass marked (they
-  // hold the tools' own pose). With none written (the game's animation didn't
-  // run since: time frozen), no capture. The game's memory is read before the
+  // hold the tools' own pose). With none written, no capture. (Under Freeze
+  // time the game still writes them every frame, CT.log 2026-11-14: a capture
+  // a frame, probably with the same values, not measured; the movement then
+  // eases out over IdleSmoothSeconds.) The game's memory is read before the
   // capture's seqlock opens (a fault can't leave it open).
   void CaptureIdle(IdleCapture& c, BlendWatch& w, BYTE const* records, unsigned int const* toRecord,
     unsigned int recordCount, int bones, bool seen)
@@ -2382,6 +3107,7 @@ namespace
       c.Kept[bone] = w.ScratchKept[bone];
     }
     c.CapturedGen = gen;
+    c.At = CounterSeconds();
     c.Seq.fetch_add(1, std::memory_order_release);
     c.Count.fetch_add(1, std::memory_order_release);
   }
@@ -2602,7 +3328,8 @@ namespace
     return true;
   }
 
-  // Made the first time it's wanted (its code checked first). Game thread.
+  // Made at the tools' start (pose_editor::Init, the init thread, at the end of Main::Init), or the first time it's
+  // wanted if Init didn't run; made or not, it isn't tried again (std::call_once). Its code checked first.
   bool BlendHook()
   {
     std::call_once(g_IdleHookOnce, []
@@ -2627,11 +3354,49 @@ namespace
     g_IdleCaptures[index].Gen.store(0, std::memory_order_release);
   }
 
+  // Everything the idle movement has learnt of the animation. Wanted anew it starts from scratch, its gate shut: a
+  // person's opens about 1 s later (IdleSpeedWindow of the game's time to know its root's speed, then IdleCalmSeconds
+  // of calm), another skeleton's at the first capture.
   void ForgetIdleRefs(Held& h)
   {
     h.IdleRefOk = false;
     memset(h.IdleRefTurn, 0, sizeof(h.IdleRefTurn));
     memset(h.IdleRefMove, 0, sizeof(h.IdleRefMove));
+    memset(h.IdlePrevOk, 0, sizeof(h.IdlePrevOk));
+    h.IdleRootOk = false;
+    h.IdleRootHead = h.IdleRootCount = 0;
+    h.IdleSpinHead = h.IdleSpinCount = 0;
+    h.IdleCaptureAt = 0.0;
+    h.IdleGameClock = 0.0;
+    h.IdleCalmSince = -1.0;
+    h.IdleGateOpen = false;
+  }
+
+  // The 10 s log line's counts (UpdateIdle), from 0
+  void ResetIdleCounts(Held& h)
+  {
+    h.IdleOpenCaptures = h.IdleOverSpeed = h.IdleOverLegs = h.IdleOverSpin = h.IdleOldRule = 0;
+    h.IdleMostSpeed = h.IdleMostLegs = h.IdleMostSpin = h.IdleMostStep = 0.f;
+    h.IdleMostLegsBone = h.IdleMostSpinBone = h.IdleMostStepBone = -1;
+  }
+
+  // The idle gate's bones by their names (at Take pose): Hips and the legs (group 1), the spine (group 2). A
+  // skeleton without all ten keeps the 10-degree gate (IdlePeople false).
+  void FindIdleBones(Held& h)
+  {
+    static char const* const names[Held::IdleSpinBones] = { "Hips", "LeftUpLeg", "LeftLeg", "LeftFoot", "RightUpLeg",
+      "RightLeg", "RightFoot", "Spine", "Spine1", "Spine2" };
+    memset(h.IdleGroup, 0, sizeof(h.IdleGroup));
+    h.IdlePeople = true;
+    for (int k = 0; k < Held::IdleSpinBones; ++k)
+    {
+      int bone = BoneByName(h.Skeleton, names[k]);
+      h.IdleSpinBone[k] = bone >= 0 && bone < h.Bones && h.InHeld[bone] ? bone : -1;
+      if (h.IdleSpinBone[k] < 0)
+        h.IdlePeople = false;
+      else
+        h.IdleGroup[bone] = k < 7 ? 1 : 2;
+    }
   }
 
   // Wanted for this pose; when it wasn't, a new wanting (its own Gen): only
@@ -2678,17 +3443,43 @@ namespace
     return 2.f * atan2f(s, fabsf(q[3]));
   }
 
+  // A turn's angle made amount times as big, then eased so that it never passes maxAngle: maxAngle x
+  // tanh(angle / maxAngle). A bone whose animation goes far still moves, more slowly, instead of standing still at
+  // a hard limit (w kept >= 0).
+  void SoftTurn(float* q, float amount, float maxAngle)
+  {
+    if (q[3] < 0.f)
+      for (int k = 0; k < 4; ++k)
+        q[k] = -q[k];
+    float s = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    if (!(s > 1e-7f) || !(maxAngle > 0.f))
+    {
+      QIdentity(q);
+      return;
+    }
+    float angle = maxAngle * tanhf(2.f * atan2f(s, q[3]) * amount / maxAngle);
+    float half = angle * 0.5f, k = sinf(half) / s;
+    q[0] *= k; q[1] *= k; q[2] *= k;
+    q[3] = cosf(half);
+  }
+
   // Each frame for a held pose: the animation the game made under it (the
   // capture), smoothed, and each held bone's movement about that. It's laid
   // over the pose by a weight that goes to 1 in IdleFadeSeconds when wanted,
-  // with captures coming, and the character standing (no body bone more than
-  // IdleGateTurn off where its animation has been, its root slower than
-  // IdleGateSpeed), and to 0 the same way otherwise (unticked, Freeze time
-  // with nothing new, walking, fighting).
+  // with captures coming, and the gate open, and to 0 the same way otherwise
+  // (unticked, no capture for a while, walking, running, a big move of the
+  // hips or legs). The gate (a person's: see IdleGateSpeed): shut when its root
+  // moves, its hips or legs go far off where their animation has been or those
+  // and its spine turn fast; open again after IdleCalmSeconds of all of them
+  // calm. The smoothing, the speeds and the gate's windows go by the game's
+  // time (IdleGameClock: the time between the captures' own stamps times the
+  // game speed), so a slowed walk is still a walk; the fade goes by real time.
   void UpdateIdle(Held& h, int index, ULONGLONG now)
   {
-    float dtWeight = h.IdleWeightAt ? (float)(now - h.IdleWeightAt) / 1000.f : 0.f;
-    h.IdleWeightAt = now;
+    (void)now;
+    double frame = g_ClipCounterSeconds;
+    float dtWeight = h.IdleWeightAt > 0.0 ? (float)(frame - h.IdleWeightAt) : 0.f;
+    h.IdleWeightAt = frame;
     dtWeight = dtWeight < 0.f ? 0.f : (dtWeight > 0.5f ? 0.5f : dtWeight);
     auto fade = [&](bool up)
     {
@@ -2698,7 +3489,11 @@ namespace
       if (h.IdleWeight <= 0.f)
         h.IdleActive = false;
     };
-    bool want = g_IdleOn && g_IdleAmount > 0.f && BlendHook();
+    // (Also while the keyframes play, 2026-11-15, the user: "idle animation should be going on even when there are
+    // key frames animating". The captures are the game's own animation under the pose, whatever the pose is, and
+    // channels the game doesn't write hold the tools' pose and are left out (Kept) as at any time; a clip playing
+    // still stops it: a whole animation of its own)
+    bool want = g_IdleOn && g_IdleAmount > 0.f && !(h.Clip.On && h.Clip.Playing) && BlendHook();
     if (!want)
     {
       // No more captures; the last movement fades out
@@ -2713,8 +3508,13 @@ namespace
     unsigned int count = c.Count.load(std::memory_order_acquire);
     if (count == h.IdleSeen)
     {
-      // Nothing new: kept, fading out after a while (the game doesn't blend this pose now)
-      fade(now - h.IdleNewAt < IdleStaleMs && h.IdleGateOpen);
+      // Nothing new: kept, fading out after a while (the game doesn't blend this pose now). At a slow game speed
+      // it waits at least 2.5 of the game's 30 a second ticks (under 1/6x; inferred: captures were measured only at
+      // 1x, one a tick, and under Freeze time, one a frame).
+      double stale = IdleStaleSeconds;
+      if (g_ClipGameScale > 0.f && g_ClipGameScale < 1.f)
+        stale = (std::max)(stale, 2.5 / (30.0 * (double)g_ClipGameScale));
+      fade(h.IdleNewAt > 0.0 && frame - h.IdleNewAt < stale && h.IdleGateOpen);
       return;
     }
     unsigned int before = c.Seq.load(std::memory_order_acquire);
@@ -2729,17 +3529,46 @@ namespace
       kept[i] = c.Kept[i];
     }
     unsigned int capturedGen = c.CapturedGen;
+    double stamp = c.At;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (c.Seq.load(std::memory_order_relaxed) != before)
       return;                                // written meanwhile: next frame
     h.IdleSeen = count;
     if (capturedGen != h.IdleGen)
       return;                                // made for another pose, or before this wanting
-    float dt = h.IdleRefOk ? (float)(now - h.IdleAt) / 1000.f : 0.f;
-    h.IdleAt = now;
-    h.IdleNewAt = now;
+    // The game's time since the capture before (none: the first since it was wanted): the real time between their
+    // stamps times the game speed (at least 0.0001: the game's own slow motion never goes under it; its real depth
+    // isn't known), and at most one 30 a second tick a frame at any speed (the game doesn't run more: above 1x, or
+    // under 30 frames a second); under Freeze time (speed 0) the real time: its captures then come every frame,
+    // holding still
+    float speedScale = g_ClipGameScale;
+    if (!(speedScale > 0.f))
+      speedScale = 1.f;
+    else
+    {
+      if (speedScale < 0.0001f)
+        speedScale = 0.0001f;
+      if (g_ClipRealDt > 0.0)
+      {
+        float most = (float)(1.0 / (30.0 * g_ClipRealDt));
+        speedScale = speedScale > most ? most : speedScale;
+      }
+    }
+    float dt = h.IdleCaptureAt > 0.0 && stamp > h.IdleCaptureAt ? (float)(stamp - h.IdleCaptureAt) * speedScale : 0.f;
+    h.IdleCaptureAt = stamp;
+    h.IdleGameClock += dt;
+    double at = h.IdleGameClock;
+    h.IdleAt = frame;
+    h.IdleNewAt = frame;
     float alpha = dt > 0.f ? 1.f - expf(-dt / IdleSmoothSeconds) : 0.f;
     float worst = 0.f;                       // the body's largest turn off where its animation has been
+    float legs = 0.f;                        // Hips' and the legs' largest
+    int legsBone = -1;
+    float stepMost = 0.f;                    // the largest turn since the capture before (degrees)
+    int stepBone = -1;
+    float spin[Held::IdleSpinBones];         // the gate's bones' turn speeds since the capture before (degrees a second)
+    for (int k = 0; k < Held::IdleSpinBones; ++k)
+      spin[k] = 0.f;
     for (int n = 0; n < h.Count; ++n)
     {
       int i = (int)h.List[n];
@@ -2751,6 +3580,7 @@ namespace
         QIdentity(h.Idle[i]);
         h.Idle[i][4] = h.Idle[i][5] = h.Idle[i][6] = 0.f;
         h.IdleRefTurn[i] = h.IdleRefMove[i] = false;
+        h.IdlePrevOk[i] = false;
         continue;
       }
       QNorm(q);
@@ -2764,6 +3594,24 @@ namespace
       QIdentity(turn);
       if (!turnKept)
       {
+        // How far it turned since the capture before
+        if (h.IdlePrevOk[i])
+        {
+          float const* p = h.IdlePrev[i];
+          float dot = fabsf(p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3]);
+          float step = 2.f * acosf(dot < 1.f ? dot : 1.f) * 57.2957795f;
+          if (step > stepMost)
+          {
+            stepMost = step;
+            stepBone = i;
+          }
+          if (h.IdleGroup[i] && dt > 0.f)
+            for (int k = 0; k < Held::IdleSpinBones; ++k)
+              if (h.IdleSpinBone[k] == i)
+                spin[k] = step / dt;
+        }
+        memcpy(h.IdlePrev[i], q, sizeof(q));
+        h.IdlePrevOk[i] = true;
         if (!h.IdleRefTurn[i])
         {
           memcpy(ref, q, sizeof(q));
@@ -2783,12 +3631,19 @@ namespace
         QConj(ref, inverse);
         QMul(inverse, q, turn);
         QNorm(turn);
-        if (!h.Face[i] && !h.Finger[i] && !h.Helper[i] && !h.Eye[i])
+        bool body = !h.Face[i] && !h.Finger[i] && !h.Helper[i] && !h.Eye[i];
+        if (body || h.IdleGroup[i] == 1)
         {
           float angle = TurnAngle(turn);
-          worst = angle > worst ? angle : worst;
+          if (body)
+            worst = angle > worst ? angle : worst;
+          if (h.IdleGroup[i] == 1 && angle > legs)
+          {
+            legs = angle;
+            legsBone = i;
+          }
         }
-        ScaleTurn(turn, g_IdleAmount, MaxIdleTurn);
+        SoftTurn(turn, g_IdleAmount, MaxIdleTurn);
       }
       memcpy(h.Idle[i], turn, sizeof(turn));
       if (moveKept)
@@ -2816,20 +3671,130 @@ namespace
       for (int k = 0; k < 3; ++k)
         h.Idle[i][4 + k] = move[k] * cut;
     }
-    // The character standing: its root (where it is: the bone the held root
-    // hangs from, as the game drew it) slow, its body's bones near where
-    // their animation has been
+
+    // Its root (where it is: the bone the held root hangs from, as the game
+    // drew it), kept with the game's time; its speed: from where it was
+    // IdleSpeedWindow of the game's time ago (not known before it has been
+    // watched that long). A skeleton whose held root has no parent, or a frame
+    // with no world pose read: taken as still, as before 2026-11-14
     int base = h.Root >= 0 && h.Root < h.Bones ? h.Parents[h.Root] : -1;
     float speed = 0.f;
+    bool speedKnown = base < 0 || !h.WorldOk;
     if (base >= 0 && h.WorldOk)
     {
-      float const* at = h.World[base];
-      if (h.IdleRootOk && dt > 0.f)
-        speed = Distance3(at, h.IdleRoot) / dt;
-      memcpy(h.IdleRoot, at, sizeof(h.IdleRoot));
+      float const* p = h.World[base];
+      int slot = (h.IdleRootHead + h.IdleRootCount) % Held::IdleRingSize;
+      if (h.IdleRootCount == Held::IdleRingSize)
+        h.IdleRootHead = (h.IdleRootHead + 1) % Held::IdleRingSize;
+      else
+        ++h.IdleRootCount;
+      h.IdleRootTime[slot] = at;
+      memcpy(h.IdleRootAt[slot], p, sizeof(h.IdleRootAt[slot]));
+      memcpy(h.IdleRoot, p, sizeof(h.IdleRoot));
       h.IdleRootOk = true;
+      // The newest place at least IdleSpeedWindow old
+      for (int k = h.IdleRootCount - 2; k >= 0; --k)
+      {
+        int old = (h.IdleRootHead + k) % Held::IdleRingSize;
+        double age = at - h.IdleRootTime[old];
+        if (age >= IdleSpeedWindow)
+        {
+          speed = (float)(Distance3(p, h.IdleRootAt[old]) / age);
+          speedKnown = true;
+          break;
+        }
+      }
     }
-    h.IdleGateOpen = worst <= IdleGateTurn && speed <= IdleGateSpeed;
+    // Each of the gate's bones' mean turn speed over IdleSpinWindow; the fastest of them
+    float spinMost = 0.f;
+    int spinBone = -1;
+    if (h.IdlePeople && dt > 0.f)
+    {
+      int slot = (h.IdleSpinHead + h.IdleSpinCount) % Held::IdleRingSize;
+      if (h.IdleSpinCount == Held::IdleRingSize)
+        h.IdleSpinHead = (h.IdleSpinHead + 1) % Held::IdleRingSize;
+      else
+        ++h.IdleSpinCount;
+      h.IdleSpinTime[slot] = at;
+      memcpy(h.IdleSpin[slot], spin, sizeof(spin));
+    }
+    if (h.IdlePeople && h.IdleSpinCount > 0)
+    {
+      float sum[Held::IdleSpinBones];
+      for (int k = 0; k < Held::IdleSpinBones; ++k)
+        sum[k] = 0.f;
+      int samples = 0;
+      for (int k = h.IdleSpinCount - 1; k >= 0; --k)
+      {
+        int s = (h.IdleSpinHead + k) % Held::IdleRingSize;
+        if (samples > 0 && at - h.IdleSpinTime[s] > IdleSpinWindow)
+          break;
+        for (int b = 0; b < Held::IdleSpinBones; ++b)
+          sum[b] += h.IdleSpin[s][b];
+        ++samples;
+      }
+      for (int b = 0; b < Held::IdleSpinBones; ++b)
+        if (sum[b] / (float)samples > spinMost)
+        {
+          spinMost = sum[b] / (float)samples;
+          spinBone = h.IdleSpinBone[b];
+        }
+    }
+
+    // The gate
+    if (h.IdlePeople)
+    {
+      bool over = (speedKnown && speed > IdleGateSpeed) || legs > IdleGateLegs || spinMost > IdleGateSpin;
+      bool calm = speedKnown && speed < IdleOpenSpeed && legs < IdleOpenLegs && spinMost < IdleOpenSpin;
+      if (h.IdleGateOpen)
+      {
+        if (over)
+        {
+          h.IdleGateOpen = false;
+          h.IdleCalmSince = -1.0;
+        }
+      }
+      else if (!calm)
+        h.IdleCalmSince = -1.0;
+      else
+      {
+        if (h.IdleCalmSince < 0.0)
+          h.IdleCalmSince = at;
+        if (at - h.IdleCalmSince >= IdleCalmSeconds)
+          h.IdleGateOpen = true;
+      }
+    }
+    else
+      h.IdleGateOpen = worst <= IdleGateTurn && (!speedKnown || speed <= IdleGateSpeed);
+
+    // For the 10 s log line
+    if (h.IdleGateOpen)
+      ++h.IdleOpenCaptures;
+    if (speedKnown && speed > IdleGateSpeed)
+      ++h.IdleOverSpeed;
+    if (legs > IdleGateLegs)
+      ++h.IdleOverLegs;
+    if (spinMost > IdleGateSpin)
+      ++h.IdleOverSpin;
+    if (worst > IdleGateTurn)
+      ++h.IdleOldRule;
+    if (speedKnown && speed > h.IdleMostSpeed)
+      h.IdleMostSpeed = speed;
+    if (legs > h.IdleMostLegs)
+    {
+      h.IdleMostLegs = legs;
+      h.IdleMostLegsBone = legsBone;
+    }
+    if (spinMost > h.IdleMostSpin)
+    {
+      h.IdleMostSpin = spinMost;
+      h.IdleMostSpinBone = spinBone;
+    }
+    if (stepMost > h.IdleMostStep)
+    {
+      h.IdleMostStep = stepMost;
+      h.IdleMostStepBone = stepBone;
+    }
     h.IdleRefOk = true;
     h.IdleActive = true;
     fade(h.IdleGateOpen);
@@ -2850,6 +3815,1612 @@ namespace
     memcpy(local + 4, turned, sizeof(turned));
     for (int k = 0; k < 3; ++k)
       local[k] += h.Idle[bone][4 + k] * h.IdleWeight;
+  }
+
+  // ---- Animation clips (ClipPlay) ----
+
+  // The clips' clocks this frame (set in Update)
+  // (g_ClipRealDt: with the idle movement's settings, above)
+  double g_ClipRealDtBefore = 0.0;           // the frame before's (KeepVoice: the camera track's time is a frame old)
+  int g_ClipLongFrames = 0;                  // frames over 0.1 s in a row, this one counted
+  // (g_ClipGameScale: with the idle movement's settings, above)
+  double g_ClipTrackTime = -1.0;
+  const wchar_t* const ClipFolderW = L"Cinematic Tools\\Animations";
+
+  // A clip being read: one at a time, on a thread of its own
+  struct ClipLoad
+  {
+    std::mutex Mutex;
+    bool Done = false;
+    std::shared_ptr<pose_clips::Clip const> Clip;
+    std::string Error;
+    int HeldId = 0;                          // the held pose it's for (Held::Id)
+    std::string File;                        // its file's name (UTF-8)
+  };
+  std::shared_ptr<ClipLoad> g_ClipLoad;
+  std::vector<std::wstring> g_ClipFiles;     // the folder's .fbx and .anim files
+  ULONGLONG g_ClipFilesListedAt = 0;
+  char g_ClipMessage[400] = "";
+
+  std::string Utf8Of(std::wstring const& w)
+  {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n : 0, '\0');
+    if (n > 0)
+      WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+  }
+
+  void ListClipFiles()
+  {
+    g_ClipFiles.clear();
+    CreateDirectoryW(L"Cinematic Tools", nullptr);
+    CreateDirectoryW(ClipFolderW, nullptr);
+    WIN32_FIND_DATAW data;
+    for (wchar_t const* ext : { L"\\*.fbx", L"\\*.anim" })
+    {
+      std::wstring pattern = std::wstring(ClipFolderW) + ext;
+      HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+      if (find != INVALID_HANDLE_VALUE)
+      {
+        do
+        {
+          if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            g_ClipFiles.push_back(data.cFileName);
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+      }
+    }
+    std::sort(g_ClipFiles.begin(), g_ClipFiles.end());
+  }
+
+  // A file read on a thread of its own (the menu and the game go on), handed
+  // over by KeepClipLoad
+  void StartClipLoad(Held const& h, std::wstring const& file)
+  {
+    if (g_ClipLoad)
+      return;
+    auto job = std::make_shared<ClipLoad>();
+    job->HeldId = h.Id;
+    job->File = Utf8Of(file);
+    std::wstring path = std::wstring(ClipFolderW) + L"\\" + file;
+    g_ClipLoad = job;
+    _snprintf_s(g_ClipMessage, sizeof(g_ClipMessage), _TRUNCATE, "Reading %s...", job->File.c_str());
+    std::thread([job, path]
+    {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      std::string error;
+      std::shared_ptr<pose_clips::Clip const> clip;
+      try
+      {
+        clip = pose_clips::Load(path, error);
+      }
+      catch (...)
+      {
+        clip.reset();
+        error = "couldn't be read (out of memory?)";
+      }
+      std::lock_guard<std::mutex> lock(job->Mutex);
+      job->Clip = clip;
+      job->Error = error;
+      job->Done = true;
+    }).detach();
+  }
+
+  // The clip faced the way the pose taken's Hips face (a turn about up): the
+  // game rest Hips' front (+Z), or its left (+X) when that lies flatter,
+  // carried by the pose taken's Hips. Taken lying or upside down (the rest's
+  // up carried more than 60 deg off up): +X in bone 1's frame, the way people
+  // face there (Faith's recorded median 90.3 deg, men 86 - 100; offline
+  // 2026-11-11).
+  void FaceClip(Held& h)
+  {
+    ClipPlay& c = h.Clip;
+    QIdentity(c.Facing);
+    if (h.Root < 0 || !c.Fit.Ok)
+      return;
+    float inverse[4], hips[4];
+    QConj(c.Fit.RestHipsQ, inverse);
+    memcpy(hips, h.Base[h.Root] + 4, sizeof(hips));
+    QNorm(hips);
+    float axes[2][3] = { { 0.f, 0.f, 1.f }, { 1.f, 0.f, 0.f } }, flattest = 0.f, yaw = 0.f;
+    for (int a = 0; a < 2; ++a)
+    {
+      float local[3], now[3];
+      QRot(inverse, axes[a], local);
+      QRot(hips, local, now);
+      float flat = sqrtf(now[0] * now[0] + now[2] * now[2]);
+      if (flat > flattest)
+      {
+        flattest = flat;
+        // The turn about up that takes the rest's +Z (or +X) onto now's way across the ground
+        yaw = a == 0 ? atan2f(now[0], now[2]) : atan2f(-now[2], now[0]);
+      }
+    }
+    // Lying or flipped when taken (the rest's up carried less than 60 deg from
+    // up): +X in bone 1's frame
+    float up[3] = { 0.f, 1.f, 0.f }, upLocal[3], upNow[3];
+    QRot(inverse, up, upLocal);
+    QRot(hips, upLocal, upNow);
+    if (upNow[1] < 0.5f)
+      yaw = 1.5707963f;
+    c.Facing[1] = sinf(yaw * 0.5f);
+    c.Facing[3] = cosf(yaw * 0.5f);
+  }
+
+  // A finished read handed to its held pose (under g_Mutex)
+  void KeepClipLoad()
+  {
+    if (!g_ClipLoad)
+      return;
+    std::shared_ptr<pose_clips::Clip const> clip;
+    std::string error, file;
+    int heldId = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_ClipLoad->Mutex);
+      if (!g_ClipLoad->Done)
+        return;
+      clip = g_ClipLoad->Clip;
+      error = g_ClipLoad->Error;
+      file = g_ClipLoad->File;
+      heldId = g_ClipLoad->HeldId;
+    }
+    g_ClipLoad.reset();
+    if (!clip)
+    {
+      _snprintf_s(g_ClipMessage, sizeof(g_ClipMessage), _TRUNCATE, "%s %s", file.c_str(), error.c_str());
+      util::log::Warning("Pose: the clip %s %s", file.c_str(), error.c_str());
+      return;
+    }
+    util::log::Write("Pose: clip read: %s%s%s", clip->Report.c_str(), clip->Warning.empty() ? "" : "; check: ",
+      clip->Warning.c_str());
+    if (util::DiagnosticsOn())
+    {
+      std::string bones;
+      for (size_t k = 0; k < clip->Bones.size(); ++k)
+        bones += (k ? ", " : "") + clip->Bones[k] + " = " + clip->SourceNames[k];
+      util::log::Write("Pose: clip %s's bones (found by %s): %s", file.c_str(), clip->BonesFrom.c_str(), bones.c_str());
+    }
+    Held* held = nullptr;
+    for (int i = 0; i < MaxHeld && !held; ++i)
+      if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Id == heldId)
+        held = &g_Held[i];
+    if (!held)
+    {
+      _snprintf_s(g_ClipMessage, sizeof(g_ClipMessage), _TRUNCATE, "%s was read, but its pose was let go meanwhile",
+        file.c_str());
+      return;
+    }
+    Held& h = *held;
+    ClipPlay& c = h.Clip;
+    pose_skeletons::Skeleton const& s = pose_skeleton_live::At(h.Skeleton);
+    c.Clip = clip;
+    pose_clips::FitTo(*clip, s.Asset, h.Bones, s.Names, s.Parents, &h.Base[0][0], c.Fit);
+    c.Time = 0.0;
+    c.TrackStart = 0.0;
+    c.LocalOk = false;
+    c.On = c.Playing = c.Fit.Ok;
+    FaceClip(h);
+    if (h.Root >= 0)
+    {
+      c.Anchor[0] = h.Base[h.Root][0];
+      c.Anchor[1] = h.Base[h.Root][2];
+    }
+    c.TravelYawOk = false;
+    c.TravelShift[0] = c.TravelShift[1] = 0.f;
+    util::log::Write("Pose: clip %s on %s 0x%I64X: %s", file.c_str(), h.Label, h.Entity, c.Fit.Report.c_str());
+    // (a clip that doesn't fit shows why in its own line in the Clip tab, from c.Fit.Report)
+    g_ClipMessage[0] = 0;
+  }
+
+  // The clip's pose at its time, as locals (h.Clip.Local), each held bone as
+  // the Fit has it (pose_clips::BoneUse): a bone the clip turns gets its world
+  // rotation (faced) as a local under its parent as made, and the game rest's
+  // translation (the Hips aside); a bone between two of those the game rest's
+  // local; a roll its sibling's turn and their rest offset; the rest the pose
+  // taken's local. The Hips across the ground where the pose taken has them,
+  // at the game rest's height, moved as the clip's (only up and down unless
+  // it follows the clip's travel), the travel along the way the body faces
+  // (the clip's facing and the Hips' own turn's heading).
+  void MakeClipPose(Held& h)
+  {
+    ClipPlay& c = h.Clip;
+    static float world[MaxBones][4], rotation[MaxBones][4];
+    float move[3];
+    pose_clips::Sample(*c.Clip, c.Fit, c.Time, c.Loop, world, move);
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n], p = h.Parents[i];
+      float parent[4] = { 0.f, 0.f, 0.f, 1.f };
+      if (i != h.Root && p >= 0 && h.InHeld[p])
+        memcpy(parent, rotation[p], sizeof(parent));
+      float* local = c.Local[i];
+      memcpy(local, h.Base[i], FloatsPerBone * sizeof(float));
+      unsigned char use = c.Fit.Use[i];
+      if (use == pose_clips::UseClip)
+      {
+        float w[4], inverse[4];
+        QMul(c.Facing, world[i], w);
+        QNorm(w);
+        QConj(parent, inverse);
+        QMul(inverse, w, local + 4);
+        QNorm(local + 4);
+        memcpy(rotation[i], w, sizeof(w));
+        if (i != h.Root)
+          memcpy(local, c.Fit.RestLocalT[i], 3 * sizeof(float));
+        continue;
+      }
+      if (use == pose_clips::UseRest)
+      {
+        memcpy(local, c.Fit.RestLocalT[i], 3 * sizeof(float));
+        memcpy(local + 4, c.Fit.RestLocalQ[i], 4 * sizeof(float));
+      }
+      QMul(parent, local + 4, rotation[i]);
+      QNorm(rotation[i]);
+    }
+    // The rolls, after their siblings (they come first in the skeletons; nothing hangs from them)
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n], d = c.Fit.Follows[i];
+      if (c.Fit.Use[i] != pose_clips::UseFollow || d < 0 || d >= h.Bones || !h.InHeld[d])
+        continue;
+      QMul(c.Local[d] + 4, c.Fit.FollowTurn[i], c.Local[i] + 4);
+      QNorm(c.Local[i] + 4);
+    }
+    // Faith's twist bones: a share of their driver's turn from its rest (its
+    // twist about X, or its Euler X), about their own X, on their rest local
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n], d = c.Fit.TwistOf[i];
+      if (c.Fit.Use[i] != pose_clips::UseTwist || d < 0 || d >= h.Bones || !h.InHeld[d])
+        continue;
+      float inverse[4], q[4];
+      QConj(c.Fit.RestLocalQ[d], inverse);
+      QMul(inverse, c.Local[d] + 4, q);
+      QNorm(q);
+      float x = q[0], y = q[1], z = q[2], w = q[3], angle;
+      if (c.Fit.TwistKind[i] == 0)
+        angle = 2.f * atan2f(w < 0.f ? -x : x, fabsf(w));
+      else if (c.Fit.TwistKind[i] == 1)
+        angle = atan2f(2.f * (y * z + x * w), 1.f - 2.f * (x * x + y * y));
+      else
+        angle = atan2f(2.f * (x * w - y * z), 1.f - 2.f * (x * x + y * y));
+      float half = 0.5f * c.Fit.TwistShare[i] * angle, turn[4] = { sinf(half), 0.f, 0.f, cosf(half) };
+      memcpy(c.Local[i], c.Fit.RestLocalT[i], 3 * sizeof(float));
+      QMul(c.Fit.RestLocalQ[i], turn, c.Local[i] + 4);
+      QNorm(c.Local[i] + 4);
+    }
+    if (h.Root >= 0 && c.Fit.TargetHips == h.Root)
+    {
+      float faced[4], front[3] = { 0.f, 0.f, 1.f }, ahead[3], heading[4];
+      memcpy(heading, c.Facing, sizeof(heading));
+      QMul(h.Turn[h.Root], c.Facing, faced);
+      QRot(faced, front, ahead);
+      if (ahead[0] * ahead[0] + ahead[2] * ahead[2] > 1e-6f)
+      {
+        float yaw = atan2f(ahead[0], ahead[2]);
+        heading[0] = heading[2] = 0.f;
+        heading[1] = sinf(yaw * 0.5f);
+        heading[3] = cosf(yaw * 0.5f);
+      }
+      float m[3] = { c.Hips == ClipTravel ? move[0] : 0.f, 0.f, c.Hips == ClipTravel ? move[2] : 0.f }, turned[3];
+      QRot(heading, m, turned);
+      // A new heading (the Hips turned) turns the travel from where the Hips
+      // are, not about the clip's start: the shift keeps them there
+      float yaw = 2.f * atan2f(heading[1], heading[3]);
+      if (c.TravelYawOk && yaw != c.TravelYaw)
+      {
+        float was[4] = { 0.f, sinf(c.TravelYaw * 0.5f), 0.f, cosf(c.TravelYaw * 0.5f) }, before[3];
+        QRot(was, m, before);
+        c.TravelShift[0] += before[0] - turned[0];
+        c.TravelShift[1] += before[2] - turned[2];
+      }
+      c.TravelYaw = yaw;
+      c.TravelYawOk = true;
+      float* t = c.Local[h.Root];
+      t[0] = c.Anchor[0] + c.TravelShift[0] + turned[0];
+      t[1] = c.Fit.RestHipsY + move[1];
+      t[2] = c.Anchor[1] + c.TravelShift[1] + turned[2];
+    }
+    c.LocalOk = true;
+  }
+
+  // Each frame for a held pose (KeepHeld, before its locals are handed): its
+  // clip's time moved on by its clock. False: no usable clip, so no pose to make.
+  bool AdvanceClip(Held& h)
+  {
+    ClipPlay& c = h.Clip;
+    if (!c.On || !c.Clip || !c.Fit.Ok)
+    {
+      c.LocalOk = false;
+      return false;
+    }
+    double length = c.Clip->Length();
+    if (c.Clock == ClipTrackTime)
+    {
+      // From Start as the track plays; at Start while no track plays
+      if (c.Playing)
+        c.Time = c.TrackStart + (g_ClipTrackTime >= 0.0 ? g_ClipTrackTime : 0.0) * c.Speed;
+    }
+    else if (c.Playing)
+      c.Time += g_ClipRealDt * (c.Clock == ClipGameTime ? g_ClipGameScale : 1.0) * c.Speed;
+    if (length > 0.0)
+    {
+      if (c.Loop)
+      {
+        c.Time = fmod(c.Time, length);
+        if (c.Time < 0.0)
+          c.Time += length;
+      }
+      else if (c.Time > length)
+      {
+        c.Time = length;
+        if (c.Clock != ClipTrackTime)
+          c.Playing = false;
+      }
+      else if (c.Time < 0.0)
+        c.Time = 0.0;
+    }
+    else
+      c.Time = 0.0;
+    return true;
+  }
+
+  // The clip's frame now made the pose taken (Base): the clip off, the edits on
+  // top of that frame (Reset goes back to it)
+  void BakeClipFrame(Held& h)
+  {
+    ClipPlay& c = h.Clip;
+    if (!c.On || !c.LocalOk)
+      return;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n];
+      memcpy(h.Base[i], c.Local[i], sizeof(h.Base[i]));
+    }
+    c.On = c.Playing = c.LocalOk = false;
+    _snprintf_s(g_ClipMessage, sizeof(g_ClipMessage), _TRUNCATE, "The frame at %.2f s is the pose now (the clip is off; "
+      "Reset goes back to that frame)", c.Time);
+    util::log::Write("Pose: %s 0x%I64X: the clip's frame at %.2f s made its pose", h.Label, h.Entity, c.Time);
+  }
+
+  // ---- Voices (VoicePlay) ----
+
+  const wchar_t* const VoiceFolderW = L"Cinematic Tools\\Voices";
+  // The kinds of sound file listed (what Windows' own decoders read; one it can't read says so when picked)
+  // (.ogg, .oga and .opus are read only where Windows' Web Media Extensions are installed, .aiff not at all: they are
+  // listed all the same, and say so when picked, rather than not showing)
+  const wchar_t* const VoiceKinds[] = { L"\\*.wav", L"\\*.mp3", L"\\*.m4a", L"\\*.mp4", L"\\*.aac", L"\\*.flac", L"\\*.wma",
+    L"\\*.ac3", L"\\*.mp2", L"\\*.webm", L"\\*.mka", L"\\*.ogg", L"\\*.oga", L"\\*.opus", L"\\*.aif", L"\\*.aiff" };
+  const float MaxVoiceLead = 0.3f;           // s: the mouth ahead of (or, negative, behind) the sound at most this
+  const double VoiceRateSeconds = 0.2;       // its time's pace is measured over about this long
+  const ULONGLONG VoiceHandMs = 150;         // its own clock waits this long after the menu last held its time
+  // A voice started from its beginning starts this far before it: the player needs 60 - 94 ms from the first call to
+  // the first sample heard (measured offline), and the first syllable would be lost
+  const double VoiceRunIn = 0.1;
+  // (g_ClipCounterSeconds: with the idle movement's settings, above)
+  // The Voice tab's (?) text
+  char const* const VoiceHelp = "Plays a recorded line on the held character and moves its mouth with it. Put the sound "
+    "file in the game folder's Cinematic Tools\\Voices and pick it here: WAV, MP3, M4A / AAC, FLAC, WMA or a video's "
+    "sound track (what Windows itself can read; OGG and Opus only where Windows' Web Media Extensions are installed, "
+    "AIFF not: convert those). Up to ten minutes are read. A damaged file can take 15 seconds to be given up "
+    "on.\n\nThe mouth's movements are worked out from the sound alone when the file is read: the jaw from how loud "
+    "the voice's vowels are, the lips from how it sounds. The tools don't know the words. Measured on computer-made "
+    "test voices (recordings of people were measured only for how fast the mouth moves, and for whether it shuts on "
+    "p, b and m: it does on about 83 % of them, but also on about 81 % of t, d, n, k, g and l): the jaw follows speech "
+    "well (about one opening a syllable, fewer with Mouth smoothing raised; shut in pauses, on time), the wide and teeth shapes are fair, the rounded one is weak, and a p, b or m is only "
+    "hinted at. The file should be the voice alone, with a short silence at its start and end: music, noise or a "
+    "second voice under it move the mouth too. A loud clipped (overloaded) voice keeps its jaw movement but loses part "
+    "of its lip closures and lip shapes, and a whisper opens the jaw about half as far, with weaker and partly wrong "
+    "lip shapes.\n\nThe "
+    "movements lie on top of the pose: the jaw, the lips and the mouth's corners keep your own edits and keyframes "
+    "underneath. Works on Faith, KrugerSec and people with a full skeleton (on a character without those mouth bones "
+    "only the sound plays). While a replay records or plays, every held pose steps aside and its mouth with it; the "
+    "voice's sound still plays.\n\nThe "
+    "sound is played by Windows beside the game's own, in step with the voice's time: it isn't placed in the world, "
+    "the game's volume settings don't change it, and it's heard only while the game's window is in front.";
+
+  // The (?) text of "A living face"
+  // (its numbers: VoiceAlive.h / .cpp, VoiceLife.h, VoiceLifeFace.h, VoiceGaze.h; Research_Pose_Editor sections 30, 31)
+  char const* const VoiceLifeHelp = "A living face, worked out from the sound's loudness and pitch when the file is "
+    "read and made for this character (a take of its own), so it stays in step when you scrub, loop or slow the "
+    "voice, and is the same every time for the same take.\n\n"
+    "Eyes: they look at the listener (where the eyes are posed) with small movements about the listener's face, look "
+    "away for a moment at the start of phrases and now and then inside long ones, and are back before the line ends. "
+    "While the voice moves the head they keep looking at the same place, as real eyes do, and dip a little in a "
+    "blink. The upper eyelids follow the eyes' movements up and down (eyes you turn yourself are left with the lids "
+    "you give them).\n\n"
+    "Blinks: about 20 to 30 a minute while speaking (studies of people talking: 26 on average), each eye its own and "
+    "each blink a little different: some only part of the way, a few long or two in a row, drawn to the ends of "
+    "phrases, to large eye movements and to strong nods. Closing and opening take as long as the game's own blinks.\n\n"
+    "Brows: a raise on the syllables that stand out most by their pitch, each its own size and the two sides a little "
+    "apart, small flickers on other stressed syllables, and a slow movement that never quite stops. They draw a "
+    "little together where the voice pauses to think or stresses a word loudly and low.\n\n"
+    "Breathing: a breath in before each group of words (the lips part a little), slow breathing in silence, and a "
+    "small lift of the head with each breath.\n\n"
+    "Head: nods on stressed syllables, a dip of the chin into the end of a phrase, a slow drift that never quite "
+    "stops, a small share of each look away. A part of it goes to the upper neck.\n\n"
+    "It hears stress, not words: what is louder, higher or longer than the syllables around it. Silence, noise, "
+    "held notes or beats get blinks, glances, breathing and the head's slow drift only (no brow raises or nods). "
+    "Music, noise or a hum under the voice can put brow "
+    "raises and nods in wrong places; singing is taken for speech.\n\n"
+    "The numbers come from studies of people talking and from the game's own animation, and were checked on "
+    "computer-made voices and one recording of a person.\n\n"
+    "Your own edits and keyframes of the eyes, the eyelids, the eyebrows, the head and the neck stay underneath. "
+    "Works on Faith, KrugerSec and people with full face bones. Like the mouth, it steps aside while a replay records "
+    "or plays.";
+
+  // The (?) text of "Feeling"
+  // (VoiceFeel.h / .cpp, VoiceFeelFace.h, VoiceFeelTables.h; Research_Pose_Editor section 31)
+  char const* const VoiceFeelHelp = "A feeling on the face, made of two of the game's own face pose libraries (the "
+    "poses the game animates faces with): Faith's for Faith and the woman's skeleton (women in flat shoes), Gabriel's "
+    "for everyone else, women in heels included (the game gives most other characters a library of their own, not "
+    "used here). They are put together the way psychologists describe expressions (FACS: a smile is the cheeks and "
+    "the mouth's corners up; sadness the inner brows up and the corners down; anger the brows down and together, the "
+    "lids tight, the lips pressed).\n\n"
+    "The tools' own analysis of the voice (its loudness and pitch) can't tell which feeling it carries, so you pick "
+    "it, and that analysis only changes how strongly it shows (Follows the voice). With From the voice ticked, a "
+    "trained model (an optional download: see its (?)) picks the feeling stretch by stretch over the one picked, and "
+    "makes its own lively feelings a little stronger or weaker by how stirred up the voice is.\n\n"
+    "Happy, Sad, Afraid, Surprised, Angry, Disgusted and Contempt follow the research's lists; Calm, Tender, Worried "
+    "and Tense are designed. Some hold the head too: Sad lowers the chin about 3 degrees, Tender tilts the head 2, "
+    "Afraid and Surprised lift the chin about a degree, Contempt and Happy a little less (Strength changes it, the "
+    "Head slider doesn't). "
+    "Sad, Worried, Angry, Tense and Disgusted hold back the voice's brow raises (Angry keeps 30 % of them). Surprised "
+    "drops the jaw a little (about 3 degrees in a pause) and Afraid parts the lips (about 2), under the speech's own jaw "
+    "and scaled by Mouth opening as it is; where the lips close for p, b and m that jaw goes (with Lip closing at 0, p, "
+    "b and m left out, it stays). A blink "
+    "still shuts over any feeling, and the lips still close for p, b and m.\n\n"
+    "One feeling for the whole voice (From the voice: one for each stretch of it): it isn't keyed on the timeline (another picked while it plays comes in over "
+    "about half a second from then on, but nothing is recorded).\n\n"
+    "Faith's own smile pose turns the mouth's "
+    "corners much more than Gabriel's (41 degrees at its fullest, against 16), and women on the woman's skeleton take "
+    "Faith's poses too: if it looks too much, lower the strength. Works on Faith, KrugerSec and people with full face "
+    "bones.";
+
+  // [SMILE] The (?) text of "Smile comes and goes" (VoiceFeel.h: SmileTimes, SmileFactor)
+  char const* const VoiceSmileHelp = "How much a smile (Happy's, Tender's, a little of Calm's, and the voice's own Happy "
+    "with From the voice) comes and goes with the speech, instead of being held at its fullest all through. At 1 it "
+    "rises a little before the speech, is at its fullest for 4 s at most, then eases to 85 % over a second while the "
+    "speech goes on; a phrase that begins after that brings it back up; after the speech (a pause of a second or "
+    "more) it eases down to half over three quarters of a second. 0: held at its fullest all through.\n\n"
+    "Why: smiles that are felt last about half a second to 4 s and come and go gradually, and in a study of smiles on "
+    "made-up faces a smile held at its fullest about 5 s looked more fake than a short one (Krumhuber and Kappas "
+    "2005). Those were smiles alone, with no speech; the times and levels here are designed within what it found. "
+    "Contempt's one-sided smirk isn't counted as a smile and stays as it is.";
+
+  // [EMOTION] The (?) texts of "From the voice" and of its sureness (VoiceEmotion.h / .cpp, EmotionHelper.exe;
+  // Research_Pose_Editor section 32)
+  char const* const VoiceEmotionHelp = "The feeling read from the voice itself, stretch by stretch (each phrase; one "
+    "over 6 s in parts of 3 - 4.5 s), over the feeling picked. A trained model hears it: audeering's wav2vec2 "
+    "emotion model, with a small part trained on the RAVDESS actors' recordings, gives the chances of 8 feelings: "
+    "neutral, calm, happy, sad, angry, fearful, disgust and surprised, shown as Calm, Happy, Sad, Angry, Afraid, "
+    "Disgusted and Surprised (neutral keeps the feeling picked; Tender, Worried, Tense and Contempt are only ever "
+    "set by hand). A phrase under 3 s is heard with the voice around it, 3 s in all. A short phrase that begins inside "
+    "what the phrases before it are heard as joins them: together they are heard as one (3 s around them, or their "
+    "whole span once that is longer, under 6 s) and share its reading, each keeping its own row and setting in the "
+    "list (heard apart, nearly the same 3 s could be heard as two different feelings). A short phrase that begins later "
+    "starts a window of its own, which the next ones can join; a phrase of 3 s or more is heard by itself.\n\n"
+    "It is an optional download (about 660 MB; CC BY-NC-SA 4.0, for non-commercial use only, and its makers ask that "
+    "it be used for research only): EmotionHelper.exe and emotion_feel.onnx in Cinematic Tools\\EmotionModel. It "
+    "runs outside the game at idle priority on 2 CPU threads, once for each voice, with about 1.7 GB of memory while "
+    "it runs. It takes about 1.2 s to start, then about 1.5 - 1.9 s for each 10 s it hears with the game closed (up "
+    "to about 2.9 s while the game runs; times vary with the PC): the time goes by the seconds it hears. It doesn't "
+    "start while Windows has under about 5.7 GB of memory "
+    "left to give, and stops if that falls under 2 GB (the game ends itself when Windows has none left): Try again "
+    "then. What it heard is kept in EmotionModel\\cache, so the same voice is read once (and taken at once, even while "
+    "another voice is being read).\n\n"
+    "How right it is, measured on short acted studio recordings it never heard, one whole recording at a time (each "
+    "actor saying the same few sentences): English actors 77 % (about 9 in 10 when it is 80 % sure or more), German "
+    "actors 54 %. How right it is on game dialogue or your own recordings isn't known. Its most common slips "
+    "over both: sad heard as calm, fearful as surprised, angry as happy. So a stretch's feeling shows only as far as "
+    "the model is sure of it and the rest of the face keeps the feeling picked (Sureness needed); any stretch can be "
+    "set by hand in the list below. The voice's own Happy, Angry, Afraid, Surprised and Disgusted show a little "
+    "stronger (up to 1.15 times) when it is more stirred up, a little weaker (down to 0.85) when it is calmer (the "
+    "feeling picked under them as it is).\n\n"
+    "The face changes over about half a second around where a stretch begins (and across a loop's end, for a voice "
+    "of 0.6 s or more), a stretch "
+    "set by hand or the sureness changed comes in over the same time, and the same time in the voice always gives "
+    "the same face (scrubbed, looped, played slow).";
+  char const* const VoiceSureHelp = "The model's chance (0 - 1) at which a stretch's feeling starts to show; it is "
+    "all there 0.4 above it, or at a chance of 1 where that comes first (so a stretch the model is fully sure of, a "
+    "chance of 1, always shows fully; from 0.60 up only that one does). Lower: more of the voice's feelings show, more of them wrong. Measured on English actors it never heard, "
+    "the mean over its 8 feelings (a neutral voice keeping the feeling picked counts as right): at 0.30, 72 % of the "
+    "face shows the right feeling and 13 % a wrong one; at 0.45, 65 % and 8 %; at 0.55, 57 % and 5 %; at 0.70, 48 % "
+    "and 3 %; at 0.95, 26 % and 1 %; the rest keeps the feeling picked. On German actors: at 0.55, 44 % and 18 %; at "
+    "0.70, 38 % and 11 %.";
+
+  // A sound file being read: one at a time, on a thread of its own
+  struct VoiceLoad
+  {
+    std::mutex Mutex;
+    bool Done = false;
+    std::shared_ptr<voice::Sound const> Sound;
+    std::string Error;
+    int HeldId = 0;                          // the held pose it's for (Held::Id)
+    std::string File;                        // its file's name (UTF-8)
+  };
+  std::shared_ptr<VoiceLoad> g_VoiceLoad;
+  std::vector<std::wstring> g_VoiceFiles;    // the folder's sound files
+  ULONGLONG g_VoiceFilesListedAt = 0;
+  char g_VoiceMessage[400] = "";
+
+  void ListVoiceFiles()
+  {
+    g_VoiceFiles.clear();
+    CreateDirectoryW(L"Cinematic Tools", nullptr);
+    CreateDirectoryW(VoiceFolderW, nullptr);
+    WIN32_FIND_DATAW data;
+    for (wchar_t const* kind : VoiceKinds)
+    {
+      std::wstring pattern = std::wstring(VoiceFolderW) + kind;
+      HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+      if (find != INVALID_HANDLE_VALUE)
+      {
+        do
+        {
+          if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            g_VoiceFiles.push_back(data.cFileName);
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+      }
+    }
+    std::sort(g_VoiceFiles.begin(), g_VoiceFiles.end());
+    // (a pattern of three letters also finds longer endings that begin with them: each file once)
+    g_VoiceFiles.erase(std::unique(g_VoiceFiles.begin(), g_VoiceFiles.end()), g_VoiceFiles.end());
+  }
+
+  // A file read on a thread of its own (the menu and the game go on), handed over by KeepVoiceLoad
+  void StartVoiceLoad(Held const& h, std::wstring const& file)
+  {
+    if (g_VoiceLoad)
+      return;
+    auto job = std::make_shared<VoiceLoad>();
+    job->HeldId = h.Id;
+    job->File = Utf8Of(file);
+    std::wstring path = std::wstring(VoiceFolderW) + L"\\" + file;
+    g_VoiceLoad = job;
+    _snprintf_s(g_VoiceMessage, sizeof(g_VoiceMessage), _TRUNCATE, "Reading %s...", job->File.c_str());
+    std::thread([job, path]
+    {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      std::string error;
+      std::shared_ptr<voice::Sound const> sound;
+      try
+      {
+        sound = voice::Load(path, error);
+      }
+      catch (...)
+      {
+        sound.reset();
+        error = "couldn't be read (out of memory?)";
+      }
+      std::lock_guard<std::mutex> lock(job->Mutex);
+      job->Sound = sound;
+      job->Error = error;
+      job->Done = true;
+    }).detach();
+  }
+
+  // What the player has to say (from its own thread), into CT.log
+  void VoicePlayerLog(const char* text)
+  {
+    util::log::Write("Pose: the voices' player: %s", text ? text : "");
+  }
+
+  // The voice taken off a held pose: its sound stops
+  void RemoveVoice(Held& h)
+  {
+    if (h.Voice.Player >= 0)
+      voice_player::Close(h.Voice.Player);
+    voice_emotion::Cancel(h.Voice.Emotion);   // [EMOTION] (a reading still going is stopped)
+    h.Voice = VoicePlay();
+  }
+
+  // A finished read handed to its held pose (under g_Mutex)
+  void KeepVoiceLoad()
+  {
+    if (!g_VoiceLoad)
+      return;
+    std::shared_ptr<voice::Sound const> sound;
+    std::string error, file;
+    int heldId = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_VoiceLoad->Mutex);
+      if (!g_VoiceLoad->Done)
+        return;
+      sound = g_VoiceLoad->Sound;
+      error = g_VoiceLoad->Error;
+      file = g_VoiceLoad->File;
+      heldId = g_VoiceLoad->HeldId;
+    }
+    g_VoiceLoad.reset();
+    if (!sound)
+    {
+      _snprintf_s(g_VoiceMessage, sizeof(g_VoiceMessage), _TRUNCATE, "%s: %s", file.c_str(), error.c_str());
+      util::log::Warning("Pose: the voice %s: %s", file.c_str(), error.c_str());
+      return;
+    }
+    util::log::Write("Pose: voice read: %s%s%s", sound->Report.c_str(), sound->Warning.empty() ? "" : "; check: ",
+      sound->Warning.c_str());
+    if (util::DiagnosticsOn() && !sound->MouthNotes.empty())
+      util::log::Write("Pose: voice %s: its mouth analysis: %.900s", file.c_str(), sound->MouthNotes.c_str());
+    Held* held = nullptr;
+    for (int i = 0; i < MaxHeld && !held; ++i)
+      if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Id == heldId)
+        held = &g_Held[i];
+    if (!held)
+    {
+      _snprintf_s(g_VoiceMessage, sizeof(g_VoiceMessage), _TRUNCATE, "%s was read, but its pose was let go meanwhile",
+        file.c_str());
+      return;
+    }
+    Held& h = *held;
+    // The new voice keeps the old one's settings (its clock, its amounts): another take of the same line
+    VoicePlay keep = h.Voice;
+    bool had = keep.Sound != nullptr;
+    // [REVIEW] The same sound read again (its samples the same: compared on the game's thread, measured offline at
+    // about 0.5 - 1.5 ms for a minute of 44.1 kHz stereo, 7 - 15 ms for ten, about 20 ms at the decoder's 128M-sample
+    // cap). [CARRY] Its feeling's reading under way (its helper's turn come) or done, not taken yet, goes on: not
+    // stopped by the Remove below and begun again from nothing. [REVIEW] Not one still waiting for its turn: it holds
+    // the earlier read's own samples, a second copy of them (up to about 256 MB) for as long as another voice's
+    // reading runs, and it has heard nothing yet (stopped, it is begun again on this read's sound, the same key)
+    bool samePcm = had && keep.Sound->File == sound->File && keep.Sound->Pcm && sound->Pcm &&
+      keep.Sound->Rate == sound->Rate && keep.Sound->Channels == sound->Channels && *keep.Sound->Pcm == *sound->Pcm;
+    bool carryReading = false;
+    if (samePcm && keep.Emotion && !keep.EmotionReadings)
+    {
+      voice_emotion::State state = voice_emotion::StatusOf(*keep.Emotion).Now;
+      carryReading = state == voice_emotion::Running || state == voice_emotion::Done;
+      if (carryReading)
+        h.Voice.Emotion.reset();
+    }
+    RemoveVoice(h);
+    VoicePlay& v = h.Voice;
+    if (had)
+    {
+      v.Loop = keep.Loop;
+      v.Clock = keep.Clock;
+      v.Start = keep.Start;
+      v.Heard = keep.Heard;
+      v.Volume = keep.Volume;
+      v.Jaw = keep.Jaw;
+      v.Lips = keep.Lips;
+      v.Closure = keep.Closure;
+      v.Smoothing = keep.Smoothing;
+      v.Life = keep.Life;
+      v.Blinks = keep.Blinks;
+      v.Brows = keep.Brows;
+      v.Head = keep.Head;
+      v.Lead = keep.Lead;
+      // [ALIVE]
+      v.Take = keep.Take;
+      v.LookAway = keep.LookAway;
+      v.Eyes = keep.Eyes;
+      v.HoldGaze = keep.HoldGaze;
+      v.Feel = keep.Feel;
+      v.FeelStrength = keep.FeelStrength;
+      v.FeelFollow = keep.FeelFollow;
+      v.FeelUneven = keep.FeelUneven;
+      v.FeelLeftStronger = keep.FeelLeftStronger;
+      v.FeelComes = keep.FeelComes;   // [SMILE]
+      v.FeelAuto = keep.FeelAuto;   // [EMOTION]
+      v.FeelSure = keep.FeelSure;
+    }
+    else
+      v.Take = 1 + (h.Id > 0 ? (h.Id - 1) % 99 : 0);   // [ALIVE] (two characters given the same line get takes of their own)
+    // [ALIVE] The new voice's face starts with the feeling picked as it is, not blended in from none
+    for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+      v.FeelWeights[f] = f == (v.Feel >= 0 && v.Feel < voice_feel::FeelingCount ? v.Feel + 1 : 0) ? 1.f : 0.f;
+    v.FeelStrengthNow = v.FeelStrength;
+    v.Sound = sound;
+    voice_feel::SmileTimesOf(sound->LifeDebug, v.SmileTimes);   // [SMILE]
+    // [EMOTION] Its stretches for the feeling read from the voice (the analysis' phrases, long ones in parts); the
+    // stretches set by hand are kept when the same file is read again and gives the same stretches
+    {
+      double seconds = sound->Pcm && sound->Channels > 0 && sound->Rate > 0 ?
+        (double)(sound->Pcm->size() / (size_t)sound->Channels) / sound->Rate : 0.0;
+      v.EmotionStretches = voice_emotion::StretchesOf(sound->LifeDebug.PhraseFrom, sound->LifeDebug.PhraseTo, seconds);
+      bool same = had && keep.Sound && keep.Sound->File == sound->File &&
+        keep.EmotionStretches.size() == v.EmotionStretches.size() && keep.FeelSetting.size() == v.EmotionStretches.size();
+      for (size_t i = 0; same && i < v.EmotionStretches.size(); ++i)
+        same = keep.EmotionStretches[i].From == v.EmotionStretches[i].From &&
+          keep.EmotionStretches[i].To == v.EmotionStretches[i].To;
+      v.FeelSetting = same ? keep.FeelSetting : std::vector<int>(v.EmotionStretches.size(), voice_emotion::FromVoice);
+      // [REVIEW] The same sound read again carries its reading, the voice's share and the looks as shown over: no
+      // jump, no new reading
+      bool sameSound = same && samePcm;
+      if (sameSound && keep.EmotionReadings && keep.EmotionReadings->size() == v.EmotionStretches.size())
+      {
+        v.Emotion = keep.Emotion;
+        v.EmotionReadings = keep.EmotionReadings;
+        v.FeelAutoNow = keep.FeelAutoNow;
+        v.FeelLooks = keep.FeelLooks;
+        v.FeelLooksFor = keep.FeelLooksFor;
+      }
+      // [CARRY] ... and a reading still going, for the same stretches (else it is stopped now)
+      if (carryReading)
+      {
+        bool sameHeard = sameSound;
+        for (size_t i = 0; sameHeard && i < v.EmotionStretches.size(); ++i)
+          sameHeard = keep.EmotionStretches[i].HeardFrom == v.EmotionStretches[i].HeardFrom &&
+            keep.EmotionStretches[i].HeardTo == v.EmotionStretches[i].HeardTo;
+        if (sameHeard)
+          v.Emotion = keep.Emotion;
+        else
+          voice_emotion::Cancel(keep.Emotion);
+      }
+    }
+    pose_skeletons::Skeleton const& s = pose_skeleton_live::At(h.Skeleton);
+    // The mouth's bones, where the pose taken has them (all of them held, or none are moved)
+    bool rig = voice_face::FindRig(h.Bones, s.Names, h.Parents, &h.Base[0][0], v.Rig);
+    if (rig)
+    {
+      int const* bones[] = { &v.Rig.Jaw, &v.Rig.Lower[0], &v.Rig.Lower[1], &v.Rig.Lower[2], &v.Rig.Upper[0], &v.Rig.Upper[1],
+        &v.Rig.Upper[2], &v.Rig.Corner[0], &v.Rig.Corner[1] };
+      for (int const* bone : bones)
+        if (*bone < 0 || *bone >= h.Bones || !h.InHeld[*bone])
+          rig = false;
+      if (!rig)
+        v.Rig.Ok = false;
+    }
+    // The eyelids, the eyebrows and the head: each part by itself, and a part only if every one of its bones is held
+    // (a bone this body's rig has no channel for stays the game's: with one lid bone of four the blink would be a
+    // wink, with five brow bones of six a lopsided raise). The fold bones and Neck1 are extras: left out one by one.
+    voice_face::LifeRig& r = v.LifeRig;
+    bool life = voice_face::FindLifeRig(h.Bones, s.Names, h.Parents, &h.Base[0][0], r);
+    if (life)
+    {
+      auto held = [&](int bone) { return bone >= 0 && bone < h.Bones && h.InHeld[bone]; };
+      r.Eyes = r.Eyes && held(r.UpLid[0]) && held(r.UpLid[1]) && held(r.LowLid[0]) && held(r.LowLid[1]);
+      for (int k = 0; k < 6; ++k)
+        r.Brows = r.Brows && held(r.Brow[k]);
+      for (int k = 0; k < 4; ++k)
+        if (!held(r.Fold[k]))
+          r.Fold[k] = -1;
+      r.Head = r.Head && held(r.HeadBone);
+      if (!held(r.Neck1))
+        r.Neck1 = -1;
+      // [ALIVE] The eyes: both eye bones held, or neither is turned (one eye looking away alone would be a squint)
+      if (!held(r.EyeBone[0]) || !held(r.EyeBone[1]))
+        r.EyeBone[0] = r.EyeBone[1] = -1;
+      life = r.Ok = r.Eyes || r.Brows || r.Head;
+    }
+    // [ALIVE] The feeling's bones (the game's own face poses: Faith's library for Faith and the woman's skeleton, the
+    // man's for everyone else; VoiceFeelFace)
+    int feelLibrary = voice_feel_tables::LibraryMan;
+    // [REVIEW 6] (not minding the case: a skeleton made from the game's own names keeps the game's spelling. A woman
+    // in heels has the men's skeleton table and takes the man's library: which one looks right on her isn't known)
+    if (s.Asset && (!_stricmp(s.Asset, "characters/skeletons/skeleton_faith") || !_stricmp(s.Asset, "characters/skeletons/skeleton_female")))
+      feelLibrary = voice_feel_tables::LibraryFaith;
+    bool feel = voice_face::FindFeelRig(h.Bones, s.Names, h.Parents, &h.Base[0][0], feelLibrary, v.FeelRig);
+    v.On = true;
+    v.Playing = false;
+    v.Time = 0.0;
+    // The player: told once where to write what happens to it (the audio opened, lost), and to be heard only while
+    // the game's window is in front, like the tools' rain and thunder
+    static bool playerSetUp = false;
+    if (!playerSetUp)
+    {
+      playerSetUp = true;
+      voice_player::SetLog(&VoicePlayerLog);
+      voice_player::SetFocusWindow((void*)g_gameHwnd);
+    }
+    if (sound->Pcm && !sound->Pcm->empty())
+      v.Player = voice_player::Open(sound->Pcm, sound->Rate, sound->Channels);
+    // (the lids' arrangement: the game keeps the lid bones on the lid's edge or at the eye's middle, and the blink
+    // is made for each; which one this body had when its pose was taken is worth knowing when a blink looks wrong)
+    // (the face's own directions are taken from the Face bone, both eye bones and HeadEnd: without them, Face stays
+    // -1 and none of the three parts can be made, the head included)
+    // (the rig's details are research: only with [Debug] Diagnostics on; a body with no Face bone is always told)
+    if (r.Face < 0)
+      util::log::Write("Pose: voice %s on %s 0x%I64X: for blinks, brow raises and head movement: no Face bone with both "
+        "eye bones and HeadEnd that the tools can use: none of them", file.c_str(), h.Label, h.Entity);
+    else if (util::DiagnosticsOn())
+      util::log::Write("Pose: voice %s on %s 0x%I64X: for blinks, brow raises and head movement: its eyelids %s%s, its "
+        "eyebrows %s, its head %s%s", file.c_str(), h.Label, h.Entity, life && r.Eyes ? "found" : "not found or not held",
+        !(life && r.Eyes) ? "" : (r.LidOnEdge[0] && r.LidOnEdge[1] ? " (lid bones on the lids' edges)" :
+        (!r.LidOnEdge[0] && !r.LidOnEdge[1] ? " (lid bones at the eyes' middles)" : " (lid bones: one eye on the edge, one at the middle)")),
+        life && r.Brows ? "found" : "not found or not held", life && r.Head ? "found" : "not found or not held",
+        life && r.Head ? (r.Neck1 >= 0 ? " (with Neck1)" : " (without Neck1)") : "");
+    // [ALIVE] (the eyes; the feeling's poses, whose library, the face's size against it, its bones found and held)
+    if (util::DiagnosticsOn() && r.Face >= 0)
+      util::log::Write("Pose: voice %s on %s 0x%I64X: for the living face's eyes: %s; for the feeling: %s", file.c_str(),
+        h.Label, h.Entity, life && r.EyeBone[0] >= 0 ? "both eye bones found and held" : "the eye bones not found or not held",
+        feel ? "found" : "no face it can be laid on");
+    if (util::DiagnosticsOn() && feel)
+    {
+      // (how many of the feeling's bones this skeleton has, and how many of them this pose holds: the others stay
+      // the game's)
+      int feelBones = 0, feelHeld = 0;
+      for (int b = 0; b < voice_feel_tables::BoneCount; ++b)
+        if (v.FeelRig.Bone[b] >= 0)
+        {
+          ++feelBones;
+          if (v.FeelRig.Bone[b] < h.Bones && h.InHeld[v.FeelRig.Bone[b]])
+            ++feelHeld;
+        }
+      util::log::Write("Pose: voice %s on %s 0x%I64X: the feeling: the game's face poses of %s's library, the face %.2f times "
+        "its size, %d of the poses' %d bones on this skeleton, %d of them held (lid bones %s)", file.c_str(), h.Label,
+        h.Entity, voice_feel_tables::Libraries[v.FeelRig.Library].Name, v.FeelRig.Scale, feelBones, voice_feel_tables::BoneCount,
+        feelHeld, v.FeelRig.Life.LidOnEdge[0] && v.FeelRig.Life.LidOnEdge[1] ? "on the lids' edges" :
+        (!v.FeelRig.Life.LidOnEdge[0] && !v.FeelRig.Life.LidOnEdge[1] ? "at the eyes' middles" : "one eye on the edge, one at the middle"));
+    }
+    // (the analysis' figures are research, only with Diagnostics on; its one-line note is always written)
+    if (util::DiagnosticsOn() && !sound->LifeNotes.empty())
+      util::log::Write("Pose: voice %s: its analysis for blinks, brows and head: %.700s%s%.300s", file.c_str(),
+        sound->LifeNotes.c_str(), sound->LifeNote.empty() ? "" : "; note: ", sound->LifeNote.c_str());
+    else if (!sound->LifeNote.empty())
+      util::log::Write("Pose: voice %s: %.300s", file.c_str(), sound->LifeNote.c_str());
+    util::log::Write("Pose: voice %s on %s 0x%I64X: %s; the sound %s", file.c_str(), h.Label, h.Entity,
+      rig ? "its mouth's bones found (the jaw, six lip bones, two corners)" :
+      "this character has no mouth bones the tools know: no mouth moves",
+      v.Player >= 0 ? "has a place in the player" :
+      "has no place in the player (all its places are taken, or it is of a kind the player doesn't take): no sound is heard");
+    g_VoiceMessage[0] = 0;
+  }
+
+  // Whether a voice's time is being moved on by its clock now (not standing, not set by hand)
+  bool VoiceClockMoves(Held const& h)
+  {
+    VoicePlay const& v = h.Voice;
+    if (!v.Sound || !v.On)
+      return false;
+    if (v.Clock == VoiceTrackTime)
+      return h.KeyTrackMoving;
+    if (v.Clock != VoiceKeysTime)
+      return v.Playing;
+    // The keyframes' playhead: moved on by its own clock only while there are keyframes (KeepKeys), whether or not
+    // they drive their bones
+    if (h.Keys.Channels.empty() || !h.Keys.Playing)
+      return false;
+    if (h.Keys.Clock == pose_keys::Clock_Track)
+      return h.KeyTrackMoving;
+    if (h.Keys.Clock == pose_keys::Clock_Clip)
+      return ClipUsable(h) && h.Clip.Playing;
+    return true;
+  }
+
+  // [ALIVE] The living face's settings that aren't in the analysis' own files
+  const ULONGLONG AliveSettleMs = 300;       // a take is made again once the take or looks-away slider rests this long
+  const float InhaleOpen = 0.15f;            // [d] (VoiceAlive's research) the jaw opens this share of its way for a breath in
+  const float FrownAu4 = 0.65f;              // [d] VoiceAlive's frown (thinking, a loud low stress) at 1 as the game's
+                                             // brow lowerer at 0.65: its inner brow 2.7 mm down, 3.3 mm in (the
+                                             // research's design: 2.5 - 3 mm down at 1)
+  const float FeelChangeSeconds = 0.6f;      // [d] a feeling picked comes in over this, the one before goes out
+  const float FeelStrengthSeconds = 0.2f;    // [d] the strength as shown follows the one set with this time constant
+
+  // [ALIVE] This character's take of the living face made from the sound's analysis (about 1.5 ms for 30 s of sound,
+  // measured offline; the game's thread)
+  void MakeAlive(Held& h)
+  {
+    VoicePlay& v = h.Voice;
+    v.AliveTake = v.Take;
+    v.AliveLookAway = v.LookAway;
+    v.Alive.reset();
+    v.AliveFound.clear();
+    if (!v.Sound || v.Sound->LifeTrack.Frames.empty())
+      return;
+    voice_alive::Settings settings;
+    settings.LookAway = !(v.LookAway > 0.f) ? 0.f : (v.LookAway > 2.f ? 2.f : v.LookAway);
+    settings.Variation = v.Take;
+    std::shared_ptr<voice_alive::Track> track;
+    std::string error;
+    // (its time is measured for the diagnostic line only: [Debug] Diagnostics on)
+    bool timed = util::DiagnosticsOn();
+    LARGE_INTEGER from{}, to{}, rate{};
+    if (timed)
+      QueryPerformanceCounter(&from);
+    bool ok = false;
+    try
+    {
+      track = std::make_shared<voice_alive::Track>();
+      ok = voice_alive::Make(v.Sound->LifeTrack, v.Sound->LifeDebug, settings, *track, error);
+    }
+    catch (...)
+    {
+      ok = false;
+      error = "not enough memory";
+    }
+    if (timed)
+    {
+      QueryPerformanceCounter(&to);
+      QueryPerformanceFrequency(&rate);
+    }
+    if (!ok || !track || track->Frames.empty())
+    {
+      v.AliveFound = "the living face couldn't be worked out" + (error.empty() ? std::string() : " (" + error + ")");
+      util::log::Warning("Pose: voice %s on %s 0x%I64X: take %d: %s", v.Sound->File.c_str(), h.Label, h.Entity, v.Take,
+        v.AliveFound.c_str());
+      return;
+    }
+    v.Alive = track;
+    // The menu's line, from the take's own report ("name: value" lines)
+    std::string report = track->Report, line;
+    auto value = [&](char const* name) -> std::string
+    {
+      std::string key = std::string(name) + ": ";
+      size_t at = report.find(key);
+      if (at == std::string::npos || (at > 0 && report[at - 1] != '\n'))
+        return std::string();
+      size_t end = report.find('\n', at);
+      return report.substr(at + key.size(), end == std::string::npos ? std::string::npos : end - at - key.size());
+    };
+    std::string blinks = value("blinks"), partial = value("partial blinks"), aways = value("looks away");
+    std::string share = value("share of the speaking time looking away"), scans = value("small saccades (scan, away, back)");
+    if (!blinks.empty())
+      line = blinks + (blinks == "1" ? " blink" : " blinks") + (partial.empty() || partial == "0" ? "" : " (" + partial + " part way)");
+    if (!aways.empty())
+    {
+      line += (line.empty() ? "" : ", ") + aways + (aways == "1" ? " look away" : " looks away");
+      double shareValue = share.empty() ? -1.0 : atof(share.c_str());
+      if (shareValue > 0.0)
+      {
+        char text[64];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, " (%.0f %% of the speaking time)", 100.0 * shareValue);
+        line += text;
+      }
+    }
+    if (!scans.empty())
+      line += (line.empty() ? "" : ", ") + scans + (scans == "1" ? " small eye movement" : " small eye movements");
+    v.AliveFound = line;
+    if (!timed)
+      return;
+    double ms = rate.QuadPart > 0 ? 1000.0 * (double)(to.QuadPart - from.QuadPart) / (double)rate.QuadPart : 0.0;
+    std::string oneLine;
+    for (char c : report)
+      oneLine += c == '\n' ? std::string("; ") : (c == '\r' ? std::string() : std::string(1, c));
+    util::log::Write("Pose: voice %s on %s 0x%I64X: take %d of its living face (looks away x%.2f) made in %.1f ms: %.900s",
+      v.Sound->File.c_str(), h.Label, h.Entity, v.Take, settings.LookAway, ms, oneLine.c_str());
+  }
+
+  // [ALIVE] The living face at a time into the sound, each value cut within its stated limits (VoiceAlive.h; the take
+  // keeps them itself, measured: its guard changed nothing on 796 files): nothing else can reach a bone
+  voice_alive::Frame AliveAt(voice_alive::Track const& track, double seconds)
+  {
+    voice_alive::Frame f = voice_alive::At(track, seconds);
+    auto cut = [](float x, float lo, float hi) { return !(x == x) ? 0.f : (x < lo ? lo : (x > hi ? hi : x)); };
+    f.GazeYaw = cut(f.GazeYaw, -voice_alive::MaxGazeYaw, voice_alive::MaxGazeYaw);
+    f.GazePitch = cut(f.GazePitch, -voice_alive::MaxGazeUp, voice_alive::MaxGazeDown);
+    f.LidFollow = cut(f.LidFollow, -voice_alive::MaxLidFollow, voice_alive::MaxLidFollow);
+    f.LidLift = cut(f.LidLift, -voice_alive::MaxLidLift, voice_alive::MaxLidLift);
+    f.BlinkLeft = cut(f.BlinkLeft, 0.f, 1.f);
+    f.BlinkRight = cut(f.BlinkRight, 0.f, 1.f);
+    f.BrowLeft = cut(f.BrowLeft, voice_alive::MinBrow, voice_alive::MaxBrow);
+    f.BrowRight = cut(f.BrowRight, voice_alive::MinBrow, voice_alive::MaxBrow);
+    f.Frown = cut(f.Frown, 0.f, 1.f);
+    f.InnerUp = cut(f.InnerUp, 0.f, 1.f);
+    f.Smile = cut(f.Smile, 0.f, 1.f);
+    f.Breath = cut(f.Breath, 0.f, 1.f);
+    f.Inhale = cut(f.Inhale, 0.f, 1.f);
+    f.Nod = cut(f.Nod, -voice_alive::MaxNodUp, voice_alive::MaxNodDown);
+    f.Turn = cut(f.Turn, -voice_alive::MaxTurn, voice_alive::MaxTurn);
+    f.Tilt = cut(f.Tilt, -voice_alive::MaxTilt, voice_alive::MaxTilt);
+    f.Energy = cut(f.Energy, 0.f, 1.f);
+    return f;
+  }
+
+  // [ALIVE] The feeling as shown this frame: its weights moved towards the one picked, the strength eased to the one
+  // set, and the shape of that mix of presets at the voice's energy (VoiceFeel::ShapeOf)
+  voice_face::FeelShape FeelShapeNow(VoicePlay& v, double at, float dt)
+  {
+    int picked = v.Feel >= 0 && v.Feel < voice_feel::FeelingCount ? v.Feel + 1 : 0;
+    float step = !(dt > 0.f) ? 0.f : (dt > 0.1f ? 0.1f : dt);
+    float sum = 0.f;
+    // [STEADY CHANGE] The weights move so they keep summing to 1: the one picked up by step / FeelChangeSeconds, the
+    // others down by the same in all, each by its share. Before, each went down by the whole step, so a feeling
+    // picked while another change was going left them summing to under 1, and shown as shares (divided by their sum)
+    // the face moved up to 3.8 times faster than a change should (measured by the review: a pick 0.3 s into a change
+    // moved 0.105 of the face in one frame at 60 fps, against 0.028). With one other weight (a plain change), the
+    // same arithmetic as before.
+    int others = 0;
+    float rest = 0.f;
+    for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+    {
+      float w = v.FeelWeights[f];
+      if (!(w > 0.f) || !(w <= 1.f))
+        v.FeelWeights[f] = w = !(w > 0.f) ? 0.f : 1.f;
+      if (f != picked && w > 0.f)
+      {
+        ++others;
+        rest += w;
+      }
+    }
+    if (others <= 1)
+      for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+      {
+        float w = v.FeelWeights[f] + (f == picked ? 1.f : -1.f) * step / FeelChangeSeconds;
+        v.FeelWeights[f] = !(w > 0.f) ? 0.f : (w > 1.f ? 1.f : w);
+      }
+    else
+    {
+      // (as shares of their sum, which then stays 1)
+      float total = rest + v.FeelWeights[picked];
+      float up = step / FeelChangeSeconds;
+      float p = v.FeelWeights[picked] / total, others0 = rest / total;
+      float p1 = p + up < 1.f ? p + up : 1.f;
+      float k = others0 > 0.f ? (1.f - p1) / others0 : 0.f;
+      for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+        v.FeelWeights[f] = f == picked ? p1 : v.FeelWeights[f] / total * k;
+    }
+    for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+      sum += v.FeelWeights[f];
+    if (!(sum > 0.f))
+    {
+      for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+        v.FeelWeights[f] = f == picked ? 1.f : 0.f;
+      sum = 1.f;
+    }
+    float strength = !(v.FeelStrength > 0.f) ? 0.f : (v.FeelStrength > 2.f ? 2.f : v.FeelStrength);
+    if (!(v.FeelStrengthNow == v.FeelStrengthNow))
+      v.FeelStrengthNow = strength;
+    float ease = step / FeelStrengthSeconds;
+    v.FeelStrengthNow += (strength - v.FeelStrengthNow) * (ease > 1.f ? 1.f : ease);
+    // [EMOTION] The feeling read from the voice, over the one picked: each stretch's look (the feeling picked as it
+    // is shown now, with the voice's feeling over it as far as the model is sure of it, or the stretch's own setting),
+    // mixed by the voice's time (the same time always gives the same face: scrubbed, played slow; looped on its own
+    // clock, the last stretch changes into the first across the loop's end). [REVIEW] Each look is eased towards what
+    // it is now (a stretch's setting or the sureness changed comes in over FeelChangeSeconds), and the voice's share
+    // eases in and out when it's turned on or off or its reading arrives. shown: the presets' weights; units: the
+    // weights their units are laid with (the voice's lively feeling's own part scaled by the voice's arousal)
+    const int count = voice_feel::FeelingCount + 1;
+    float shown[count], units[count];
+    for (int f = 0; f < count; ++f)
+      shown[f] = units[f] = v.FeelWeights[f] / sum;
+    v.FeelVoiceShareNow = 0.f;
+    v.FeelStretchWeightNow = 0.f;
+    {
+      float target = v.FeelAuto && v.EmotionReadings ? 1.f : 0.f;
+      float move = step / FeelChangeSeconds;
+      float before = v.FeelAutoNow;   // [FIX CHECK] (0: the looks weren't shown: made anew, not eased from what they were)
+      if (!(v.FeelAutoNow == v.FeelAutoNow))
+        v.FeelAutoNow = target;
+      v.FeelAutoNow = v.FeelAutoNow < target ? (v.FeelAutoNow + move < target ? v.FeelAutoNow + move : target) :
+        (v.FeelAutoNow - move > target ? v.FeelAutoNow - move : target);
+      size_t n = v.EmotionStretches.size();
+      if (v.FeelAutoNow > 0.f && v.EmotionReadings && v.EmotionReadings->size() == n)
+      {
+        bool fresh = v.FeelLooks.size() != n || v.FeelLooksFor != (void const*)v.EmotionReadings.get() || !(before > 0.f);
+        v.FeelLooks.resize(n);
+        v.FeelLooksFor = v.EmotionReadings.get();
+        for (size_t i = 0; i < n; ++i)
+        {
+          voice_emotion::Look want = voice_emotion::LookOf(&(*v.EmotionReadings)[i], i < v.FeelSetting.size() ?
+            v.FeelSetting[i] : voice_emotion::FromVoice, v.FeelWeights, v.FeelSure);
+          voice_emotion::Look& look = v.FeelLooks[i];
+          if (fresh)
+          {
+            look = want;
+            continue;
+          }
+          // The same part of the way for every weight (they still sum to 1), none moving more than move a frame
+          float gap = 0.f;
+          for (int f = 0; f < count; ++f)
+          {
+            gap = fmaxf(gap, fabsf(want.Weights[f] - look.Weights[f]));
+            gap = fmaxf(gap, fabsf(want.Units[f] - look.Units[f]));
+          }
+          if (!(gap > move))
+          {
+            look = want;   // (caught up: exactly what it is, so a resting face is the same face)
+            continue;
+          }
+          float part = move / gap;
+          for (int f = 0; f < count; ++f)
+          {
+            look.Weights[f] += part * (want.Weights[f] - look.Weights[f]);
+            look.Units[f] += part * (want.Units[f] - look.Units[f]);
+          }
+          look.Share += part * (want.Share - look.Share);
+          look.Scale = want.Scale;
+          look.Shown = want.Shown;
+          look.ByHand = want.ByHand;
+        }
+        double loop = v.Loop && v.Clock == VoiceOwnTime && v.Sound && v.Sound->Seconds > 0.0 ? v.Sound->Seconds : 0.0;
+        float heard[count], heardUnits[count], share = 0.f, stretchWeight = 0.f;
+        int stretch = -1;
+        if (voice_emotion::MixAt(v.EmotionStretches, v.FeelLooks, at, FeelChangeSeconds, loop, heard, heardUnits, share,
+          stretch, stretchWeight))
+        {
+          float a = v.FeelAutoNow;
+          for (int f = 0; f < count; ++f)
+          {
+            shown[f] = (1.f - a) * shown[f] + a * heard[f];
+            units[f] = (1.f - a) * units[f] + a * heardUnits[f];
+          }
+          v.FeelStretchNow = stretch;
+          v.FeelStretchWeightNow = stretchWeight;
+          v.FeelVoiceShareNow = a * share;
+        }
+      }
+    }
+    // The presets mixed by their weights (none: no unit, every brow raise kept)
+    voice_feel::Preset mix{};
+    mix.Name = "";
+    mix.RaiseKeep = shown[0];
+    for (int f = 0; f < voice_feel::FeelingCount; ++f)
+    {
+      float w = shown[f + 1], wu = units[f + 1];
+      if (!(w > 0.f) && !(wu > 0.f))
+        continue;
+      voice_feel::Preset const& p = voice_feel::Presets[f];
+      for (int u = 0; u < voice_face::AuCount; ++u)
+      {
+        mix.Au[u] += wu * p.Au[u];
+        mix.RightOnly[u] += wu * p.RightOnly[u];
+      }
+      mix.Nod += wu * p.Nod;
+      mix.Tilt += wu * p.Tilt;
+      mix.RaiseKeep += w * p.RaiseKeep;
+      mix.Jaw += wu * p.Jaw;   // [JAW]
+    }
+    voice_feel::Settings settings;
+    settings.Strength = v.FeelStrengthNow;
+    settings.FollowVoice = v.FeelFollow;
+    settings.Asymmetry = v.FeelUneven;
+    settings.LeftStronger = v.FeelLeftStronger;
+    float energy = v.Sound ? voice_feel::EnergyAt(v.Sound->Energy, at) : 0.f;
+    // [SMILE] The smile's share now, by the voice's own time (looped on its own clock: across the loop's end)
+    double smileLoop = v.Loop && v.Clock == VoiceOwnTime && v.Sound && v.Sound->Seconds > 0.0 ? v.Sound->Seconds : 0.0;
+    float smile = voice_feel::SmileFactor(v.SmileTimes, at, smileLoop, v.FeelComes);
+    v.FeelSmileNow = smile;
+    // [JAW] [FIX CHECK] The closure a feeling's jaw goes by, taken over time: the most of JawClosure within FeelJawSpread
+    // frames either way, nearer ones counting more (read from the voice's own mouth curve at those times: no state, the
+    // same time always gives the same face)
+    float jawShut = -1.f;
+    v.FeelJawOn = mix.Jaw > 0.f && v.FeelStrengthNow > 0.f && v.Rig.Ok;
+    if (mix.Jaw > 0.f && v.Sound)
+    {
+      jawShut = 0.f;
+      for (int k = -voice_feel::FeelJawSpread; k <= voice_feel::FeelJawSpread; ++k)
+      {
+        float closed = k == 0 ? v.Shape.Closed : voice::MouthAt(*v.Sound, at + 0.01 * k, v.Smoothing).Closed;
+        float w = 1.f - (float)(k < 0 ? -k : k) / (float)(voice_feel::FeelJawSpread + 1);
+        float c = w * voice_feel::JawClosure(closed, v.Closure);
+        if (c > jawShut)
+          jawShut = c;
+      }
+    }
+    return voice_feel::ShapeOf(mix, settings, energy, v.Shape, v.Closure, smile, jawShut);
+  }
+
+  // Each frame for a held pose (KeepHeld, after its keyframes and its clip, before its locals are handed): its
+  // voice's time moved on by its clock, the mouth's shape at that time made the layer's offsets, and its sound asked
+  // for at that time.
+  void KeepVoice(Held& h)
+  {
+    VoicePlay& v = h.Voice;
+    v.Layer.Count = 0;
+    v.Shape = voice_face::Shape();
+    v.LifeShape = voice_face::LifeShape();
+    v.LifeEyesNow = v.LifeBrowsNow = v.LifeHeadNow = v.LifeTried = false;   // (set again below when the life moves the face)
+    v.LifeBlinkTaken = 1.f;
+    v.EyesNow = v.FeelNow = false;   // [ALIVE]
+    v.GazeNow[0] = v.GazeNow[1] = 0.f;
+    v.FeelKeep = 1.f;
+    v.FeelNod = v.FeelTilt = 0.f;
+    v.FeelStretchNow = -1;   // [EMOTION]
+    if (!v.Sound)
+      return;
+    // [EMOTION] The voice's feeling: read once it's wanted (EmotionHelper.exe, from a thread of the tools' own), and
+    // what it heard taken once it's there
+    if (v.FeelAuto && !v.Emotion && v.FeelRig.Ok && !v.EmotionStretches.empty() && voice_emotion::Available())
+      v.Emotion = voice_emotion::Start(v.Sound, v.EmotionStretches);
+    if (v.Emotion && !v.EmotionReadings)
+    {
+      voice_emotion::Status s = voice_emotion::StatusOf(*v.Emotion);
+      if (s.Now == voice_emotion::Done && s.Readings && s.Readings->size() == v.EmotionStretches.size())
+        v.EmotionReadings = s.Readings;
+    }
+    double length = v.Sound->Seconds;
+    double before = v.Time;
+    bool moves = VoiceClockMoves(h);
+    if (v.On)
+    {
+      if (v.Clock == VoiceKeysTime)
+        v.Time = h.Keys.Time - v.Start;
+      else if (v.Clock == VoiceTrackTime)
+        v.Time = (g_ClipTrackTime >= 0.0 ? g_ClipTrackTime : 0.0) - v.Start;
+      else if (GetTickCount64() - v.SetByHandAt < VoiceHandMs)
+        moves = false;   // its time is held in the menu (the slider, the picture): it waits there, silent
+      else if (v.Playing)
+      {
+        v.Time += g_ClipRealDt;
+        if (v.Time >= length)
+        {
+          if (v.Loop && length > 0.0)
+            v.Time = fmod(v.Time, length);
+          else
+          {
+            v.Time = length;
+            v.Playing = false;
+            moves = false;
+          }
+        }
+      }
+    }
+    if (!std::isfinite(v.Time))
+      v.Time = 0.0;
+    // Another clock that stands this frame (the game's time frozen under the keyframes): the voice stands
+    if (v.Clock != VoiceOwnTime && v.Time == before)
+      moves = false;
+
+    // Its pace against real time (1: as recorded), for the sound: its own clock is real time itself; another clock's
+    // is measured, the first frame's as it is and then over a fifth of a second. A jump (a loop, a cut) isn't a pace.
+    // The rate told to the player is held still while the measure stays within 1 % of it, and is exactly 1 within
+    // 2 % of real time: the player takes a new rate as a change of speed and chases harder (its pitch wobbles), and
+    // takes a clock a little off the told rate in its stride (measured offline: 3 % off stands 15 ms behind).
+    // The camera track is moved on AFTER pose_editor::Update (CameraManager::OnCameraUpdate), by that frame's own dt,
+    // 0.1 s at most: the step seen here was made over the frame before, so it is held against that frame's length.
+    // A frame over 0.1 s gives no pace (the track was held back in it: the player takes the jump), unless the frames
+    // stay that long (three in a row: a slow frame dump), where the track's pace really is that slow.
+    // The first pace taken is taken as it is (Paced), and none is taken from a time that wasn't this clock's the
+    // frame before (the voice was off, just read, or on another clock).
+    bool byTrack = v.Clock == VoiceTrackTime || (v.Clock == VoiceKeysTime && (h.Keys.Clock == pose_keys::Clock_Track ||
+      (h.Keys.Clock == pose_keys::Clock_Clip && h.Clip.Clock == ClipTrackTime)));
+    double real = byTrack ? g_ClipRealDtBefore : g_ClipRealDt;
+    if (!moves || v.Clock == VoiceOwnTime)
+    {
+      v.Pace = v.Rate = 1.f;
+      v.Paced = false;
+    }
+    else if (!v.WasOn || v.LastClock != v.Clock)
+      v.Paced = false;
+    else if (real > 0.0 && (!byTrack || real <= 0.1 || g_ClipLongFrames >= 3))
+    {
+      double pace = (v.Time - before) / real;
+      if (pace > 0.0 && pace < 8.0)
+      {
+        double share = v.Paced ? real / VoiceRateSeconds : 1.0;
+        if (share > 1.0)
+          share = 1.0;
+        v.Pace += (float)((pace - (double)v.Pace) * share);
+        float told = fabsf(v.Pace - 1.f) < 0.02f ? 1.f : v.Pace;
+        if (!v.Paced || told == 1.f || fabsf(told - v.Rate) > 0.01f * v.Rate)
+          v.Rate = told;
+        v.Paced = true;
+      }
+    }
+    v.WasOn = v.On;
+    v.LastClock = v.Clock;
+    v.Moving = moves;
+
+    // The sound, where the voice's time is at this frame's reading of the clock (before its start and after its end
+    // the player is silent by itself: a voice whose time runs in from before 0 is heard from its first sample)
+    if (v.Player >= 0)
+      voice_player::Want(v.Player, v.On && v.Heard && moves, v.Time, v.Rate, v.Volume, g_ClipCounterSeconds);
+    if (!v.On)
+      return;
+    // (the face ahead of the sound only while it plays: paused, it shows the time it stands at)
+    double at = v.Time + (moves ? (double)v.Lead * (double)v.Rate : 0.0);
+    // [ALIVE] The settings within their ranges (one that isn't a number would never equal the take's and make it
+    // again every AliveSettleMs)
+    // (and the others too, so that no value typed into a slider that isn't a number stays in one: 0 for those)
+    auto within = [](float x, float most) { return !(x > 0.f) ? 0.f : (x > most ? most : x); };
+    v.Take = v.Take < 1 ? 1 : (v.Take > 99 ? 99 : v.Take);
+    v.LookAway = within(v.LookAway, 2.f);
+    v.Eyes = within(v.Eyes, 1.f);
+    if (!(v.Feel >= -1 && v.Feel < voice_feel::FeelingCount))
+      v.Feel = -1;
+    v.FeelStrength = within(v.FeelStrength, 2.f);
+    v.FeelFollow = within(v.FeelFollow, 1.f);
+    v.FeelUneven = within(v.FeelUneven, 0.3f);
+    v.FeelComes = within(v.FeelComes, 1.f);   // [SMILE]
+    v.FeelSure = !(v.FeelSure >= voice_emotion::SureLeast) ? voice_emotion::SureLeast :
+      (v.FeelSure > voice_emotion::SureMost ? voice_emotion::SureMost : v.FeelSure);   // [EMOTION]
+    // [ALIVE] This character's take of the living face, made (again) when there is none for the take and the looks
+    // away set, once those sliders have rested AliveSettleMs
+    if (v.Life &&!v.Sound->LifeTrack.Frames.empty() && (v.AliveTake != v.Take || v.AliveLookAway != v.LookAway) &&
+        GetTickCount64() - v.AliveWantedAt >= AliveSettleMs)
+      MakeAlive(h);
+    bool haveAlive = v.Life && v.Alive && !v.Alive->Frames.empty();
+    voice_alive::Frame alive{};
+    if (haveAlive)
+      alive = AliveAt(*v.Alive, at);
+    voice_face::Amounts amounts;
+    float jaw[FloatsPerBone];
+    v.FeelJawNow = 0.f;
+    v.FeelJawOn = false;
+    if (v.Rig.Ok)
+    {
+      v.Shape = voice::MouthAt(*v.Sound, at, v.Smoothing);
+      // [ALIVE] The lips part for a quick breath in before speech
+      if (haveAlive && alive.Inhale > 0.f)
+      {
+        float open = v.Shape.Open + InhaleOpen * alive.Inhale;
+        v.Shape.Open = open > 1.f ? 1.f : open;
+      }
+      amounts.Jaw = v.Jaw;
+      amounts.Lips = v.Lips;
+      amounts.Closure = v.Closure;
+      // The jaw as it is posed under the voice: the edit and the keyframes on the pose taken (or the clip's), and
+      // the idle movement
+      EditedLocal(h, v.Rig.Jaw, jaw);
+      AddIdle(h, v.Rig.Jaw, jaw);
+      voice_face::MakeOffsets(v.Rig, v.Shape, amounts, jaw + 4, v.Layer);
+    }
+    int mouthEntries = v.Layer.Count;   // [JAW] the mouth's own entries, first in the layer (MakeOffsets: 9)
+    // The life around the mouth: the eyelids, the eyebrows and the head, after the mouth's bones in the same layer.
+    // Its moves are made from the pose the layer is laid on AS IT IS THIS FRAME (the edits, the keyframes, the clip
+    // and the idle movement; a bone that isn't held: as taken): the lids' way down is measured from where the lid
+    // bones stand now, so lids the user has MOVED part closed are shut from there and not driven past shut (measured
+    // offline with the way taken once from the pose taken: half-closed lids ended 7 - 8 mm under the lower lid), and
+    // the head's own axes are the Head's and Neck1's rotations of now. Finding the bones again takes about 4 - 11
+    // microseconds (measured). A part the voice's own rig has off (not there, or not all held) stays off.
+    // [ALIVE] With the living face (VoiceAlive's take) the shape is its own: each eye's blink, each side's brows, its
+    // head; the feeling (VoiceFeelFace) is laid on the same pose; then the eyes (VoiceGaze), held against the head as
+    // the layer has turned it; then the lids, which follow the eyes. In that order: the brows and the head, the
+    // feeling's face and head, the eyes, the life's lids, the feeling's lids.
+    bool feelPicked = v.Feel >= 0 && v.Feel < voice_feel::FeelingCount;
+    for (int f = 1; f <= voice_feel::FeelingCount; ++f)
+      feelPicked = feelPicked || v.FeelWeights[f] > 0.f;   // (one still going out)
+    feelPicked = feelPicked || v.FeelAutoNow > 0.f || (v.FeelAuto && v.EmotionReadings);   // [EMOTION]
+    if ((v.Life || feelPicked) && (v.LifeRig.Ok || v.FeelRig.Ok) && h.Skeleton >= 0 && h.Skeleton < pose_skeleton_live::Count())
+    {
+      if (haveAlive)
+      {
+        voice_face::LifeShape& s = v.LifeShape;
+        s = voice_face::LifeShape();
+        s.Sided = true;
+        s.BlinkSide[0] = alive.BlinkLeft;
+        s.BlinkSide[1] = alive.BlinkRight;
+        s.BrowSide[0] = alive.BrowLeft;
+        s.BrowSide[1] = alive.BrowRight;
+        s.Nod = alive.Nod;
+        s.Turn = alive.Turn;
+        s.Tilt = alive.Tilt;
+        // (both sides' middle, for the menu's bars)
+        s.Blink = 0.5f * (alive.BlinkLeft + alive.BlinkRight);
+        s.Brow = 0.5f * (alive.BrowLeft + alive.BrowRight);
+      }
+      else if (v.Life)
+        v.LifeShape = voice::LifeAt(*v.Sound, at);
+      voice_face::LifeAmounts life;
+      life.Blinks = v.Blinks;
+      life.Brows = v.Brows;
+      life.Head = v.Head;
+      static float pose[MaxBones][FloatsPerBone];   // (the game's thread only, like the clip's)
+      for (int i = 0; i < h.Bones; ++i)
+        if (h.InHeld[i])
+        {
+          EditedLocal(h, i, pose[i]);
+          AddIdle(h, i, pose[i]);
+        }
+        else
+          memcpy(pose[i], h.Base[i], sizeof(pose[i]));
+      // The Face bone's own rotation as the pose under the edits has it (as taken, or the clip's), not as the user
+      // turned it: the eyes, lids and brows hang on the Face bone and turn with it, so the face's own axes in its
+      // frame are the same however it is turned. With the edited rotation (found by the review, measured through
+      // this code) a Face turned 30 degrees sent the brows 30 degrees off the face's up and the nod 26 - 28 degrees
+      // off the head's own axis, and from 40 - 60 degrees the blink and the head were dropped. (The game never turns
+      // the Face bone: identity on every body in every recorded sample.)
+      int faceBone = v.LifeRig.Ok ? v.LifeRig.Face : v.FeelRig.Life.Face;
+      if (faceBone >= 0 && faceBone < h.Bones)
+        memcpy(pose[faceBone] + 4, (h.InHeld[faceBone] ? BaseOf(h, faceBone) : h.Base[faceBone]) + 4, 4 * sizeof(float));
+      char const* const* names = pose_skeleton_live::At(h.Skeleton).Names;
+      voice_face::LifeRig now;
+      bool nowOk = false;
+      if (v.Life && v.LifeRig.Ok)
+      {
+        v.LifeTried = true;
+        nowOk = voice_face::FindLifeRig(h.Bones, names, h.Parents, &pose[0][0], now);
+      }
+      if (nowOk)
+      {
+        now.Eyes = now.Eyes && v.LifeRig.Eyes;
+        now.Brows = now.Brows && v.LifeRig.Brows;
+        now.Head = now.Head && v.LifeRig.Head;
+        for (int k = 0; k < 4; ++k)
+          if (v.LifeRig.Fold[k] < 0)
+            now.Fold[k] = -1;
+        if (v.LifeRig.Neck1 < 0)
+          now.Neck1 = -1;
+        if (v.LifeRig.EyeBone[0] < 0 || v.LifeRig.EyeBone[1] < 0)   // [ALIVE] (both eyes held, or neither turned)
+          now.EyeBone[0] = now.EyeBone[1] = -1;
+        now.Ok = now.Eyes || now.Brows || now.Head;
+        // Lid bones at the eye's middle (the game's other arrangement, on people) are shut by TURNING them, which
+        // their places don't show: the part of the upper lid's turn about the head's right, in the blink's sense,
+        // that the pose under the layer has is taken off the blink (by how far the lid is from the edge). Measured by
+        // the review: without it a lid already turned shut by 35 degrees was turned 35 more.
+        // [ALIVE] The turn is measured against the identity, the game's own bind rotation of every face bone (every
+        // library's bind, the feeling's research), not against the pose as taken: a pose TAKEN with the eyes shut
+        // (the game's people mid-blink: 32 - 35 degrees there; open: 3.3 at most) is covered too, as the feeling's
+        // own reading of it (VoiceFeelFace's PoseClosed) does.
+        float taken[2] = { 1.f, 1.f };   // how much of its blink each eye is left (the menu's Blink bar)
+        for (int s = 0; now.Eyes && s < 2; ++s)
+        {
+          int lid = now.UpLid[s];
+          float share = 1.f - now.LidEdge[s];
+          if (!(share > 0.f) || lid < 0 || lid >= h.Bones)
+            continue;
+          float q[4];
+          memcpy(q, pose[lid] + 4, sizeof(q));
+          if (q[3] < 0.f)
+            for (int k = 0; k < 4; ++k)
+              q[k] = -q[k];
+          float about = q[0] * now.Right[0] + q[1] * now.Right[1] + q[2] * now.Right[2];
+          float closed = now.NodSign * 2.f * atan2f(about, q[3]);
+          if (!std::isfinite(closed))
+            continue;
+          float uncapped = now.LidAngle[s];
+          float angle = now.LidAngle[s] - closed * share;
+          now.LidAngle[s] = !(angle > 0.f) ? 0.f : (angle > voice_face::LidAngleMost ? voice_face::LidAngleMost : angle);
+          // The lower lid's share of the blink (lid bones between the two arrangements) goes down with the upper's:
+          // without it, its move dropped in one frame where the upper lid's reached 0 (the fix check's find)
+          if (uncapped > 0.f && now.LidAngle[s] < uncapped)
+          {
+            float left = now.LidAngle[s] / uncapped;
+            for (int k = 0; k < 3; ++k)
+              now.LowLidMove[s][k] *= left;
+            taken[s] = left;
+          }
+        }
+        v.LifeBlinkTaken = (taken[0] + taken[1]) * 0.5f;
+        v.LifeEyesNow = now.Eyes;
+        v.LifeBrowsNow = now.Brows;
+        v.LifeHeadNow = now.Head;
+      }
+      float const* headQ = nowOk ? pose[now.HeadBone] + 4 : nullptr;
+      float const* faceQ = nowOk ? pose[now.Face] + 4 : nullptr;
+      float const* neck1Q = nowOk && now.Neck1 >= 0 ? pose[now.Neck1] + 4 : nullptr;
+      // 1. The brows and the head
+      if (nowOk)
+        voice_face::AddLifeOffsets(now, v.LifeShape, life, headQ, faceQ, v.Layer, neck1Q,
+          voice_face::LifePartBrows | voice_face::LifePartHead);
+      // 2. The feeling's face (every bone but the lids) and its nod and tilt, on the same pose; the living face's
+      // frown (thinking, a loud low stress) as the game's brow lowerer
+      voice_face::FeelRig feel;
+      bool feelOk = v.FeelRig.Ok && voice_face::FindFeelRig(h.Bones, names, h.Parents, &pose[0][0], v.FeelRig.Library, feel);
+      voice_face::FeelShape feelShape;
+      float const* feelHead = nullptr;
+      float const* feelFace = nullptr;
+      float const* feelNeck = nullptr;
+      if (feelOk)
+      {
+        feelShape = FeelShapeNow(v, at, (float)g_ClipRealDt);
+        if (haveAlive && alive.Frown > 0.f)
+        {
+          float brows = !(v.Brows > 0.f) ? 0.f : (v.Brows > 2.f ? 2.f : v.Brows);
+          feelShape.Left[voice_face::Au4] += FrownAu4 * alive.Frown * brows;
+          feelShape.Right[voice_face::Au4] += FrownAu4 * alive.Frown * brows;
+        }
+        // [JAW] The feeling's jaw (Surprised, Afraid) under the speech's own: the mouth's entries made again with the
+        // jaw that much further open where the speech has it less (Open + Jaw x (1 - Open): the speech still opens it
+        // all the way; the feeling's jaw is already gone where the lips close for p, b and m: ShapeOf), laid over the
+        // mouth's own entries before the feeling's corner and lip moves are added to them. v.Shape stays the speech's
+        // (the feeling's lip gates, the menu's bars).
+        if (feelShape.Jaw > 0.f && v.Rig.Ok && mouthEntries > 0 && mouthEntries <= v.Layer.Count &&
+          v.Layer.Bone[0] == v.Rig.Jaw)
+        {
+          voice_face::Shape opened = v.Shape;
+          float j = feelShape.Jaw > 1.f ? 1.f : feelShape.Jaw;
+          float open = opened.Open < 0.f ? 0.f : (opened.Open > 1.f ? 1.f : opened.Open);
+          opened.Open = open + j * (1.f - open);
+          voice_face::Offsets mouth;
+          voice_face::MakeOffsets(v.Rig, opened, amounts, jaw + 4, mouth);
+          bool alike = mouth.Count == mouthEntries;
+          for (int n = 0; alike && n < mouthEntries; ++n)
+            alike = mouth.Bone[n] == v.Layer.Bone[n];
+          if (alike)
+          {
+            for (int n = 0; n < mouthEntries; ++n)
+            {
+              memcpy(v.Layer.Turn[n], mouth.Turn[n], sizeof(v.Layer.Turn[n]));
+              memcpy(v.Layer.Move[n], mouth.Move[n], sizeof(v.Layer.Move[n]));
+            }
+            v.FeelJawNow = j;
+          }
+        }
+        feelHead = pose[feel.Life.HeadBone] + 4;
+        feelFace = pose[feel.Life.Face] + 4;
+        feelNeck = feel.Life.Neck1 >= 0 ? pose[feel.Life.Neck1] + 4 : nullptr;
+        voice_face::AddFeelOffsets(feel, feelShape, nowOk ? &now : nullptr, feelHead, feelFace, feelNeck, v.Layer,
+          voice_face::FeelPartFace);
+        v.FeelNow = true;
+        // (for the menu: the share of the voice's brow raises the feeling keeps, and its own nod and tilt, as
+        // AddFeelOffsets takes them)
+        float keep = feelShape.RaiseKeep;
+        v.FeelKeep = !(keep >= 0.f) ? 0.f : (keep > 1.f ? 1.f : keep);
+        auto posture = [](float x) { return !(x == x) ? 0.f : (x > voice_face::FeelHeadMost ? voice_face::FeelHeadMost :
+          (x < -voice_face::FeelHeadMost ? -voice_face::FeelHeadMost : x)); };
+        v.FeelNod = feel.Life.Head ? posture(feelShape.Nod) : 0.f;
+        v.FeelTilt = feel.Life.Head ? posture(feelShape.Tilt) : 0.f;
+      }
+      // 3. The eyes: the take's gaze, held in the world against the head as the layer has now turned it (the life's
+      // and the feeling's turns of Head and Neck1), brought back onto EyeMost where it would pass it; and how far each
+      // eye looks down more than as posed, for the lids.
+      // [REVIEW 4] Against the eyes as posed NOW, not as taken: the lids follow only what the voice does to the eyes.
+      // The user's own eye edits and lid edits stay the user's pair (before: an eye edited down and its lid lowered
+      // by hand to match were lowered again, to 86 % shut; and a sound with no take laid lids it never had: the
+      // review).
+      float lookDown[2] = { 0.f, 0.f }, lookRight[2] = { 0.f, 0.f };
+      if (nowOk && now.EyeBone[0] >= 0 && now.EyeBone[1] >= 0 && now.EyeBone[0] < h.Bones && now.EyeBone[1] < h.Bones)
+      {
+        float eyes = !(v.Eyes > 0.f) ? 0.f : (v.Eyes > 1.f ? 1.f : v.Eyes);
+        bool lay = haveAlive && (eyes > 0.f || v.HoldGaze);
+        // (the take's gaze is the eyes in the head against ITS planned head, its own counter-turn taken off already;
+        // the gaze it plans, against the head as posed, is that plus the take's head: held, VoiceGaze takes the
+        // layer's real head back out of it; not held, the eyes look that way in the head and ride with every turn)
+        float yaw = haveAlive ? eyes * (alive.GazeYaw + alive.Turn) : 0.f;
+        float pitch = haveAlive ? eyes * (alive.GazePitch + alive.Nod) : 0.f;
+        float const* eyeQ[2] = { pose[now.EyeBone[0]] + 4, pose[now.EyeBone[1]] + 4 };
+        // [REVIEW 3] The Face bone's rotation as it is handed (the user's edit and the idle movement in it): the eyes
+        // hang on it so, and the head's counter-turn is taken in its frame (pose[] has the Face as taken, for the
+        // face's own axes; with that one a Face turned 10 - 30 degrees by the user put the held eyes 1 - 9 degrees
+        // off: the review)
+        float faceHanded[FloatsPerBone];
+        if (h.InHeld[now.Face])
+        {
+          EditedLocal(h, now.Face, faceHanded);
+          AddIdle(h, now.Face, faceHanded);
+        }
+        else
+          memcpy(faceHanded, h.Base[now.Face], sizeof(faceHanded));
+        if (voice_face::AddGazeOffsets(now, yaw, pitch, v.HoldGaze, lay, neck1Q, headQ, faceHanded + 4, eyeQ, eyeQ, v.Layer,
+            lookDown, lookRight) && lay)
+        {
+          // (the menu's line: what was laid, the two eyes' mean, in degrees against the eyes as posed)
+          v.EyesNow = true;
+          v.GazeNow[0] = 57.29578f * 0.5f * (lookRight[0] + lookRight[1]);
+          v.GazeNow[1] = 57.29578f * 0.5f * (lookDown[0] + lookDown[1]);
+        }
+      }
+      // 4. The life's lids: each eye's blink, and its upper lid following its eye (the energy's small widening off)
+      float follow[2] = { 0.f, 0.f }, blinkUsed[2] = { 0.f, 0.f };
+      for (int s = 0; s < 2; ++s)
+      {
+        follow[s] = voice_face::LidFollowOf(lookDown[s]) - (haveAlive ? alive.LidLift : 0.f);
+        v.LifeShape.LidFollow[s] = follow[s];
+        blinkUsed[s] = voice_face::LifeBlinkOf(v.LifeShape, life, s);
+      }
+      if (nowOk)
+        voice_face::AddLifeOffsets(now, v.LifeShape, life, headQ, faceQ, v.Layer, neck1Q, voice_face::LifePartLids);
+      // 5. The feeling's lids, the life's blink and follow laid again from where the feeling puts them
+      if (feelOk)
+        voice_face::AddFeelOffsets(feel, feelShape, nowOk ? &now : nullptr, feelHead, feelFace, feelNeck, v.Layer,
+          voice_face::FeelPartLids, blinkUsed, follow);
+    }
+    // Held bones only, each once: a bone this body's pose doesn't hold (its rig has no channel for it) stays the
+    // game's, and nothing that isn't a number goes into the pose
+    int kept = 0;
+    for (int n = 0; n < v.Layer.Count && n < voice_face::MaxDriven; ++n)
+    {
+      int bone = v.Layer.Bone[n];
+      bool ok = bone >= 0 && bone < h.Bones && h.InHeld[bone];
+      for (int k = 0; ok && k < 4; ++k)
+        ok = std::isfinite(v.Layer.Turn[n][k]);
+      for (int k = 0; ok && k < 3; ++k)
+        ok = std::isfinite(v.Layer.Move[n][k]);
+      for (int k = 0; ok && k < kept; ++k)
+        ok = v.Layer.Bone[k] != bone;
+      if (!ok)
+        continue;
+      if (kept != n)
+      {
+        v.Layer.Bone[kept] = bone;
+        memcpy(v.Layer.Turn[kept], v.Layer.Turn[n], sizeof(v.Layer.Turn[kept]));
+        memcpy(v.Layer.Move[kept], v.Layer.Move[n], sizeof(v.Layer.Move[kept]));
+      }
+      ++kept;
+    }
+    v.Layer.Count = kept;
+  }
+
+  // The voice's layer laid over a bone's handed local pose (after the idle movement)
+  void AddVoice(Held const& h, int bone, float* local)
+  {
+    voice_face::Offsets const& layer = h.Voice.Layer;
+    for (int n = 0; n < layer.Count; ++n)
+      if (layer.Bone[n] == bone)
+      {
+        float turned[4];
+        QMul(layer.Turn[n], local + 4, turned);
+        QNorm(turned);
+        memcpy(local + 4, turned, sizeof(turned));
+        for (int k = 0; k < 3; ++k)
+          local[k] += layer.Move[n][k];
+        return;
+      }
   }
 
   // Every frame for a held pose: its slots found again, the check of what the
@@ -2914,7 +5485,12 @@ namespace
 
     // What the game made of the locals handed last frame: each held bone's
     // world pose its parent's (as the game builds it) times them
-    if (liveOk && h.HandedOk && h.BodyTable)
+    // (not while a clip, the keyframes or a voice change the pose every frame: the game can be a frame behind a
+    // changing pose, and a jaw that opens fast would count as "not taken"; Voice.Moving is still the frame
+    // before's here, the frame whose hand-over is checked)
+    if (liveOk && h.HandedOk && h.BodyTable && !(h.Clip.On && h.Clip.Playing) && !PlayingKeys(h) &&
+        !(h.Voice.Sound && h.Voice.On && (h.Voice.Rig.Ok || (h.Voice.Life && h.Voice.LifeRig.Ok) ||
+          (h.Voice.FeelRig.Ok && (h.Voice.Life || h.Voice.Feel >= 0))) && h.Voice.Moving))
     {
       float worst = 0.f;
       bool taken = true;
@@ -2957,9 +5533,37 @@ namespace
           h.Frames, h.FrozenTaken, h.FrozenFrames, h.Worst * 100.f);
       }
       if (g_IdleOn)
-        util::log::Write("Pose: %s 0x%I64X: idle movement from %d of the game's animation frames under the pose (last %.0f s)",
-          h.Label, h.Entity, h.IdleFrames, (now - h.CheckSince) / 1000.0);
+      {
+        // What its gate did with them (a person's limits, or the 10-degree one where no hips and legs were found): research,
+        // only with [Debug] Diagnostics on (without it the line is the one before these figures)
+        char gate[1024] = "";
+        if (h.IdleFrames > 0 && util::DiagnosticsOn())
+        {
+          char legsName[64], spinName[64], stepName[64];
+          strcpy_s(legsName, h.IdleMostLegsBone >= 0 ? BoneName(h, h.IdleMostLegsBone) : "none");
+          strcpy_s(spinName, h.IdleMostSpinBone >= 0 ? BoneName(h, h.IdleMostSpinBone) : "none");
+          strcpy_s(stepName, h.IdleMostStepBone >= 0 ? BoneName(h, h.IdleMostStepBone) : "none");
+          if (h.IdlePeople)
+            _snprintf_s(gate, sizeof(gate), _TRUNCATE, "; its gate open in %d of them (speeds in the game's "
+              "time); its root faster than %.2f m/s in %d, its hips or a leg more "
+              "than %.0f degrees off where their animation has been in %d, those or its spine turning faster than %.0f "
+              "degrees a second in %d; the 10-degree rule before 2026-11-14 would have shut %d; at most: its root %.2f "
+              "m/s, %s %.1f degrees off, %s %.0f degrees a second; the largest turn between two of them %.1f degrees (%s)",
+              h.IdleOpenCaptures, IdleGateSpeed, h.IdleOverSpeed, IdleGateLegs * 57.2957795f, h.IdleOverLegs,
+              IdleGateSpin, h.IdleOverSpin, h.IdleOldRule, h.IdleMostSpeed, legsName, h.IdleMostLegs * 57.2957795f,
+              spinName, h.IdleMostSpin, h.IdleMostStep, stepName);
+          else
+            _snprintf_s(gate, sizeof(gate), _TRUNCATE, "; its gate (no hips and legs found: any body bone "
+              "more than 10 degrees off, or its root "
+              "faster than %.2f m/s) open in %d of them; its root faster in %d; at most its root %.2f m/s; the largest "
+              "turn between two of them %.1f degrees (%s)", IdleGateSpeed, h.IdleOpenCaptures, h.IdleOverSpeed,
+              h.IdleMostSpeed, h.IdleMostStep, stepName);
+        }
+        util::log::Write("Pose: %s 0x%I64X: idle movement from %d of the game's animation frames under the pose (last %.0f s)%s",
+          h.Label, h.Entity, h.IdleFrames, (now - h.CheckSince) / 1000.0, gate);
+      }
       h.IdleFrames = 0;
+      ResetIdleCounts(h);
       for (int i = 0; i < h.WeaponCount; ++i)
       {
         HeldWeapon const& w = h.Weapons[i];
@@ -2982,17 +5586,13 @@ namespace
     if (liveOk)
       memcpy(h.World, chain, (size_t)h.Bones * FloatsPerBone * sizeof(float));
     UpdateIdle(h, (int)(&h - g_Held), now);
-    for (int n = 0; n < h.Count; ++n)
-    {
-      int i = (int)h.List[n], p = h.Parents[i];
-      float local[FloatsPerBone];
-      EditedLocal(h, i, local);
-      AddIdle(h, i, local);
-      memcpy(buffer + n * FloatsPerBone, local, sizeof(local));
-      memcpy(h.Handed[i], local, sizeof(local));
-      if (liveOk && p >= 0)
-        Compose(h.World[p], local, h.World[i]);
-    }
+    bool clipPose = AdvanceClip(h);
+    KeepKeys(h);
+    if (clipPose)
+      MakeClipPose(h);
+    KeepVoice(h);
+    // (EditedLocal, AddIdle, AddVoice per bone as before 2026-11-16, then the kinematics' layers: PoseMotion.inl)
+    MakeHandedPose(h, buffer, liveOk);
     h.WorldOk = liveOk;
 
     // Steps aside while a replay records or plays (it hands its own override
@@ -3063,50 +5663,68 @@ namespace
       animated == 0 ? ". The game doesn't animate its body now, so it doesn't take the pose" : "");
   }
 
-  // The drones within DroneScanRadius of the camera with a body of their own
-  // (+ 0x100), into out (their entity, animatable and distance); how many of
-  // them there are at all, how many with a body, and the first body's bones
+  // The drones and the other plain actors within DroneScanRadius of the camera
+  // with a body of their own (+ 0x100), into out (their entity, animatable and
+  // distance); how many drones there are at all, how many with a body, and the
+  // first body's bones.
+  // The plain actors (class ClientActorEntity itself) are, by the game's data
+  // (2026-11-12), the bear mascots, the pigeons and the drones that have no
+  // AI: the tools had the bear's skeleton from the first build but never
+  // listed one. Their bodies sit at the same place as a drone's (the class
+  // the drone's is derived from). Weapons are actors of another class of
+  // their own and aren't walked here: they go with their character.
   int WalkDrones(float const* camera, Candidate* out, int max, int& drones, int& withBody, int& firstBones)
   {
+    struct ActorClass
+    {
+      __int64 Rva;
+      char const* Name;
+    };
+    static const ActorClass classes[] = { { DroneTypeInfoRva, "PamClientDroneActorEntity" },
+      { ActorTypeInfoRva, "ClientActorEntity" } };
     __int64 base = (__int64)g_gameHandle;
-    __int64 typeInfo = base + DroneTypeInfoRva;
     int count = 0;
     drones = withBody = firstBones = 0;
-    if (!TypeNameIs(typeInfo, "PamClientDroneActorEntity"))
-      return 0;
-    __try
+    for (int k = 0; k < 2; ++k)
     {
-      for (int list = 0; list < 4; ++list)
+      __int64 typeInfo = base + classes[k].Rva;
+      if (!TypeNameIs(typeInfo, classes[k].Name))
+        continue;
+      __try
       {
-        __int64 link = *(__int64*)(typeInfo + TypeInstanceListsOffset + list * 0x10);
-        for (int n = 0; link && n < MaxPerList; ++n, link = *(__int64*)link)
+        for (int list = 0; list < 4; ++list)
         {
-          __int64 entity = link - EntityLinkOffset;
-          if (TypeOf(entity) != typeInfo)
-            continue;
-          float place[3];
-          if (!EntityPlace(entity, place) || !(Distance3(place, camera) <= DroneScanRadius))
-            continue;
-          ++drones;
-          __int64 animatable = *(__int64*)(entity + ActorBodyOffset);
-          LiveSlot slot{};
-          if (!SlotOf(animatable, 0, slot))
-            continue;
-          if (!withBody++)
-            firstBones = slot.Bones;
-          if (count < max)
+          __int64 link = *(__int64*)(typeInfo + TypeInstanceListsOffset + list * 0x10);
+          for (int n = 0; link && n < MaxPerList; ++n, link = *(__int64*)link)
           {
-            out[count] = Candidate{};
-            out[count].Entity = entity;
-            out[count].Animatable = animatable;
-            out[count].Distance = Distance3(place, camera);
-            ++count;
+            __int64 entity = link - EntityLinkOffset;
+            if (TypeOf(entity) != typeInfo)
+              continue;
+            float place[3];
+            if (!EntityPlace(entity, place) || !(Distance3(place, camera) <= DroneScanRadius))
+              continue;
+            if (k == 0)
+              ++drones;
+            __int64 animatable = *(__int64*)(entity + ActorBodyOffset);
+            LiveSlot slot{};
+            if (!SlotOf(animatable, 0, slot))
+              continue;
+            if (k == 0 && !withBody++)
+              firstBones = slot.Bones;
+            if (count < max)
+            {
+              out[count] = Candidate{};
+              out[count].Entity = entity;
+              out[count].Animatable = animatable;
+              out[count].Distance = Distance3(place, camera);
+              ++count;
+            }
           }
         }
       }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
+      __except (EXCEPTION_EXECUTE_HANDLER)
+      {
+      }
     }
     return count;
   }
@@ -3142,7 +5760,7 @@ namespace
       c.Kind = kind;
       c.Distance = distance;
       c.Bones = slot.Bones;
-      c.Skeleton = MatchSkeleton(slot.Bones, slot.Parents);
+      c.Skeleton = SkeletonOf(animatable, slot, g_Body, c.Cant);
       c.Animated = AnimatedByGame(animatable);
       __int64 entry = OverrideIn(slot);
       c.OtherOverride = entry != 0;
@@ -3255,14 +5873,194 @@ namespace
       s.Weapons.insert(s.Weapons.end(), w.EditMove, w.EditMove + 3);
       s.Weapons.insert(s.Weapons.end(), w.EditTurn, w.EditTurn + 4);
     }
+    s.KeysTime = h.Keys.Time;
+    for (int l = 0; l < LimbCount; ++l)
+    {
+      KinPin const& pin = h.Pins[l];
+      s.Pins.push_back(pin.On ? 1.f : 0.f);
+      s.Pins.insert(s.Pins.end(), pin.Place, pin.Place + 3);
+      s.Pins.insert(s.Pins.end(), pin.Turn, pin.Turn + 4);
+      s.Pins.insert(s.Pins.end(), pin.Seen, pin.Seen + 3);
+    }
     return s;
   }
 
+  // A step of the history: this pose (or the one given, taken just before) with the keyframes and references now
+  HistoryStep StepOf(Held const& h, Snapshot const& pose)
+  {
+    HistoryStep step;
+    step.Pose = pose;
+    step.Keys = h.Keys.Channels;
+    step.Length = h.Keys.Length;
+    step.RefTurns.assign(&h.KeyRefTurn[0][0], &h.KeyRefTurn[0][0] + (size_t)h.Bones * 4);
+    step.RefMoves.assign(&h.KeyRefMove[0][0], &h.KeyRefMove[0][0] + (size_t)h.Bones * 3);
+    step.On = h.Keys.On;
+    step.Loop = h.Keys.Loop;
+    step.Speed = h.Keys.Speed;
+    step.Clock = h.Keys.Clock;
+    step.Start = h.Keys.Start;
+    step.Time = h.Keys.Time;
+    return step;
+  }
+
+  // Whether a scalar field is being typed into right now (ctrl+click or double-click turned it into a text box): read
+  // before the field is drawn, so a number typed in the frame the mouse is pressed still counts
+  bool TypingInField()
+  {
+    ImGuiContext& g = *GImGui;
+    return g.ActiveId != 0 && g.ActiveId == g.ScalarAsInputTextId;
+  }
+
+  // A drag field's new value counts on a drag or a typed number, not on a click alone (a click rounds the value to
+  // what the field shows, ImGui 1.61, and returns it as changed)
+  bool DragTakes(bool typing)
+  {
+    return typing || !ImGui::IsMouseDown(0) || ImGui::IsMouseDragging(0, 1.f);
+  }
+
+  void ForgetStash(Held& h)
+  {
+    h.FutureStash.clear();
+    h.TrimmedStash = HistoryStep();
+    h.TrimmedOk = false;
+    h.StashOk = false;
+  }
+
+  // After a step was pushed onto History: the Redo steps it ends and the oldest step it trims (past MaxUndo) kept
+  // aside until the step proves a change
+  void NoteNewStep(Held& h)
+  {
+    h.FutureStash = std::move(h.Future);
+    h.Future.clear();
+    h.TrimmedOk = false;
+    h.TrimmedStash = HistoryStep();
+    if (h.History.size() > MaxUndo)
+    {
+      h.TrimmedStash = std::move(h.History.front());
+      h.History.erase(h.History.begin());
+      h.TrimmedOk = true;
+    }
+    h.StashOk = true;
+  }
+
+  // The last push's step taken off again, as if it had never been pushed (Redo and the oldest step put back)
+  void DropLastStep(Held& h)
+  {
+    if (h.History.empty())
+      return;
+    h.History.pop_back();
+    if (h.StashOk)
+    {
+      h.Future = std::move(h.FutureStash);
+      if (h.TrimmedOk)
+        h.History.insert(h.History.begin(), std::move(h.TrimmedStash));
+    }
+    ForgetStash(h);
+  }
+
+  bool SameKeys(std::vector<pose_keys::Channel> const& a, std::vector<pose_keys::Channel> const& b)
+  {
+    if (a.size() != b.size())
+      return false;
+    for (size_t c = 0; c < a.size(); ++c)
+    {
+      if (a[c].Bone != b[c].Bone || a[c].Keys.size() != b[c].Keys.size())
+        return false;
+      for (size_t k = 0; k < a[c].Keys.size(); ++k)
+      {
+        pose_keys::Key const& x = a[c].Keys[k];
+        pose_keys::Key const& y = b[c].Keys[k];
+        if (x.Time != y.Time || x.Ease != y.Ease || x.Auto != y.Auto || memcmp(x.Turn, y.Turn, sizeof(x.Turn)) != 0 ||
+            memcmp(x.Move, y.Move, sizeof(x.Move)) != 0)
+          return false;
+      }
+    }
+    return true;
+  }
+
+  // Whether a step holds the pose and keyframes as they are now (its push changed nothing)
+  bool StepIsNow(Held const& h, HistoryStep const& step)
+  {
+    if (step.Length != h.Keys.Length || !SameKeys(step.Keys, h.Keys.Channels))
+      return false;
+    // a keyframes file's load changes their settings and the time too (a reload of the same file with the playhead
+    // at 0 leaves the keys and the pose as they were)
+    if (step.Settings && (step.On != h.Keys.On || step.Loop != h.Keys.Loop || step.Speed != h.Keys.Speed ||
+        step.Clock != h.Keys.Clock || step.Start != h.Keys.Start || step.Time != h.Keys.Time))
+      return false;
+    Snapshot now = SnapshotOf(h);
+    if (now.Weapons != step.Pose.Weapons || now.Turns.size() != step.Pose.Turns.size() ||
+        now.Moves.size() != step.Pose.Moves.size() || now.Turns.size() != (size_t)h.Bones * 4)
+      return false;
+    // With the keyframes on and their time moved since the step (playing), the bones with keyframes are theirs
+    // (KeepKeys samples them again): only the others tell whether the step changed something
+    bool timeMoved = h.Keys.On && step.Pose.KeysTime != h.Keys.Time;
+    for (int b = 0; b < h.Bones; ++b)
+    {
+      if (timeMoved && pose_keys::Find(h.Keys, b) != nullptr)
+        continue;
+      for (int k = 0; k < 4; ++k)
+        if (now.Turns[(size_t)b * 4 + k] != step.Pose.Turns[(size_t)b * 4 + k])
+          return false;
+      for (int k = 0; k < 3; ++k)
+        if (now.Moves[(size_t)b * 3 + k] != step.Pose.Moves[(size_t)b * 3 + k])
+          return false;
+    }
+    return true;
+  }
+
+  // Each frame (the overlay's, with AutoKeyChanges): once what pushed the last step is let go (no drag, no item
+  // held), a step that changed nothing is dropped (a ring clicked and not turned, a slider or the Length clicked and
+  // not moved, a Reset of what was already reset), so Redo stays; one that changed something is kept for good
+  void SettleLastStep(Held& h)
+  {
+    if (!h.StashOk || !h.Used)
+      return;
+    if (h.History.empty())
+    {
+      ForgetStash(h);
+      return;
+    }
+    int index = (int)(&h - g_Held);
+    if ((g_Drag.On && g_Drag.Held == index) || ((g_Move.On || g_Move.Pending) && g_Move.Held == index))
+      return;
+    if ((g_KeyDrag.On || g_KeyDrag.Pending || g_KeyScrub) && g_KeyDrag.Held == h.Id)
+      return;
+    if (ImGui::IsAnyItemActive())
+      return;
+    if (StepIsNow(h, h.History.back()))
+      DropLastStep(h);
+    else
+      ForgetStash(h);
+  }
+
+  // Whether a pose (a snapshot of it) has changes its keyframe references don't hold yet: changes not keyframed
+  bool SnapshotHasUnkeyed(Held const& h, Snapshot const& s)
+  {
+    if (s.Turns.size() != (size_t)h.Bones * 4 || s.Moves.size() != (size_t)h.Bones * 3)
+      return true;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int bone = (int)h.List[n];
+      for (int k = 0; k < 4; ++k)
+        if (fabsf(s.Turns[(size_t)bone * 4 + k] - h.KeyRefTurn[bone][k]) > 1e-6f)
+          return true;
+      for (int k = 0; k < 3; ++k)
+        if (fabsf(s.Moves[(size_t)bone * 3 + k] - h.KeyRefMove[bone][k]) > 1e-6f)
+          return true;
+    }
+    return false;
+  }
+
+  // A step before a change of the pose: the pose as it was (s) and the keyframes as they are now. Auto key
+  // keyframing the change before the time moves belongs to this step: PushKeyUndo(merge) then pushes nothing.
+  // (The merge only when the pose pushed had no change not keyframed yet: else auto key would keyframe those older
+  // changes into this step too, and one Undo would take back two changes; the review, 2026-11-15.)
   void PushUndo(Held& h, Snapshot const& s)
   {
-    h.Undo.push_back(s);
-    if (h.Undo.size() > MaxUndo)
-      h.Undo.erase(h.Undo.begin());
+    h.History.push_back(StepOf(h, s));
+    NoteNewStep(h);
+    h.HistoryHasKeys = !SnapshotHasUnkeyed(h, s);
   }
 
   void ApplySnapshot(Held& h, Snapshot const& s)
@@ -3285,6 +6083,17 @@ namespace
         memcpy(w.OffsetWorld, f + 9, FloatsPerBone * sizeof(float));
         memcpy(w.EditMove, f + 17, 3 * sizeof(float));
         memcpy(w.EditTurn, f + 20, 4 * sizeof(float));
+      }
+    if (s.Pins.size() == (size_t)LimbCount * PinSnapshotFloats)
+      for (int l = 0; l < LimbCount; ++l)
+      {
+        float const* f = s.Pins.data() + (size_t)l * PinSnapshotFloats;
+        KinPin& pin = h.Pins[l];
+        if (!pin.On || !(f[0] > 0.5f))
+          continue;   // (on in both: its place then; else as it is, StartHold's check takes it from the pose)
+        memcpy(pin.Place, f + 1, sizeof(pin.Place));
+        memcpy(pin.Turn, f + 4, sizeof(pin.Turn));
+        memcpy(pin.Seen, f + 8, sizeof(pin.Seen));
       }
   }
 
@@ -3316,10 +6125,753 @@ namespace
     return !QIsIdentity(h.Turn[bone]) || h.Move[bone][0] != 0.f || h.Move[bone][1] != 0.f || h.Move[bone][2] != 0.f;
   }
 
+  // ---- The keyframes (PLAN.md 2.2 - 2.5) ----
+
+  bool KeyRefDiffers(Held const& h, int bone)
+  {
+    for (int k = 0; k < 4; ++k)
+      if (fabsf(h.Turn[bone][k] - h.KeyRefTurn[bone][k]) > 1e-6f)
+        return true;
+    for (int k = 0; k < 3; ++k)
+      if (fabsf(h.Move[bone][k] - h.KeyRefMove[bone][k]) > 1e-6f)
+        return true;
+    return false;
+  }
+
+  bool KeysCurrent(Held const& h)
+  {
+    return h.Keys.Channels.empty() || (h.KeysAppliedOk && h.Keys.Time == h.KeysAppliedTime &&
+      h.Keys.Revision == h.KeysAppliedRevision);
+  }
+
+  bool ClipUsable(Held const& h)
+  {
+    return h.Clip.On && h.Clip.Clip && h.Clip.Fit.Ok;
+  }
+
+  bool TrackHoldsTime(Held const& h)
+  {
+    if (h.Keys.Clock == pose_keys::Clock_Track)
+      return g_ClipTrackTime >= 0.0;
+    if (h.Keys.Clock == pose_keys::Clock_Clip)
+      return !h.Keys.Channels.empty() && ClipUsable(h) && h.Clip.Clock == ClipTrackTime && h.Clip.Playing &&
+        h.Keys.Playing;
+    return false;
+  }
+
+  bool PlayingKeys(Held const& h)
+  {
+    if (!h.Keys.On || h.Keys.Channels.empty())
+      return false;
+    if (h.Keys.Clock == pose_keys::Clock_Game || h.Keys.Clock == pose_keys::Clock_Real)
+      return h.Keys.Playing;
+    if (h.Keys.Clock == pose_keys::Clock_Track)
+      return h.Keys.Playing && h.KeyTrackMoving;
+    if (h.Keys.Clock == pose_keys::Clock_Clip)
+      return h.Keys.Playing && ClipUsable(h) && h.Clip.Playing;
+    return false;
+  }
+
+  // A step before a change of the keyframes: the pose and the keyframes as they are now. merge (auto key keyframing
+  // a change): none when the last step was pushed before that change of the pose and still holds the keyframes as
+  // they are, so the change and its keyframe go in one Undo. Every other change of the keyframes is a step of its own
+  // (a drag in the timeline starts from it every frame, and drops it if the key ends where it was).
+  void PushKeyUndo(Held& h, bool merge)
+  {
+    if (merge && h.HistoryHasKeys && !h.History.empty())
+    {
+      h.HistoryHasKeys = false;
+      return;
+    }
+    h.History.push_back(StepOf(h, SnapshotOf(h)));
+    NoteNewStep(h);
+    h.HistoryHasKeys = false;
+  }
+
+  void KeysMatchPose(Held& h)
+  {
+    h.KeysAppliedTime = h.Keys.Time;
+    h.KeysAppliedRevision = h.Keys.Revision;
+    h.KeysAppliedOk = true;
+  }
+
+  int ChangedBones(Held const& h, int* out)
+  {
+    int count = 0;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int bone = (int)h.List[n];
+      if (KeyRefDiffers(h, bone))
+        out[count++] = bone;
+    }
+    return count;
+  }
+
+  // A bone keyframed at the playhead. Its first keyframe while the pose has keyframes at other times (with
+  // g_KeyAnchors): also keyframes holding it as it was (its reference) at the nearest keyframe time of any bone
+  // before and after, so the change shows only between them; those are Auto (drawn hollow). Returns how many holds.
+  // KeyBoneIn: those keys made in into (all: the keyframes they're made among, h.Keys; the motion trail lays them in a
+  // copy of a few channels, 2026-11-16: into has the bone's channel if all has it)
+  int KeyBoneIn(Held const& h, pose_keys::Anim const& all, pose_keys::Anim& into, int bone)
+  {
+    if (bone < 0 || bone >= h.Bones || !h.InHeld[bone])
+      return 0;
+    int holds = 0;
+    if (g_KeyAnchors && !all.Channels.empty() && pose_keys::Find(all, bone) == nullptr)
+    {
+      double before = 0.0;
+      if (pose_keys::KeyTimeBefore(all, all.Time, before) &&
+          pose_keys::SetKey(into, bone, before, h.KeyRefTurn[bone], h.KeyRefMove[bone], -1, true) >= 0)
+        ++holds;
+      double after = 0.0;
+      if (pose_keys::KeyTimeAfter(all, all.Time, after) &&
+          pose_keys::SetKey(into, bone, after, h.KeyRefTurn[bone], h.KeyRefMove[bone], -1, true) >= 0)
+        ++holds;
+    }
+    pose_keys::SetKey(into, bone, all.Time, h.Turn[bone], h.Move[bone], -1);
+    return holds;
+  }
+
+  int KeyBone(Held& h, int bone)
+  {
+    if (bone < 0 || bone >= h.Bones || !h.InHeld[bone])
+      return 0;
+    int holds = KeyBoneIn(h, h.Keys, h.Keys, bone);
+    memcpy(h.KeyRefTurn[bone], h.Turn[bone], sizeof(h.KeyRefTurn[bone]));
+    memcpy(h.KeyRefMove[bone], h.Move[bone], sizeof(h.KeyRefMove[bone]));
+    return holds;
+  }
+
+  // What the last keyframing did, shown under the Keyframe: row (the user, 2026-11-15: auto key keyframed without
+  // saying so). count bones keyframed at the playhead, holds: the hollow keyframes made with them (KeyBone).
+  void NoteKeys(Held& h, int const* bones, int count, int holds, bool automatic)
+  {
+    if (count <= 0)
+      return;
+    char what[96];
+    if (count == 1)
+      _snprintf_s(what, sizeof(what), _TRUNCATE, "%s", BoneName(h, bones[0]));
+    else
+      _snprintf_s(what, sizeof(what), _TRUNCATE, "%d bones", count);
+    _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "%s %s at %.2f s", automatic ? "Auto key: keyframed" :
+      "Keyframed", what, h.Keys.Time);
+    size_t used = strlen(g_KeyNote);
+    if (holds > 0 && count == 1)
+      _snprintf_s(g_KeyNote + used, sizeof(g_KeyNote) - used, _TRUNCATE, ", held as it was at the %s around it (%d "
+        "hollow)", holds == 1 ? "keyframe time" : "keyframe times", holds);
+    else if (holds > 0)
+      _snprintf_s(g_KeyNote + used, sizeof(g_KeyNote) - used, _TRUNCATE, ", the new ones held as they were at the "
+        "keyframe times around (%d hollow)", holds);
+    g_KeyNoteAt = GetTickCount64();
+    g_KeyNoteHeld = h.Id;
+  }
+
+  // These bones keyframed at the playhead as one Undo step (merge: into the step pushed before the change they
+  // keyframe, see PushKeyUndo), said under the Keyframe: row. Only with KeysCurrent (the references are the pose
+  // made from the keyframes now). Returns count.
+  int KeyBones(Held& h, int const* bones, int count, bool automatic, bool merge)
+  {
+    if (count <= 0)
+      return 0;
+    PushKeyUndo(h, merge);
+    int holds = 0;
+    for (int k = 0; k < count; ++k)
+      holds += KeyBone(h, bones[k]);
+    KeysMatchPose(h);
+    NoteKeys(h, bones, count, holds, automatic);
+    return count;
+  }
+
+  int KeyChanges(Held& h, bool automatic)
+  {
+    if (!KeysCurrent(h))
+      return 0;
+    int bones[MaxBones];
+    int count = ChangedBones(h, bones);
+    if (count == 0)
+      return 0;
+    return KeyBones(h, bones, count, automatic, automatic);
+  }
+
+  // Auto key: what is still un-keyed is keyframed now, before the time moves or playing starts (from the first
+  // change: since 2026-11-15 a pose with no keyframes yet is keyframed too, as the red Auto key says)
+  void CommitAutoKey(Held& h)
+  {
+    if (g_AutoKey && h.Keys.On && !PlayingKeys(h))
+      KeyChanges(h, true);
+  }
+
+  int SelectedBones(Held const& h, int* out)
+  {
+    if (g_SelectedWeapon >= 0)
+      return 0;
+    int count = 0;
+    if (g_SelectedGroup >= 0)
+    {
+      if (g_SelectedGroup >= FaceGroupCount)
+        return 0;
+      for (int k = 0; k < h.GroupSize[g_SelectedGroup]; ++k)
+      {
+        int bone = h.GroupMembers[g_SelectedGroup][k];
+        if (bone >= 0 && bone < h.Bones && h.InHeld[bone])
+          out[count++] = bone;
+      }
+      return count;
+    }
+    if (g_SelectedBone >= 0 && g_SelectedBone < h.Bones && h.InHeld[g_SelectedBone])
+    {
+      out[0] = g_SelectedBone;
+      return 1;
+    }
+    return 0;
+  }
+
+  int KeySelection(Held& h)
+  {
+    if (!KeysCurrent(h))
+      return 0;
+    int bones[MaxBones];
+    int count = SelectedBones(h, bones);
+    if (count == 0)
+      return 0;
+    bool anyChange = false;
+    for (int k = 0; k < count; ++k)
+    {
+      pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+      int key = channel ? pose_keys::KeyAt(*channel, h.Keys.Time) : -1;
+      if (channel == nullptr || key < 0 || channel->Keys[(size_t)key].Auto || KeyRefDiffers(h, bones[k]))
+      {
+        anyChange = true;
+        break;
+      }
+    }
+    if (!anyChange)
+      return 0;
+    return KeyBones(h, bones, count, false, false);
+  }
+
+  int KeyWholePose(Held& h)
+  {
+    if (!KeysCurrent(h))
+      return 0;
+    int bones[MaxBones];
+    int count = 0;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int bone = (int)h.List[n];
+      if (pose_keys::Find(h.Keys, bone) != nullptr || IsEdited(h, bone) || KeyRefDiffers(h, bone))
+        bones[count++] = bone;
+    }
+    if (count == 0)
+      return 0;
+    bool anyChange = false;
+    for (int k = 0; k < count; ++k)
+    {
+      pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+      int key = channel ? pose_keys::KeyAt(*channel, h.Keys.Time) : -1;
+      if (channel == nullptr || key < 0 || channel->Keys[(size_t)key].Auto || KeyRefDiffers(h, bones[k]))
+      {
+        anyChange = true;
+        break;
+      }
+    }
+    if (!anyChange)
+      return 0;
+    return KeyBones(h, bones, count, false, false);
+  }
+
+  int SelectedKeysAtPlayhead(Held const& h)
+  {
+    int bones[MaxBones];
+    int count = SelectedBones(h, bones);
+    int keys = 0;
+    for (int k = 0; k < count; ++k)
+    {
+      pose_keys::Channel const* channel = pose_keys::Find(h.Keys, bones[k]);
+      if (channel != nullptr && pose_keys::KeyAt(*channel, h.Keys.Time) >= 0)
+        ++keys;
+    }
+    return keys;
+  }
+
+  int RemoveSelectedKeys(Held& h)
+  {
+    if (!KeysCurrent(h))
+      return 0;
+    int bones[MaxBones];
+    int count = SelectedBones(h, bones);
+    if (count == 0)
+      return 0;
+    int found = 0;
+    for (int k = 0; k < count; ++k)
+    {
+      pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+      if (channel != nullptr && pose_keys::KeyAt(*channel, h.Keys.Time) >= 0)
+        ++found;
+    }
+    if (found == 0)
+      return 0;
+    PushKeyUndo(h);
+    int removed = 0;
+    for (int k = 0; k < count; ++k)
+    {
+      pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+      if (channel == nullptr)
+        continue;
+      int index = pose_keys::KeyAt(*channel, h.Keys.Time);
+      if (index >= 0 && pose_keys::RemoveKey(h.Keys, bones[k], index))
+        ++removed;
+    }
+    if (h.Keys.Channels.empty())
+      h.Keys.Playing = false;
+    return removed;
+  }
+
+  // Undo (redo: Redo): the pose and its keyframes as they were before the last change (as the last Undo took them
+  // back), together, so a drag and the keyframe auto key made of it go in one step. With Auto key off and the
+  // playhead at the time the step was taken at, all is as it was then (the changes not keyframed then are again).
+  // Otherwise the bones with keyframes are read again from them where the playhead is (they own those bones there),
+  // the others are as they were, and no change counts as not keyframed.
+  bool UndoStep(Held& h, bool redo)
+  {
+    std::vector<HistoryStep>& from = redo ? h.Future : h.History;
+    std::vector<HistoryStep>& to = redo ? h.History : h.Future;
+    if (from.empty())
+      return false;
+    ForgetStash(h);
+    HistoryStep step = std::move(from.back());
+    from.pop_back();
+    HistoryStep now = StepOf(h, SnapshotOf(h));
+    now.Settings = step.Settings;   // (Redo of a load puts the file's settings back)
+    to.push_back(std::move(now));
+    if (to.size() > MaxUndo)
+      to.erase(to.begin());
+    if (step.Settings)
+    {
+      h.Keys.On = step.On;
+      h.Keys.Loop = step.Loop;
+      h.Keys.Speed = step.Speed;
+      h.Keys.Clock = step.Clock;
+      h.Keys.Start = step.Start;
+      h.Keys.Playing = false;
+      h.Keys.Time = step.Time < 0.0 ? 0.0 : (step.Time > step.Length ? step.Length : step.Time);
+    }
+    bool samePlace = step.Pose.KeysTime == h.Keys.Time && step.RefTurns.size() == (size_t)h.Bones * 4 &&
+      step.RefMoves.size() == (size_t)h.Bones * 3;
+    ApplySnapshot(h, step.Pose);
+    h.Keys.Channels = std::move(step.Keys);
+    h.Keys.Length = step.Length;
+    ++h.Keys.Revision;
+    if (h.Keys.Channels.empty())
+      h.Keys.Playing = false;
+    // Not with Auto key on: it would keyframe again at once what this took back when the step was taken after the
+    // change (a step auto key pushed itself, with no step before the change, holds the changed pose)
+    if (samePlace && !g_AutoKey)
+    {
+      memcpy(&h.KeyRefTurn[0][0], step.RefTurns.data(), step.RefTurns.size() * sizeof(float));
+      memcpy(&h.KeyRefMove[0][0], step.RefMoves.data(), step.RefMoves.size() * sizeof(float));
+      KeysMatchPose(h);
+    }
+    else
+    {
+      for (int bone = 0; bone < h.Bones; ++bone)
+      {
+        memcpy(h.KeyRefTurn[bone], h.Turn[bone], sizeof(h.KeyRefTurn[bone]));
+        memcpy(h.KeyRefMove[bone], h.Move[bone], sizeof(h.KeyRefMove[bone]));
+      }
+      h.KeysAppliedOk = false;
+    }
+    h.HistoryHasKeys = false;
+    return true;
+  }
+
+  void RemoveAllKeys(Held& h)
+  {
+    if (h.Keys.Channels.empty())
+      return;
+    PushKeyUndo(h);
+    h.Keys.Channels.clear();
+    ++h.Keys.Revision;
+    h.Keys.Playing = false;
+  }
+
+  void SetPlayhead(Held& h, double t)
+  {
+    if (TrackHoldsTime(h) && h.Keys.Playing)
+      return;
+    CommitAutoKey(h);
+    h.HistoryHasKeys = false;
+    if (!std::isfinite(t) || h.Keys.Length <= 0.0)
+    {
+      h.Keys.Time = 0.0;
+      return;
+    }
+    if (t < 0.0)
+      t = 0.0;
+    if (t > h.Keys.Length)
+      t = h.Keys.Length;
+    h.Keys.Time = t;
+    ClipPlay& c = h.Clip;
+    if (h.Keys.Clock == pose_keys::Clock_Clip && ClipUsable(h) && h.Keys.Speed > 0.f)
+    {
+      double length = c.Clip->Length();
+      double clipTime = (t - h.Keys.Start) / (double)h.Keys.Speed;
+      if (clipTime < 0.0)
+        clipTime = 0.0;
+      if (clipTime > length)
+        clipTime = length;
+      if (c.Loop && length > 0.0 && clipTime >= length)
+        clipTime = std::nextafter(length, 0.0);
+      c.Time = clipTime;
+      h.Keys.Time = h.Keys.Start + c.Time * (double)h.Keys.Speed;
+    }
+  }
+
+  // Play / Pause, as the Pose window's button and its hotkey do it (on the clip's clock the clip with them)
+  void TogglePlay(Held& h)
+  {
+    if (pose_keys::KeyCount(h.Keys) == 0 || h.Keys.Clock == pose_keys::Clock_Track)
+      return;
+    bool clipClock = h.Keys.Clock == pose_keys::Clock_Clip && ClipUsable(h);
+    bool shownPlaying = clipClock ? (h.Keys.Playing && h.Clip.Playing) : h.Keys.Playing;
+    bool wasOn = h.Keys.On;
+    CommitAutoKey(h);
+    h.Keys.Playing = !shownPlaying;
+    if (h.Keys.Playing)
+      h.KeysTimeMoved = true;   // (until the next KeepKeys measures it: the Bone tab's line doesn't flash "held")
+    h.Keys.On = true;
+    if (!wasOn)
+      h.KeysAppliedOk = false;
+    if (h.Keys.Playing && (h.Keys.Clock == pose_keys::Clock_Game || h.Keys.Clock == pose_keys::Clock_Real) &&
+        !h.Keys.Loop && h.Keys.Time >= h.Keys.Length)
+      SetPlayhead(h, 0.0);
+    if (clipClock)
+    {
+      ClipPlay& c = h.Clip;
+      c.Playing = h.Keys.Playing;
+      if (c.Playing && !c.Loop && c.Clock != ClipTrackTime && c.Time >= c.Clip->Length())
+        c.Time = 0.0;   // as the Clip tab's own Play does
+    }
+  }
+
+  // To the keyframe before (direction < 0) or the next one; with none that way, the start or the end
+  void JumpToKey(Held& h, int direction)
+  {
+    if (pose_keys::KeyCount(h.Keys) == 0 || TrackHoldsTime(h))
+      return;
+    double found = 0.0;
+    if (direction < 0)
+      SetPlayhead(h, pose_keys::KeyTimeBefore(h.Keys, h.Keys.Time, found) ? found : 0.0);
+    else
+      SetPlayhead(h, pose_keys::KeyTimeAfter(h.Keys, h.Keys.Time, found) ? found : h.Keys.Length);
+  }
+
+  // One frame back or on: a 30th of a second (the game's tick), while not playing
+  void StepFrame(Held& h, int direction)
+  {
+    if (TrackHoldsTime(h) || PlayingKeys(h))
+      return;
+    SetPlayhead(h, h.Keys.Time + (direction < 0 ? -1.0 : 1.0) / 30.0);
+  }
+
+  // A hotkey's key name ("" with none bound, or no input yet)
+  std::string HotkeyName(Action action)
+  {
+    if (!g_mainHandle || !g_mainHandle->GetInputSystem())
+      return std::string();
+    return g_mainHandle->GetInputSystem()->GetKeyName(action);
+  }
+
+  // The last item's tooltip, with its hotkey when one is bound
+  void ItemTooltipKey(char const* text, Action action)
+  {
+    std::string key = HotkeyName(action);
+    if (key.empty())
+      ImGui::ItemTooltip(text);
+    else
+    {
+      char line[200];
+      _snprintf_s(line, sizeof(line), _TRUNCATE, "%s (%s)", text, key.c_str());
+      ImGui::ItemTooltip(line);
+    }
+  }
+
+  // Undo and Redo: one history for the pose and its keyframes (id: the place's own, two places draw them)
+  void DrawUndoButtons(Held& h, char const* id)
+  {
+    char label[64];
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "Undo (%d)###%sUndo", (int)h.History.size(), id);
+    SameLineIfFits(label);
+    bool gate = !h.History.empty();
+    if (!gate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool press = ImGui::Button(label);
+    if (!gate)
+      ImGui::PopStyleVar();
+    if (press && gate)
+      UndoStep(h, false);
+    ItemTooltipKey("Takes back the last change of the pose or its keyframes, both together", Action::Pose_Undo);
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "Redo (%d)###%sRedo", (int)h.Future.size(), id);
+    SameLineIfFits(label);
+    gate = !h.Future.empty();
+    if (!gate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    press = ImGui::Button(label);
+    if (!gate)
+      ImGui::PopStyleVar();
+    if (press && gate)
+      UndoStep(h, true);
+    ItemTooltipKey("Puts back what Undo took back", Action::Pose_Redo);
+  }
+
+  // The Pose window's hotkeys (rebound in the tools' Hotkeys; by default numpad keys the camera's and the game's saved
+  // binds don't use, its default keys unknown): while the window is open, for the pose it edits, not during a drag
+  void PoseHotkeys()
+  {
+    if (!g_WindowOpen || g_Active < 0 || g_Active >= MaxHeld || !g_mainHandle || !g_mainHandle->GetInputSystem())
+      return;
+    InputSystem* input = g_mainHandle->GetInputSystem();
+    Held& h = g_Held[g_Active];
+    if (!h.Used || h.Restoring)
+      return;
+    if (g_Drag.On || g_Move.On || g_Move.Pending || g_KeyDrag.On || g_KeyDrag.Pending || g_KeyScrub)
+      return;
+    if (input->WentDown(Action::Pose_Redo))
+      UndoStep(h, true);
+    else if (input->WentDown(Action::Pose_Undo))
+      UndoStep(h, false);
+    if (input->WentDown(Action::Pose_Play))
+      TogglePlay(h);
+    // As the buttons: not while playing or with the keyframes off; the whole pose once something is posed or keyed,
+    // Remove with a picked bone's keyframe at the playhead
+    bool canKey = h.Keys.On && !PlayingKeys(h);
+    if (canKey && input->WentDown(Action::Pose_KeyChanges))
+      KeyChanges(h);
+    if (canKey && input->WentDown(Action::Pose_KeyWholePose))
+    {
+      bool wholeAny = false;
+      for (int n = 0; n < h.Count && !wholeAny; ++n)
+      {
+        int b = (int)h.List[n];
+        wholeAny = pose_keys::Find(h.Keys, b) != nullptr || IsEdited(h, b) || KeyRefDiffers(h, b);
+      }
+      if (wholeAny)
+        KeyWholePose(h);
+    }
+    if (canKey && input->WentDown(Action::Pose_RemoveKey) && SelectedKeysAtPlayhead(h) > 0)
+      RemoveSelectedKeys(h);
+    if (input->WentDown(Action::Pose_PreviousKey))
+      JumpToKey(h, -1);
+    if (input->WentDown(Action::Pose_NextKey))
+      JumpToKey(h, 1);
+    if (input->WentDown(Action::Pose_FrameBack))
+      StepFrame(h, -1);
+    if (input->WentDown(Action::Pose_FrameOn))
+      StepFrame(h, 1);
+  }
+
+  void AutoKeyChanges()
+  {
+    if (!g_AutoKey || !g_WindowOpen || g_Active < 0 || g_Active >= MaxHeld)
+      return;
+    Held& h = g_Held[g_Active];
+    if (!h.Used || h.Restoring || !h.Keys.On || PlayingKeys(h) || !KeysCurrent(h))
+      return;
+    if (g_Drag.On || g_Move.On || g_Move.Pending)
+      return;
+    if (ImGui::IsAnyItemActive())
+      return;
+    int bones[MaxBones];
+    int count = ChangedBones(h, bones);
+    if (count == 0)
+      return;
+    KeyBones(h, bones, count, true, true);
+  }
+
+  void KeepKeys(Held& h)
+  {
+    pose_keys::Anim& a = h.Keys;
+    h.KeyTrackMoving = g_ClipTrackTime >= 0.0 && h.KeyTrackTimeBefore >= 0.0 &&
+      g_ClipTrackTime != h.KeyTrackTimeBefore;
+    h.KeyTrackTimeBefore = g_ClipTrackTime;
+    h.KeysTimeMoved = false;
+    h.KeysDt = 0.0;
+    if (a.Channels.empty())
+      return;
+    if (a.Clock == pose_keys::Clock_Track)
+      a.Playing = true;   // the track plays it: this clock has no pause of its own
+    ClipPlay const& c = h.Clip;
+    double timeBefore = a.Time;
+    pose_keys::Advance(a, g_ClipRealDt, g_ClipGameScale, g_ClipTrackTime, c.Time, ClipUsable(h));
+    h.KeysTimeMoved = a.Time != timeBefore;
+    // How far it moved (the follow-through's springs step by it): a loop's wrap is time going on, not back
+    double dt = a.Time - timeBefore;
+    if (dt < 0.0 && a.Loop && a.Length > 0.0 && timeBefore - a.Time > 0.5 * a.Length)
+      dt += a.Length;
+    h.KeysDt = std::isfinite(dt) && dt > 0.0 ? (dt > 0.25 ? 0.25 : dt) : 0.0;
+    if (!a.On)
+      return;
+    int index = (int)(&h - g_Held);
+    if ((g_Drag.On && g_Drag.Held == index) || ((g_Move.On || g_Move.Pending) && g_Move.Held == index))
+      return;
+    ApplyKeysNow(h);
+  }
+
+  // The keyframes' pose at the playhead into the edit, as KeepKeys does it each frame (2026-11-16: also at once when
+  // a dot of the picked bone's path puts the playhead at its time, before its drag starts from that pose): with the
+  // time moved, every keyed bone from its keys and every reference the pose; with only the keys changed, the keyed
+  // bones that have no change of their own not keyframed yet
+  void ApplyKeysNow(Held& h)
+  {
+    pose_keys::Anim& a = h.Keys;
+    if (!a.On || a.Channels.empty())
+      return;
+    bool moved = !h.KeysAppliedOk || a.Time != h.KeysAppliedTime;
+    if (!moved && a.Revision == h.KeysAppliedRevision)
+      return;
+    for (size_t channel = 0; channel < a.Channels.size(); ++channel)
+    {
+      int bone = a.Channels[channel].Bone;
+      if (bone < 0 || bone >= h.Bones || !h.InHeld[bone])
+        continue;
+      if (!moved && KeyRefDiffers(h, bone))
+        continue;   // an un-keyed change stays while only keys changed
+      float turn[4], move[3];
+      if (!pose_keys::Sample(a.Channels[channel], a.Time, turn, move, a.Loop ? a.Length : 0.0))
+        continue;
+      memcpy(h.Turn[bone], turn, sizeof(turn));
+      memcpy(h.Move[bone], move, sizeof(move));
+      ClampMove(h, bone);
+      QNorm(h.Turn[bone]);
+      memcpy(h.KeyRefTurn[bone], h.Turn[bone], sizeof(turn));
+      memcpy(h.KeyRefMove[bone], h.Move[bone], sizeof(move));
+    }
+    if (moved)
+    {
+      for (int bone = 0; bone < h.Bones; ++bone)
+      {
+        memcpy(h.KeyRefTurn[bone], h.Turn[bone], 4 * sizeof(float));
+        memcpy(h.KeyRefMove[bone], h.Move[bone], 3 * sizeof(float));
+      }
+    }
+    h.KeysAppliedTime = a.Time;
+    h.KeysAppliedRevision = a.Revision;
+    h.KeysAppliedOk = true;
+  }
+
   void ResetBone(Held& h, int bone)
   {
     QIdentity(h.Turn[bone]);
     h.Move[bone][0] = h.Move[bone][1] = h.Move[bone][2] = 0.f;
+  }
+
+  // A Reset button (bones: which it resets, MaxBones of them; weapons: Reset all's weapons too). A bone with
+  // keyframes goes back to them when the time moves (they own it), so a reset of it alone doesn't last: with any
+  // such among them it asks first (DrawResetAsk: keyframe the reset at the playhead, or take their keyframes away);
+  // with none, it resets at once.
+  void RequestReset(Held& h, bool const* bones, bool weapons, Snapshot const& before, char const* what)
+  {
+    int keyed = 0;
+    int first = -1;
+    for (int b = 0; b < h.Bones; ++b)
+      if (bones[b] && pose_keys::Find(h.Keys, b) != nullptr)
+      {
+        if (first < 0)
+          first = b;
+        ++keyed;
+      }
+    if (keyed == 0 || !h.Keys.On)
+    {
+      PushUndo(h, before);
+      for (int b = 0; b < h.Bones; ++b)
+        if (bones[b])
+          ResetBone(h, b);
+      if (weapons)
+        for (int i = 0; i < h.WeaponCount; ++i)
+          ResetWeapon(h.Weapons[i]);
+      if (StepIsNow(h, h.History.back()))
+        DropLastStep(h);   // nothing was posed: no step (and Redo kept)
+      if (keyed > 0)
+      {
+        // (the keyframes are off: they put nothing back until Use the keyframes is ticked again; only the keyed
+        // bones go back then)
+        if (keyed == 1)
+          _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "Reset %s; the keyframes are off: %s has keyframes, "
+            "and they put it back once Use the keyframes is ticked", what, BoneName(h, first));
+        else
+          _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "Reset %s; the keyframes are off: %d of these bones "
+            "have keyframes, and they put those back once Use the keyframes is ticked", what, keyed);
+        g_KeyNoteAt = GetTickCount64();
+        g_KeyNoteHeld = h.Id;
+      }
+      return;
+    }
+    ResetAsk& a = g_ResetAsk;
+    a.HeldId = h.Id;
+    memcpy(a.Bones, bones, sizeof(a.Bones));
+    a.Weapons = weapons;
+    a.Keyed = keyed;
+    a.First = first;
+    strncpy_s(a.What, what, _TRUNCATE);
+    g_ResetAskOpen = true;
+  }
+
+  // The Reset question answered: the bones reset, then (keyframe) their reset keyframed at the playhead (the
+  // keyframed ones; with Auto key on the others it changed too, as auto key would), or their keyframes taken away;
+  // all one Undo step.
+  void DoReset(Held& h, bool keyframe)
+  {
+    ResetAsk const& a = g_ResetAsk;
+    bool current = KeysCurrent(h);
+    PushUndo(h, SnapshotOf(h));
+    for (int b = 0; b < h.Bones; ++b)
+      if (a.Bones[b])
+        ResetBone(h, b);
+    if (a.Weapons)
+      for (int i = 0; i < h.WeaponCount; ++i)
+        ResetWeapon(h.Weapons[i]);
+    h.HistoryHasKeys = false;   // the step just pushed holds the keyframes as they are: their change is in it
+    if (keyframe)
+    {
+      int list[MaxBones];
+      int count = 0;
+      int holds = 0;
+      for (int b = 0; b < h.Bones; ++b)
+      {
+        if (!a.Bones[b] || !h.InHeld[b])
+          continue;
+        bool keyed = pose_keys::Find(h.Keys, b) != nullptr;
+        // a bone with no keyframes needs its reference for its holds: only when it is the pose's now (current)
+        if (keyed || (g_AutoKey && current && KeyRefDiffers(h, b)))
+        {
+          holds += KeyBone(h, b);
+          list[count++] = b;
+        }
+      }
+      if (current)
+        KeysMatchPose(h);
+      NoteKeys(h, list, count, holds, false);
+    }
+    else
+    {
+      int removed = 0;
+      for (int b = 0; b < h.Bones; ++b)
+      {
+        if (!a.Bones[b])
+          continue;
+        if (pose_keys::RemoveChannel(h.Keys, b))
+          ++removed;
+        // not a change to keyframe (auto key): it stays so at every time now
+        memcpy(h.KeyRefTurn[b], h.Turn[b], sizeof(h.KeyRefTurn[b]));
+        memcpy(h.KeyRefMove[b], h.Move[b], sizeof(h.KeyRefMove[b]));
+      }
+      if (h.Keys.Channels.empty())
+        h.Keys.Playing = false;
+      _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "Reset %s and took the keyframes of %d %s away", a.What,
+        removed, removed == 1 ? "bone" : "bones");
+      g_KeyNoteAt = GetTickCount64();
+      g_KeyNoteHeld = h.Id;
+    }
   }
 
   // Shown on the picture and in the list (no search): its kind is shown, and
@@ -3425,7 +6977,7 @@ namespace
       return;
     }
     fprintf(f, "# MEC Cinematic Tools pose, %s, %s; each held bone: name, local rotation x y z w, translation x y z\n",
-      h.Label, pose_skeletons::Skeletons[h.Skeleton].Asset);
+      h.Label, h.Asset);
     for (int n = 0; n < h.Count; ++n)
     {
       int i = (int)h.List[n];
@@ -3447,11 +6999,11 @@ namespace
   void LoadPose(Held& h, char const* name)
   {
     char path[MAX_PATH];
-    sprintf_s(path, "%s\\%s.txt", PoseFolder, name);
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s.txt", PoseFolder, name);
     FILE* f = nullptr;
     if (fopen_s(&f, path, "r") || !f)
     {
-      sprintf_s(g_FileMessage, "%s couldn't be read", path);
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "%s couldn't be read", path);
       return;
     }
     Snapshot before = SnapshotOf(h);
@@ -3463,7 +7015,7 @@ namespace
       if (line[0] == '#')
       {
         // "# MEC Cinematic Tools pose, <who>, <its SkeletonAsset>; ..."
-        char const* asset = pose_skeletons::Skeletons[h.Skeleton].Asset;
+        char const* asset = h.Asset;
         char const* at = strstr(line, asset);
         size_t length = strlen(asset);
         sameSkeleton |= at && (at[length] == ';' || at[length] == ',' || at[length] == '\n');
@@ -3481,15 +7033,16 @@ namespace
         continue;
       }
       QNorm(q);
-      // local = turn * base, so turn = saved * base^-1
+      // local = turn * base, so turn = saved * base^-1 (the base shown: a
+      // clip's frame while one is on)
       float inverse[4];
-      QConj(h.Base[i] + 4, inverse);
+      QConj(BaseOf(h, i) + 4, inverse);
       QMul(q, inverse, h.Turn[i]);
       QNorm(h.Turn[i]);
       if (i == h.Root || sameSkeleton)
       {
         for (int k = 0; k < 3; ++k)
-          h.Move[i][k] = t[k] - h.Base[i][k];
+          h.Move[i][k] = t[k] - BaseOf(h, i)[k];
         ClampMove(h, i);
       }
       else
@@ -3499,12 +7052,773 @@ namespace
     fclose(f);
     if (set > 0)
       PushUndo(h, before);
-    sprintf_s(g_FileMessage, "Loaded %s: %d bones set", name, set);
+    _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Loaded %s: %d bones set", name, set);
     if (notHere)
-      sprintf_s(g_FileMessage + strlen(g_FileMessage), sizeof(g_FileMessage) - strlen(g_FileMessage),
+    {
+      size_t used = strlen(g_FileMessage);
+      _snprintf_s(g_FileMessage + used, sizeof(g_FileMessage) - used, _TRUNCATE,
         ", %d not in this skeleton's held bones", notHere);
+    }
     util::log::Write("Pose: %s loaded onto %s 0x%I64X: %d bones set, %d not in its held bones", path, h.Label, h.Entity, set,
       notHere);
+  }
+
+  // ---- Saved keyframes: Cinematic Tools\Poses\<name>.posekeys, the file of PLAN.md 1.2 ----
+
+  void ListKeyFiles()
+  {
+    g_KeyFiles.clear();
+    WIN32_FIND_DATAW data;
+    std::wstring pattern = Widen(PoseFolder) + L"\\*.posekeys";
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+      do
+      {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+          std::wstring name = data.cFileName;
+          if (name.size() > 9 && !_wcsicmp(name.c_str() + name.size() - 9, L".posekeys"))
+            g_KeyFiles.push_back(name.substr(0, name.size() - 9));
+        }
+      } while (FindNextFileW(find, &data));
+      FindClose(find);
+    }
+    std::sort(g_KeyFiles.begin(), g_KeyFiles.end());
+  }
+
+  bool SaveKeys(Held const& h, char const* name, bool quiet)
+  {
+    char clean[64];
+    if (!CleanName(name, clean, sizeof(clean)))
+    {
+      if (quiet)
+      {
+        if (!g_AutosaveFailLogged)
+        {
+          g_AutosaveFailLogged = true;
+          util::log::Warning("Pose: the keyframes' autosave couldn't be written: give it a name first (letters, digits, "
+            "spaces, - and _)");
+        }
+      }
+      else
+        _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE,
+          "The keyframes couldn't be saved: give it a name first (letters, digits, spaces, - and _)");
+      return false;
+    }
+    CreateDirectoryA("Cinematic Tools", nullptr);
+    CreateDirectoryA(PoseFolder, nullptr);
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s.posekeys", PoseFolder, clean);
+    pose_keys::File file;
+    int keys = KeysFileOf(h, file);
+    std::string error;
+    if (!pose_keys::SaveFile(path, file, error))
+    {
+      if (quiet)
+      {
+        if (!g_AutosaveFailLogged)
+        {
+          g_AutosaveFailLogged = true;
+          util::log::Warning("Pose: the keyframes' autosave couldn't be written: %s", error.c_str());
+        }
+      }
+      else
+        _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "The keyframes couldn't be saved: %s",
+          error.c_str());
+      return false;
+    }
+    if (!quiet)
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Saved %s (%d bones, %d keyframes)", path,
+        (int)file.Bones.size(), keys);
+      util::log::Write("Pose: %s saved from %s 0x%I64X (%d bones, %d keyframes)", path, h.Label, h.Entity,
+        (int)file.Bones.size(), keys);
+    }
+    g_KeyFilesListedAt = 0;
+    return true;
+  }
+
+  // The keyframes as a file holds them (and the bones posed without keyframes); returns how many keyframes
+  int KeysFileOf(Held const& h, pose_keys::File& file)
+  {
+    file = pose_keys::File();
+    file.Label = h.Label;
+    file.Skeleton = h.Asset;
+    file.Clip = h.Clip.Clip ? h.Clip.Clip->File : std::string();
+    file.OverClip = h.Clip.On && h.Clip.LocalOk;
+    file.Length = h.Keys.Length;
+    file.Loop = h.Keys.Loop;
+    file.Speed = h.Keys.Speed;
+    file.Clock = h.Keys.Clock;
+    file.Start = h.Keys.Start;
+    int keys = 0;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int bone = (int)h.List[n];
+      pose_keys::Channel const* channel = pose_keys::Find(h.Keys, bone);
+      bool edited = IsEdited(h, bone);
+      if (channel == nullptr && !edited)
+        continue;
+      pose_keys::FileBone boneFile;
+      boneFile.Name = BoneName(h, bone);
+      if (channel != nullptr)
+      {
+        boneFile.Keys = channel->Keys;
+        keys += (int)channel->Keys.size();
+      }
+      if (channel == nullptr && edited)
+      {
+        boneFile.HasStatic = true;
+        memcpy(boneFile.StaticTurn, h.Turn[bone], sizeof(boneFile.StaticTurn));
+        memcpy(boneFile.StaticMove, h.Move[bone], sizeof(boneFile.StaticMove));
+      }
+      if (!file.OverClip)
+      {
+        boneFile.HasBase = true;
+        memcpy(boneFile.BaseQ, h.Base[bone] + 4, sizeof(boneFile.BaseQ));
+        memcpy(boneFile.BaseT, h.Base[bone], sizeof(boneFile.BaseT));
+      }
+      file.Bones.push_back(boneFile);
+    }
+    return keys;
+  }
+
+  // ---- The keyframes in a file anywhere (2026-11-16, the user: "also make it possible to save the keyframes to a
+  // file"): the keyframes bar's Save / Save as / Load, the Windows file window on a thread of its own ----
+
+  std::wstring Widen(char const* text)
+  {
+    int n = MultiByteToWideChar(CP_ACP, 0, text, -1, nullptr, 0);
+    std::wstring w(n > 1 ? (size_t)(n - 1) : 0, L'\0');
+    if (n > 1)
+      MultiByteToWideChar(CP_ACP, 0, text, -1, &w[0], n);
+    return w;
+  }
+
+  // A keyframes file of Cinematic Tools\Poses as a whole path (name: its name without .posekeys)
+  std::wstring PoseKeysPath(char const* name)
+  {
+    std::wstring relative = Widen(PoseFolder) + L"\\" + Widen(name) + L".posekeys";
+    wchar_t full[1024];
+    DWORD length = GetFullPathNameW(relative.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
+    return length > 0 && length < sizeof(full) / sizeof(full[0]) ? std::wstring(full) : relative;
+  }
+
+  std::wstring PoseKeysPath(std::wstring const& name)
+  {
+    std::wstring relative = Widen(PoseFolder) + L"\\" + name + L".posekeys";
+    wchar_t full[1024];
+    DWORD length = GetFullPathNameW(relative.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
+    return length > 0 && length < sizeof(full) / sizeof(full[0]) ? std::wstring(full) : relative;
+  }
+
+  // The file's name alone, for what's said (UTF-8)
+  std::string FileNameOf(std::wstring const& path)
+  {
+    size_t slash = path.find_last_of(L"\\/");
+    return Utf8Of(slash == std::wstring::npos ? path : path.substr(slash + 1));
+  }
+
+  // The keyframes saved in a file anywhere (a whole path); said in g_FileMessage
+  bool SaveKeysToPath(Held const& h, std::wstring const& path)
+  {
+    pose_keys::File file;
+    int keys = KeysFileOf(h, file);
+    std::string error;
+    std::string shown = Utf8Of(path);
+    std::string logged = FileNameOf(path);   // (CT.log gets the file's name alone, not the user's folders)
+    if (!pose_keys::SaveFile(path.c_str(), file, error))
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "The keyframes couldn't be saved as %s: %s",
+        shown.c_str(), error.c_str());
+      util::log::Warning("Pose: keyframes couldn't be saved as %s: %s", logged.c_str(), error.c_str());
+      return false;
+    }
+    _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Saved %s (%d bones, %d keyframes)", shown.c_str(),
+      (int)file.Bones.size(), keys);
+    util::log::Write("Pose: %s saved from %s 0x%I64X (%d bones, %d keyframes)", logged.c_str(), h.Label, h.Entity,
+      (int)file.Bones.size(), keys);
+    g_KeyFilesListedAt = 0;
+    return true;
+  }
+
+  bool LoadKeysFile(Held& h, pose_keys::File const& file, char const* name, char const* path);
+
+  bool LoadKeys(Held& h, char const* name)
+  {
+    if (g_Drag.On || g_Move.On || g_Move.Pending)
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Let go of the bone before loading keyframes");
+      return false;
+    }
+    if (name == nullptr || name[0] == '\0' || strchr(name, '\\') || strchr(name, '/') || strchr(name, ':') ||
+      strstr(name, ".."))
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "That keyframes file's name can't be used");
+      return false;
+    }
+    char path[MAX_PATH];
+    int length = _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s.posekeys", PoseFolder, name);
+    if (length < 0 || length >= MAX_PATH)
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "That keyframes file's name can't be used");
+      return false;
+    }
+    pose_keys::File file;
+    std::string error;
+    if (!pose_keys::LoadFile(path, file, error))
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "%s couldn't be loaded: %s", name,
+        error.c_str());
+      return false;
+    }
+    return LoadKeysFile(h, file, name, path);
+  }
+
+  // Keyframes loaded from a file anywhere (a whole path); said in g_FileMessage
+  bool LoadKeysFromPath(Held& h, std::wstring const& path)
+  {
+    std::string name = FileNameOf(path), shown = Utf8Of(path);
+    if (g_Drag.On || g_Move.On || g_Move.Pending)
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Let go of the bone before loading keyframes");
+      return false;
+    }
+    pose_keys::File file;
+    std::string error;
+    if (!pose_keys::LoadFile(path.c_str(), file, error))
+    {
+      _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "%s couldn't be loaded: %s", shown.c_str(),
+        error.c_str());
+      return false;
+    }
+    return LoadKeysFile(h, file, name.c_str(), name.c_str());   // (CT.log gets the file's name alone)
+  }
+
+  // A file's keyframes put on the pose (one Undo step; name: said, path: logged)
+  bool LoadKeysFile(Held& h, pose_keys::File const& file, char const* name, char const* path)
+  {
+    ++h.KeysLoads;
+    Snapshot before = SnapshotOf(h);
+    PushUndo(h, before);
+    h.History.back().Settings = true;   // the load replaces the keyframes' settings too: Undo puts them back
+    pose_keys::Anim keys;
+    keys.Revision = h.Keys.Revision + 1;
+    int loadedBones = 0, loadedKeys = 0, notHere = 0, refused = 0;
+    for (size_t b = 0; b < file.Bones.size(); ++b)
+    {
+      pose_keys::FileBone const& boneFile = file.Bones[b];
+      int bone = BoneByName(h.Skeleton, boneFile.Name.c_str());
+      if (bone < 0 || !h.InHeld[bone])
+      {
+        ++notHere;
+        continue;
+      }
+      ++loadedBones;
+      bool rebase = boneFile.HasBase && !file.OverClip && !(h.Clip.On && h.Clip.LocalOk);
+      bool keepMove = bone == h.Root || file.Skeleton == h.Asset;
+      auto place = [&](float const* sourceTurn, float const* sourceMove, float* turn, float* move)
+      {
+        memcpy(turn, sourceTurn, 4 * sizeof(float));
+        memcpy(move, sourceMove, 3 * sizeof(float));
+        if (rebase)
+          pose_keys::Rebase(boneFile.BaseQ, boneFile.BaseT, h.Base[bone] + 4, h.Base[bone], keepMove, turn, move);
+        else if (!keepMove)
+          move[0] = move[1] = move[2] = 0.f;
+        float limit = MoveLimit(h, bone);
+        for (int k = 0; k < 3; ++k)
+        {
+          if (!std::isfinite(move[k]))
+            move[k] = 0.f;
+          move[k] = move[k] < -limit ? -limit : (move[k] > limit ? limit : move[k]);
+        }
+      };
+      for (size_t k = 0; k < boneFile.Keys.size(); ++k)
+      {
+        pose_keys::Key const& key = boneFile.Keys[k];
+        float turn[4], move[3];
+        place(key.Turn, key.Move, turn, move);
+        if (pose_keys::SetKey(keys, bone, key.Time, turn, move, key.Ease) >= 0)
+          ++loadedKeys;
+        else
+          ++refused;
+      }
+      if (boneFile.HasStatic)
+      {
+        float turn[4], move[3];
+        place(boneFile.StaticTurn, boneFile.StaticMove, turn, move);
+        memcpy(h.Turn[bone], turn, sizeof(turn));
+        memcpy(h.Move[bone], move, sizeof(move));
+      }
+    }
+    keys.Loop = file.Loop;
+    float speed = file.Speed;
+    if (speed < 0.05f)
+      speed = 0.05f;
+    if (speed > 4.f)
+      speed = 4.f;
+    keys.Speed = speed;
+    keys.Clock = file.Clock < 0 ? 0 : (file.Clock >= pose_keys::Clock_Count ? pose_keys::Clock_Count - 1 : file.Clock);
+    double start = file.Start;
+    if (start < -3600.0)
+      start = -3600.0;
+    if (start > 3600.0)
+      start = 3600.0;
+    keys.Start = start;
+    pose_keys::SetLength(keys, file.Length);
+    keys.Time = 0.0;
+    keys.Playing = false;
+    keys.On = true;
+    h.Keys = keys;
+    h.KeysAppliedOk = false;
+    for (int bone = 0; bone < h.Bones; ++bone)
+    {
+      memcpy(h.KeyRefTurn[bone], h.Turn[bone], 4 * sizeof(float));
+      memcpy(h.KeyRefMove[bone], h.Move[bone], 3 * sizeof(float));
+    }
+    ForgetStash(h);   // a load is a step of its own, kept (SettleLastStep doesn't judge it)
+    _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "Loaded %s: %d keyframes on %d bones", name,
+      loadedKeys, loadedBones);
+    if (notHere)
+    {
+      size_t used = strlen(g_FileMessage);
+      _snprintf_s(g_FileMessage + used, sizeof(g_FileMessage) - used, _TRUNCATE,
+        ", %d bones not in this skeleton's held bones", notHere);
+    }
+    if (refused)
+    {
+      size_t used = strlen(g_FileMessage);
+      _snprintf_s(g_FileMessage + used, sizeof(g_FileMessage) - used, _TRUNCATE, ", %d keyframes refused", refused);
+    }
+    std::string currentClip = h.Clip.Clip ? h.Clip.Clip->File : std::string();
+    bool overOtherClip = file.OverClip && (!(h.Clip.On && h.Clip.LocalOk) || file.Clip != currentClip);
+    if (overOtherClip)
+    {
+      size_t used = strlen(g_FileMessage);
+      _snprintf_s(g_FileMessage + used, sizeof(g_FileMessage) - used, _TRUNCATE,
+        ", its edits were made over \"%s\"", file.Clip.c_str());
+    }
+    util::log::Write("Pose: %s loaded onto %s 0x%I64X: %d keyframes on %d bones, %d not in its held bones, "
+      "%d keyframes refused%s", path, h.Label, h.Entity, loadedKeys, loadedBones, notHere, refused,
+      overOtherClip ? " (made over another clip)" : "");
+    return true;
+  }
+
+  // The keyframes in a file anywhere, off the menu's thread: the Windows file window (Save as, Load) and the file's
+  // writing or reading run on a thread of their own (KeyFileWork), so neither the window nor a slow folder (a network
+  // drive asleep, a cloud file being fetched) holds up the game (the review, 2026-11-16: the I/O ran under g_Mutex on
+  // the menu's thread); the answer is taken on the menu's thread (TakeKeyFileAnswer). One at a time.
+  enum KeyFileKind { KeyFile_SaveAs, KeyFile_Save, KeyFile_Load };
+  struct KeyFileAsk
+  {
+    std::mutex Mutex;
+    bool Open = false;          // asked, its answer not taken yet
+    bool Done = false;          // answered: Path ("": the window closed with no file), Error ("": none)
+    int Kind = KeyFile_SaveAs;
+    int HeldId = 0;             // for this pose (h.Id)
+    std::wstring Path;
+    std::string Error;
+    pose_keys::File Loaded;     // KeyFile_Load: the file as read
+    int Bones = 0, Keys = 0;    // a save: what it holds
+    unsigned LoadsAtAsk = 0;    // the pose's KeysLoads when asked
+    ULONGLONG QuietUntil = 0;   // the file window closed with a mouse button down: its press isn't taken until then
+  };
+  KeyFileAsk g_KeyFileAsk;
+  // The offline harness only: in place of the file window, the path it would give ("": closed with no file)
+  std::wstring (*g_KeyFileWindowStub)(bool save, std::wstring const& folder, std::wstring const& name) = nullptr;
+  // The offline harness only: told where the keyframes bar's file buttons and the Load menu's items are
+  void (*g_KeyFileItemStub)(char const* what, ImVec2 min, ImVec2 max) = nullptr;
+  // ... and where the Voice tab's emotion items are (the last item drawn: its rect; nothing in the game)
+  void ReportItemForTests(char const* what)
+  {
+    if (g_KeyFileItemStub)
+      g_KeyFileItemStub(what, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+  }
+  bool g_MouseQuiet = false;    // a press that came as the file window closed: not taken until the buttons are up
+
+  // What's under way (-1: nothing), for the buttons' gates and tips
+  int KeyFileBusy()
+  {
+    std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+    return g_KeyFileAsk.Open ? g_KeyFileAsk.Kind : -1;
+  }
+
+  bool KeyFileWindowOpen()
+  {
+    return KeyFileBusy() >= 0;
+  }
+
+  bool MouseButtonDown()
+  {
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
+      (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
+  }
+
+  // The file window's events: OnFileOk comes as a file is picked, before the window closes (the final review,
+  // 2026-11-16: checked after Show returned, the press the game sees as it comes back to the front was already taken).
+  // A mouse button down then (a double-click on a file: the window closes on its second press) quiets that press. The
+  // rest left to the window (E_NOTIMPL: its own way).
+  class KeyFileEvents : public IFileDialogEvents
+  {
+    LONG m_Refs = 1;
+  public:
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** out) override
+    {
+      if (!out)
+        return E_POINTER;
+      if (riid == __uuidof(IUnknown) || riid == __uuidof(IFileDialogEvents))
+      {
+        *out = static_cast<IFileDialogEvents*>(this);
+        AddRef();
+        return S_OK;
+      }
+      *out = nullptr;
+      return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override
+    {
+      return (ULONG)InterlockedIncrement(&m_Refs);
+    }
+    IFACEMETHODIMP_(ULONG) Release() override
+    {
+      LONG n = InterlockedDecrement(&m_Refs);
+      if (n == 0)
+        delete this;
+      return (ULONG)n;
+    }
+    IFACEMETHODIMP OnFileOk(IFileDialog*) override
+    {
+      if (MouseButtonDown())
+      {
+        std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+        g_KeyFileAsk.QuietUntil = GetTickCount64() + 1000;
+      }
+      return S_OK;
+    }
+    IFACEMETHODIMP OnFolderChanging(IFileDialog*, IShellItem*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnFolderChange(IFileDialog*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnSelectionChange(IFileDialog*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnShareViolation(IFileDialog*, IShellItem*, FDE_SHAREVIOLATION_RESPONSE*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnTypeChange(IFileDialog*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP OnOverwrite(IFileDialog*, IShellItem*, FDE_OVERWRITE_RESPONSE*) override { return E_NOTIMPL; }
+  };
+
+  // The window itself (KeyFileWork's thread, COM's single-threaded apartment there): a .posekeys file to save as (save)
+  // or to load, starting in folder with name; "" when closed with no file (error: why, when it failed). No owner
+  // window: the game's window belongs to another thread, and an owner there would tie the two threads' input together;
+  // so it can open behind the game (Alt+Tab). FOS_NOCHANGEDIR: the tools' own files are found from the game's folder
+  // as the current one.
+  std::wstring ShowKeyFileWindow(bool save, std::wstring const& folder, std::wstring const& name, std::string& error)
+  {
+    std::wstring chosen;
+    HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileDialog* dialog = nullptr;
+    HRESULT made = save ? CoCreateInstance(__uuidof(FileSaveDialog), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)) :
+      CoCreateInstance(__uuidof(FileOpenDialog), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (SUCCEEDED(made) && dialog)
+    {
+      COMDLG_FILTERSPEC types[] = { { L"Pose keyframes (*.posekeys)", L"*.posekeys" }, { L"All files (*.*)", L"*.*" } };
+      dialog->SetFileTypes(2, types);
+      dialog->SetFileTypeIndex(1);
+      dialog->SetDefaultExtension(L"posekeys");
+      FILEOPENDIALOGOPTIONS options = 0;
+      if (SUCCEEDED(dialog->GetOptions(&options)))
+        dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR |
+          (save ? FOS_OVERWRITEPROMPT : FOS_FILEMUSTEXIST));
+      dialog->SetTitle(save ? L"Save the keyframes (Cinematic Tools)" : L"Load keyframes (Cinematic Tools)");
+      IShellItem* start = nullptr;
+      if (!folder.empty() && SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&start))) &&
+          start)
+      {
+        dialog->SetFolder(start);
+        start->Release();
+      }
+      if (!name.empty())
+        dialog->SetFileName(name.c_str());
+      KeyFileEvents* events = new KeyFileEvents();
+      DWORD cookie = 0;
+      bool advised = SUCCEEDED(dialog->Advise(events, &cookie));
+      HRESULT shown = dialog->Show(nullptr);
+      if (advised)
+        dialog->Unadvise(cookie);
+      events->Release();
+      if (SUCCEEDED(shown))
+      {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item)) && item)
+        {
+          PWSTR path = nullptr;
+          if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path)
+          {
+            chosen = path;
+            CoTaskMemFree(path);
+          }
+          item->Release();
+        }
+        if (chosen.empty())
+          error = "the file window gave no file on the disk";
+      }
+      else if (shown != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+      {
+        char text[96];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "the file window failed (0x%08X)", (unsigned)shown);
+        error = text;
+      }
+      dialog->Release();
+    }
+    else
+    {
+      char text[96];
+      _snprintf_s(text, sizeof(text), _TRUNCATE, "the file window couldn't be made (0x%08X)", (unsigned)made);
+      error = text;
+    }
+    if (SUCCEEDED(init))
+      CoUninitialize();
+    return chosen;
+  }
+
+  struct KeyFileJob
+  {
+    int Kind;
+    std::wstring Folder, Name;  // the window's start (Save as, Load)
+    std::wstring Path;          // KeyFile_Save: the file
+    std::shared_ptr<pose_keys::File> Data;   // a save: the keyframes as they were when asked
+  };
+
+  // The thread: the window (Save as, Load), then the file written or read; the answer left in g_KeyFileAsk
+  void KeyFileWork(KeyFileJob job)
+  {
+    std::wstring path = job.Path;
+    std::string error;
+    if (job.Kind != KeyFile_Save)
+    {
+      bool save = job.Kind == KeyFile_SaveAs;
+      if (g_KeyFileWindowStub)
+        path = g_KeyFileWindowStub(save, job.Folder, job.Name);
+      else
+      {
+        path = ShowKeyFileWindow(save, job.Folder, job.Name, error);
+        // (the buttons up by now: the game saw no press, or its press was quieted already; none to quiet later)
+        if (!MouseButtonDown())
+        {
+          std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+          g_KeyFileAsk.QuietUntil = 0;
+        }
+      }
+    }
+    pose_keys::File loaded;
+    if (!path.empty() && error.empty())
+    {
+      if (job.Kind == KeyFile_Load)
+        pose_keys::LoadFile(path.c_str(), loaded, error);
+      else if (job.Data)
+        pose_keys::SaveFile(path.c_str(), *job.Data, error);
+      else
+        error = "nothing to save";
+    }
+    std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+    g_KeyFileAsk.Done = true;
+    g_KeyFileAsk.Path = path;
+    g_KeyFileAsk.Error = error;
+    if (job.Kind == KeyFile_Load && error.empty())
+      g_KeyFileAsk.Loaded = std::move(loaded);
+  }
+
+  void SayKeyNote(Held const& h, char const* text)
+  {
+    _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "%s", text);
+    g_KeyNoteAt = GetTickCount64();
+    g_KeyNoteHeld = h.Id;
+  }
+
+  // Save as (the window), Save (into h.KeysFile) or Load (the window) for this pose, on KeyFileWork's thread. The window
+  // starts at the pose's keyframes' file, else the file it last loaded, else Cinematic Tools\Poses with the Files tab's
+  // keyframes name (else the pose's). A save writes the keyframes as they are now.
+  void AskKeyFile(Held const& h, int kind)
+  {
+    KeyFileJob job;
+    job.Kind = kind;
+    std::wstring const& known = !h.KeysFile.empty() ? h.KeysFile : h.KeysSuggest;
+    size_t slash = known.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+    {
+      job.Folder = known.substr(0, slash);
+      job.Name = known.substr(slash + 1);
+    }
+    if (job.Folder.empty())
+    {
+      CreateDirectoryA("Cinematic Tools", nullptr);
+      CreateDirectoryA(PoseFolder, nullptr);
+      std::wstring path = PoseKeysPath("x");
+      size_t end = path.find_last_of(L"\\/");
+      if (end != std::wstring::npos)
+        job.Folder = path.substr(0, end);
+    }
+    if (job.Name.empty() && kind == KeyFile_SaveAs)
+    {
+      char clean[64];
+      if (CleanName(g_KeySaveName, clean, sizeof(clean)) || CleanName(h.Label, clean, sizeof(clean)))
+        job.Name = Widen(clean) + L".posekeys";
+    }
+    if (kind == KeyFile_Load)
+      job.Name.clear();   // (the window's name field empty: a file to pick)
+    int bones = 0, keys = 0;
+    if (kind != KeyFile_Load)
+    {
+      job.Data = std::make_shared<pose_keys::File>();
+      keys = KeysFileOf(h, *job.Data);
+      bones = (int)job.Data->Bones.size();
+    }
+    if (kind == KeyFile_Save)
+    {
+      job.Path = h.KeysFile;
+      if (job.Path.empty())
+        return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+      if (g_KeyFileAsk.Open)
+        return;
+      g_KeyFileAsk.Open = true;
+      g_KeyFileAsk.Done = false;
+      g_KeyFileAsk.Kind = kind;
+      g_KeyFileAsk.HeldId = h.Id;
+      g_KeyFileAsk.Path.clear();
+      g_KeyFileAsk.Error.clear();
+      g_KeyFileAsk.Loaded = pose_keys::File();
+      g_KeyFileAsk.Bones = bones;
+      g_KeyFileAsk.Keys = keys;
+      g_KeyFileAsk.LoadsAtAsk = h.KeysLoads;
+    }
+    try
+    {
+      std::thread(KeyFileWork, std::move(job)).detach();
+    }
+    catch (...)
+    {
+      std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+      g_KeyFileAsk.Open = false;
+      SayKeyNote(h, "The keyframes' file couldn't be done (no thread for it)");
+      return;
+    }
+    if (kind == KeyFile_Save)
+    {
+      std::string shown = "Saving the keyframes into " + Utf8Of(h.KeysFile) + "...";
+      SayKeyNote(h, shown.c_str());
+    }
+    else
+      SayKeyNote(h, kind == KeyFile_SaveAs ? "The file window is open: pick where to save the keyframes (if it isn't in "
+        "front, it's behind the game: Alt+Tab to it)" : "The file window is open: pick the keyframes to load (if it isn't "
+        "in front, it's behind the game: Alt+Tab to it)");
+  }
+
+  // The answer, once it's in (the menu's thread, each frame; a load waits while a bone is held): a save's file becomes
+  // the pose's keyframes file (the bar's Save writes there next); a load's keyframes put on the pose (one Undo step),
+  // and its file only offered to Save as next (the review, 2026-11-16: a loaded file as Save's file was written over
+  // after an Undo of the load, a lossy load onto another skeleton, or an autosave loaded). Nothing for a pose let go.
+  void TakeKeyFileAnswer()
+  {
+    int kind = 0, heldId = 0, bones = 0, keys = 0;
+    unsigned loadsAtAsk = 0;
+    std::wstring path;
+    std::string error;
+    pose_keys::File loaded;
+    {
+      std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+      if (!g_KeyFileAsk.Open || !g_KeyFileAsk.Done)
+        return;
+      // (a load waits while anything is held: a bone, a ring, a keyframe on the timeline, a field; the final review)
+      if (g_KeyFileAsk.Kind == KeyFile_Load && (g_Drag.On || g_Move.On || g_Move.Pending || g_KeyDrag.On ||
+          g_KeyDrag.Pending || g_KeyScrub || ImGui::IsAnyItemActive()))
+        return;
+      kind = g_KeyFileAsk.Kind;
+      heldId = g_KeyFileAsk.HeldId;
+      path = g_KeyFileAsk.Path;
+      error = g_KeyFileAsk.Error;
+      bones = g_KeyFileAsk.Bones;
+      keys = g_KeyFileAsk.Keys;
+      loadsAtAsk = g_KeyFileAsk.LoadsAtAsk;
+      loaded = std::move(g_KeyFileAsk.Loaded);
+      g_KeyFileAsk.Loaded = pose_keys::File();
+      g_KeyFileAsk.Open = g_KeyFileAsk.Done = false;
+    }
+    Held* found = nullptr;
+    for (int i = 0; i < MaxHeld && !found; ++i)
+      if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Id == heldId)
+        found = &g_Held[i];
+    bool save = kind != KeyFile_Load;
+    std::string shown = Utf8Of(path);
+    char note[sizeof(g_KeyNote)];
+    if (!error.empty() && path.empty())
+      _snprintf_s(note, sizeof(note), _TRUNCATE, "The keyframes weren't %s: %s", save ? "saved" : "loaded", error.c_str());
+    else if (!error.empty())
+    {
+      _snprintf_s(note, sizeof(note), _TRUNCATE, save ? "The keyframes couldn't be saved as %s: %s" :
+        "%s couldn't be loaded: %s", shown.c_str(), error.c_str());
+      // (CT.log gets the file's name alone, not the user's folders; the menu's note keeps the whole path)
+      util::log::Warning(save ? "Pose: The keyframes couldn't be saved as %s: %s" : "Pose: %s couldn't be loaded: %s",
+        FileNameOf(path).c_str(), error.c_str());
+    }
+    else if (path.empty())
+      _snprintf_s(note, sizeof(note), _TRUNCATE, "The file window was closed: nothing %s", save ? "saved" : "loaded");
+    else if (save)
+    {
+      _snprintf_s(note, sizeof(note), _TRUNCATE, "Saved %s (%d bones, %d keyframes)%s", shown.c_str(), bones, keys,
+        found ? "" : "; the pose was let go meanwhile");
+      util::log::Write("Pose: %s saved (%d bones, %d keyframes)", FileNameOf(path).c_str(), bones, keys);
+      g_KeyFilesListedAt = 0;
+      // (Save's file only with no load since it was asked: else Save would write the loaded keyframes into it
+      // unasked; the final review)
+      if (found && found->KeysLoads == loadsAtAsk)
+        found->KeysFile = path;
+      if (found)
+        found->KeysSuggest = path;
+    }
+    else if (!found)
+      _snprintf_s(note, sizeof(note), _TRUNCATE, "The pose was let go while the file window was open: nothing loaded");
+    else
+    {
+      std::string name = FileNameOf(path);
+      LoadKeysFile(*found, loaded, name.c_str(), name.c_str());   // (CT.log gets the file's name alone)
+      found->KeysFile.clear();
+      found->KeysSuggest = path;
+      _snprintf_s(note, sizeof(note), _TRUNCATE, "%s", g_FileMessage);
+    }
+    _snprintf_s(g_FileMessage, sizeof(g_FileMessage), _TRUNCATE, "%s", note);
+    _snprintf_s(g_KeyNote, sizeof(g_KeyNote), _TRUNCATE, "%s", note);
+    g_KeyNoteAt = GetTickCount64();
+    g_KeyNoteHeld = heldId;
+  }
+
+  // A press as the file window closed (a double-click on a file in it closes it on the second press: the game comes back
+  // to the front with the button down; the reviews, 2026-11-16): the first press seen within 1 s of the file picked with
+  // a button down (KeyFileEvents::OnFileOk) isn't taken until the buttons are up: by nothing on the menu's frame
+  // (pose_editor::QuietMouse, from UI.cpp before the overlays; DrawOverlay calls it too, for the harness). A file picked
+  // with no button down (the window's Save or Open button: on the release; Enter) quiets nothing.
+  void QuietMouseAfterWindow()
+  {
+    ImGuiIO& io = ImGui::GetIO();
+    bool pressed = io.MouseClicked[0] || io.MouseClicked[1] || io.MouseClicked[2];
+    if (pressed)
+    {
+      std::lock_guard<std::mutex> lock(g_KeyFileAsk.Mutex);
+      if (g_KeyFileAsk.QuietUntil != 0 && GetTickCount64() < g_KeyFileAsk.QuietUntil)
+        g_MouseQuiet = true;
+      g_KeyFileAsk.QuietUntil = 0;
+    }
+    if (!g_MouseQuiet)
+      return;
+    if (!io.MouseDown[0] && !io.MouseDown[1] && !io.MouseDown[2])
+    {
+      g_MouseQuiet = false;
+      return;
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+      io.MouseClicked[k] = false;
+      io.MouseDoubleClicked[k] = false;
+    }
   }
 
   // ---- The turning rings ----
@@ -3736,66 +8050,25 @@ namespace
     return true;
   }
 
+  // The kinematics (2026-11-16): the hinged limbs, holds, curves (PoseKinematics.inl) and the layers over the pose
+  // handed each frame (PoseMotion.inl)
+#include "PoseKinematics.inl"
+#include "PoseMotion.inl"
+
   // Two bones bent so the third's place is the target (as near as they
-  // reach): an upper bone (a), its child (b) and its child (c), e.g. arm,
-  // forearm, hand. The joint keeps bending to the side it bent to.
+  // reach): an upper bone (a), its child (b) and its child (c), e.g. a
+  // collarbone and an upper arm for an elbow, a shin and a foot for a toe.
+  // The joint keeps bending in the plane it's bent in (its normal carried:
+  // until 2026-11-16 the side was, and it flipped when the drag direction
+  // passed it); no hinge, no limits (a limb's own: SolveLimb).
   void TwoBone(Held& h, int a, int b, int c, float const* target, float (*w)[FloatsPerBone])
   {
     ComposeHeld(h, w);
-    float pa[3], pb[3], pc[3];
-    memcpy(pa, w[a], sizeof(pa));
-    memcpy(pb, w[b], sizeof(pb));
-    memcpy(pc, w[c], sizeof(pc));
-    float ab[3] = { pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2] };
-    float bc[3] = { pc[0] - pb[0], pc[1] - pb[1], pc[2] - pb[2] };
-    float ac[3] = { pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2] };
-    float at[3] = { target[0] - pa[0], target[1] - pa[1], target[2] - pa[2] };
-    float lab = Length3(ab), lbc = Length3(bc), lat = Length3(at);
-    if (lab < 1e-4f || lbc < 1e-4f || lat < 1e-4f)
-      return;
-    float d[3] = { at[0] / lat, at[1] / lat, at[2] / lat };
-    float lo = fabsf(lab - lbc) + 1e-3f, hi = lab + lbc - 1e-3f;
-    lat = lat < lo ? lo : (lat > hi ? hi : lat);
-    // The side the joint bends to: b off the line from a to c
-    float acn[3] = { ac[0], ac[1], ac[2] };
-    if (Length3(acn) < 1e-5f)
-      memcpy(acn, d, sizeof(acn));
-    Normalize3(acn);
-    float along = ab[0] * acn[0] + ab[1] * acn[1] + ab[2] * acn[2];
-    float bend[3] = { ab[0] - acn[0] * along, ab[1] - acn[1] * along, ab[2] - acn[2] * along };
-    if (Length3(bend) < 1e-5f)
-      AnyPerpendicular(acn, bend);
-    float off = bend[0] * d[0] + bend[1] * d[1] + bend[2] * d[2];
-    for (int k = 0; k < 3; ++k)
-      bend[k] -= d[k] * off;
-    if (Length3(bend) < 1e-5f)
-      AnyPerpendicular(d, bend);
-    Normalize3(bend);
-    float x = (lab * lab - lbc * lbc + lat * lat) / (2.f * lat);
-    float height = sqrtf((std::max)(0.f, lab * lab - x * x));
-    float b2[3], c2[3];
-    for (int k = 0; k < 3; ++k)
-    {
-      b2[k] = pa[k] + d[k] * x + bend[k] * height;
-      c2[k] = pa[k] + d[k] * lat;
-    }
-    // The upper bone turned so its child is at b2, then the child so its own
-    // child is at c2
-    float u[3] = { ab[0] / lab, ab[1] / lab, ab[2] / lab };
-    float v[3] = { b2[0] - pa[0], b2[1] - pa[1], b2[2] - pa[2] };
-    Normalize3(v);
-    float q[4];
-    FromTo(u, v, q);
-    ApplyWorldTurn(h, a, q, w);
+    LimbSolve s;
+    SolveTwo(w[a], w[b], w[c], target, nullptr, false, false, s);
+    ApplyWorldTurn(h, a, s.TurnA, w);
     ComposeHeld(h, w);
-    float now[3] = { w[c][0] - w[b][0], w[c][1] - w[b][1], w[c][2] - w[b][2] };
-    float want[3] = { c2[0] - w[b][0], c2[1] - w[b][1], c2[2] - w[b][2] };
-    if (Length3(now) < 1e-5f || Length3(want) < 1e-5f)
-      return;
-    Normalize3(now);
-    Normalize3(want);
-    FromTo(now, want, q);
-    ApplyWorldTurn(h, b, q, w);
+    ApplyWorldTurn(h, b, s.TurnB, w);
   }
 
   // The bone moved by a world offset (its move is in its parent's frame; w is
@@ -3866,17 +8139,32 @@ namespace
   // the whole body (2026-11-08, the user: "using a bone moves the whole body
   // instead of that bone"). A part's first bone swings instead (SwingBone).
   // From the pose as it is.
+  // Since 2026-11-16 (PoseKinematics.inl): a hand or foot bends its arm or
+  // leg about the elbow's or knee's hinge, within its limits, and keeps its
+  // angle (Hands and feet keep their angle); an arm's collarbone joins in;
+  // an elbow or knee is aimed by its upper bone; a chest or head bends the
+  // spine or neck in a curve; a toe with 3 bones taken in moves its foot;
+  // the Hips keep the feet where they stand; pinned hands and feet stay.
   void SolveMove(Held& h, int bone, float const* target, int chainBones)
   {
     static float w[MaxBones][FloatsPerBone];
     if (bone < 0 || bone >= h.Bones || !h.InHeld[bone])
       return;
+    ComposeHeld(h, w);
+    KinHold hold;
+    bool kin = h.Kin.Found;
+    if (kin)
+      StartHold(h, bone, w, hold);
+    float endTurn[4];
+    memcpy(endTurn, w[bone] + 4, sizeof(endTurn));
+    QNorm(endTurn);
     if (bone == h.Root || h.Face[bone] || g_FreeMove)
     {
       // Moved itself (Free move: any bone; its children go with it)
-      ComposeHeld(h, w);
       float delta[3] = { target[0] - w[bone][0], target[1] - w[bone][1], target[2] - w[bone][2] };
       TranslateBone(h, bone, delta, w);
+      if (kin)
+        FinishHold(h, hold, w);
       return;
     }
     int chain[4];
@@ -3884,14 +8172,51 @@ namespace
     for (int a = h.Parents[bone]; a >= 0 && count < chainBones && count < 4 && h.InHeld[a] && a != h.Root &&
         h.Part[a] == h.Part[bone]; a = h.Parents[a])
       chain[count++] = a;
+    int role = -1, limbIndex = kin ? LimbOf(h, bone, &role) : -1;
+    KinLimb const* limb = limbIndex >= 0 ? &h.Kin.Limbs[limbIndex] : nullptr;
+    int toeRole = -1, toeLimb = kin && h.Parents[bone] >= 0 ? LimbOf(h, h.Parents[bone], &toeRole) : -1;
+    bool done = true;
+    if (limb && role == 2 && count >= 2 && chain[0] == limb->Mid && chain[1] == limb->Upper)
+    {
+      // A hand or a foot
+      ReachLimb(h, limbIndex, target, count, w);
+      if (g_KeepEndTurn)
+        SetWorldTurn(h, bone, endTurn, w);
+    }
+    else if (limb && role == 1 && count >= 1 && chain[0] == limb->Upper)
+      AimLimbJoint(h, limbIndex, target, count, w);   // an elbow or a knee
+    else if (toeLimb >= 0 && toeRole == 2 && !h.Kin.Limbs[toeLimb].Arm && count >= 3 &&
+        chain[0] == h.Kin.Limbs[toeLimb].End && chain[1] == h.Kin.Limbs[toeLimb].Mid)
+      ReachToe(h, toeLimb, bone, target, w);          // a toe, its foot moving
+    else if (kin && g_SpineCurve && count >= 2 && InSpineOrNeck(h, chain[0]) && InSpineOrNeck(h, chain[count - 1]))
+    {
+      bool all = true;
+      for (int k = 0; k < count; ++k)
+        all = all && InSpineOrNeck(h, chain[k]);
+      if (all)
+        CurveChain(h, bone, chain, count, target, w);   // a chest or a head
+      else
+        done = false;
+    }
+    else
+      done = false;
+    if (done)
+    {
+      FinishHold(h, hold, w);
+      return;
+    }
     if (count == 0)
     {
       SwingBone(h, bone, target, w);
+      if (kin)
+        FinishHold(h, hold, w);
       return;
     }
     if (count == 2)
     {
       TwoBone(h, chain[1], chain[0], bone, target, w);
+      if (kin)
+        FinishHold(h, hold, w);
       return;
     }
     // One bone: it turns to point at it; more: each in turn, again and again
@@ -3917,6 +8242,11 @@ namespace
       if (Distance3(w[bone], target) < 0.001f)
         break;
     }
+    // (a hand or foot with only its forearm or shin bending keeps its angle too)
+    if (limb && role == 2 && g_KeepEndTurn)
+      SetWorldTurn(h, bone, endTurn, w);
+    if (kin)
+      FinishHold(h, hold, w);
   }
 
   // The eye a dragged bone stands for: an eye, or an iris (its child); -1
@@ -4196,12 +8526,3363 @@ namespace
     g_Move.Accepted = SnapshotOf(h);
     memcpy(g_Move.AcceptedPlace, after[bone], sizeof(g_Move.AcceptedPlace));
   }
+
+  // ---- The Pose window: its parts and shared bits ----
+
+  char const* PoseIntroText()
+  {
+    return "Pose Faith, KrugerSec and other people bone by bone: pick one, Take pose, then drag its bones' dots on "
+      "the picture where you like, turn a bone with its rings, or use the sliders here. Freeze time holds everyone "
+      "while you pose (with time running, posed KrugerSec keep their AI: they walk, aim and fight in the pose).";
+  }
+
+  void SameLineIfFits(char const* nextLabel, bool checkbox)
+  {
+    char const* end = strstr(nextLabel, "##");
+    ImGuiStyle const& style = ImGui::GetStyle();
+    float width = ImGui::CalcTextSize(nextLabel, end).x +
+      (checkbox ? ImGui::GetFrameHeight() + style.ItemInnerSpacing.x : style.FramePadding.x * 2.f);
+    // The cursor is already back at the line's start here: measure from where the previous item ended
+    float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    if (ImGui::GetItemRectMax().x + style.ItemSpacing.x + width <= right)
+      ImGui::SameLine();
+  }
+
+  bool TabButton(char const* label, bool selected, float width)
+  {
+    ImVec4 white = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ImVec4 red = ImGui::GetStyleColorVec4(ImGuiCol_Button);
+    if (selected)
+    {
+      ImGui::PushStyleColor(ImGuiCol_Button, white);
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, white);
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, white);
+      ImGui::PushStyleColor(ImGuiCol_Text, red);
+    }
+    bool clicked = ImGui::Button(label, ImVec2(width, ImGui::GetFrameHeight() * 1.35f));
+    if (selected)
+      ImGui::PopStyleColor(4);
+    return clicked;
+  }
+
+  bool AnyEdited(Held const& h)
+  {
+    for (int n = 0; n < h.Count; ++n)
+      if (IsEdited(h, (int)h.List[n]))
+        return true;
+    return false;
+  }
+
+  Held* DrawWho()
+  {
+    float fontSize = ImGui::GetFontSize();
+    Held* active = g_Active >= 0 && g_Held[g_Active].Used && !g_Held[g_Active].Restoring ? &g_Held[g_Active] : nullptr;
+    int editable = 0;
+    for (int i = 0; i < MaxHeld; ++i)
+      editable += g_Held[i].Used && !g_Held[i].Restoring;
+    char header[128];
+    _snprintf_s(header, sizeof(header), _TRUNCATE, "Who: %s###PoseWho",
+      active ? active->Label : (editable ? "pick a held one" : "nobody held"));
+    if (ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen))
+    {
+      ImGui::BeginChild("##PoseWho", ImVec2(fontSize * 18.f, fontSize * 6.5f), true);
+      ImGui::Text("Near the camera (%d):", (int)g_Candidates.size());
+      for (Candidate const& c : g_Candidates)
+      {
+        char row[200];
+        char const* note = c.LettingGo ? "  (being let go)" : c.Held ? "  (held)" : c.Skeleton < 0 ?
+          "  (skeleton not known: can't be posed; CT.log says what was read of it)" : c.Cant == Cant_NoRoot ?
+          "  (its bones don't hang on one bone: can't be posed)" : c.Cant == Cant_RootUnanimated ?
+          "  (the game animates no main bone of it: can't be posed)" : c.Animated == 0 ?
+          "  (the game doesn't animate it now: can't be posed)" : c.OtherOverride ? "  (a replay or Dash ghost poses it)" : "";
+        if (c.Kind == Kind_Faith)
+          _snprintf_s(row, sizeof(row), _TRUNCATE, "Faith%s##%I64X", note, c.Entity);
+        else
+          _snprintf_s(row, sizeof(row), _TRUNCATE, "%s, %.1f m%s##%I64X", KindName(c.Kind, c.Skeleton), c.Distance, note,
+            c.Entity);
+        if (ImGui::Selectable(row, g_Picked == c.Entity))
+        {
+          g_Picked = c.Entity;
+          for (int i = 0; i < MaxHeld; ++i)
+            if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Entity == c.Entity && g_Active != i)
+            {
+              g_Active = i;
+              g_SelectedBone = g_Held[i].Root;
+              g_SelectedGroup = -1;
+              g_SelectedWeapon = -1;
+            }
+        }
+        if (note[0] && !c.Held)
+          ImGui::ItemTooltip(note + 2);
+      }
+      if (g_Candidates.empty())
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextDisabled(g_ScannedAt ? "Nobody that can be posed within %.0f m of the camera" : "Looking...", ScanRadius);
+        ImGui::PopTextWrapPos();
+      }
+      ImGui::EndChild();
+
+      ImGui::SameLine();
+      active = g_Active >= 0 && g_Held[g_Active].Used && !g_Held[g_Active].Restoring ? &g_Held[g_Active] : nullptr;
+      int heldCount = 0;
+      for (int i = 0; i < MaxHeld; ++i)
+        heldCount += g_Held[i].Used;
+      ImGui::BeginChild("##PoseWhoInfo", ImVec2(0.f, fontSize * 6.5f), false);
+      Candidate const* picked = nullptr;
+      for (Candidate const& c : g_Candidates)
+        if (c.Entity == g_Picked)
+          picked = &c;
+      bool canTake = picked && !picked->Held && picked->Skeleton >= 0 && picked->Cant == Cant_No && picked->Animated != 0 &&
+        !picked->OtherOverride;
+      if (!canTake)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+      if (ImGui::Button("Take pose", ImVec2(fontSize * 7.f, 0.f)) && canTake)
+      {
+        g_TakeWhat = *picked;
+        g_TakeRequest = true;
+      }
+      if (!canTake)
+        ImGui::PopStyleVar();
+      ImGui::HelpMarker("Holds the picked one's pose as it is now: from then on it's drawn in the pose you make, from its "
+        "hips down to its fingers, while it stays where the game has it. Up to 8 at a time.");
+      bool activeHasKeys = active && KeysSpanTime(active->Keys);
+      bool anyHeldHasKeys = false;
+      for (int i = 0; i < MaxHeld; ++i)
+        if (g_Held[i].Used && KeysSpanTime(g_Held[i].Keys))
+          anyHeldHasKeys = true;
+      if (activeHasKeys)
+      {
+        if (ImGui::ConfirmButton("Let go") && active)
+          g_ReleaseRequest = g_Active;
+      }
+      else if (ImGui::Button("Let go") && active)
+        g_ReleaseRequest = g_Active;
+      char allLabel[48];
+      _snprintf_s(allLabel, sizeof(allLabel), _TRUNCATE, "Let go of all (%d)", heldCount);
+      SameLineIfFits(allLabel);
+      if (anyHeldHasKeys)
+      {
+        if (ImGui::ConfirmButton(allLabel) && heldCount)
+          g_ReleaseRequest = -1;
+      }
+      else if (ImGui::Button(allLabel) && heldCount)
+        g_ReleaseRequest = -1;
+
+      if (active)
+      {
+        ImGui::Text("Editing: %s", active->Label);
+        ImGui::HelpMarker(PoseIntroText());
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextDisabled("%s", active->Status[0] ? active->Status : "Being taken...");
+        if (active->CheckLine[0])
+          ImGui::TextDisabled("%s", active->CheckLine);
+        ImGui::PopTextWrapPos();
+      }
+      if (g_HairWhilePaused)
+      {
+        char hairStatus[160];
+        paused_hair::Status(hairStatus, sizeof(hairStatus));
+        if (hairStatus[0])
+        {
+          ImGui::PushTextWrapPos(0.f);
+          ImGui::TextDisabled("%s", hairStatus);
+          ImGui::PopTextWrapPos();
+        }
+      }
+      for (int i = 0; i < MaxHeld; ++i)
+        if (g_Held[i].Used && g_Held[i].Restoring && g_Held[i].RestoreWaitLogged)
+        {
+          ImGui::PushTextWrapPos(0.f);
+          ImGui::TextDisabled("%s: let go, its bones put back when the game animates it again (it doesn't now). Let go of "
+            "all lets it go now, as posed.", g_Held[i].Label);
+          ImGui::PopTextWrapPos();
+        }
+      ImGui::EndChild();
+    }
+
+    active = g_Active >= 0 && g_Held[g_Active].Used && !g_Held[g_Active].Restoring ? &g_Held[g_Active] : nullptr;
+    if (!active)
+    {
+      int heldCount = 0;
+      for (int i = 0; i < MaxHeld; ++i)
+        heldCount += g_Held[i].Used;
+      ImGui::PushTextWrapPos(0.f);
+      ImGui::TextDisabled("%s", PoseIntroText());
+      ImGui::PopTextWrapPos();
+      ImGui::TextDisabled(heldCount ? "Pick a held one in the list to edit it" : "No pose held");
+      if (g_LetGoMessage[0])
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextUnformatted(g_LetGoMessage);
+        ImGui::PopTextWrapPos();
+      }
+    }
+    return active;
+  }
+
+  void DrawOptionsTab(Held& h, bool& configChanged)
+  {
+    float fontSize = ImGui::GetFontSize();
+    configChanged |= ImGui::Checkbox("Show the bones on the picture", &g_ShowBones);
+    configChanged |= ImGui::Checkbox("Face", &g_ShowFace);
+    SameLineIfFits("Group the face", true);
+    configChanged |= ImGui::Checkbox("Group the face", &g_GroupFace);
+    ImGui::HelpMarker("The face's bones as groups (eyes, eyelids, brows, lips, mouth corners, cheeks, nose): a group's dot "
+      "turns or moves all its bones together. Dragging the Eyes makes them look at a point.");
+    SameLineIfFits("Fingers", true);
+    configChanged |= ImGui::Checkbox("Fingers", &g_ShowFingers);
+    SameLineIfFits("Helper bones", true);
+    configChanged |= ImGui::Checkbox("Helper bones", &g_ShowHelpers);
+    const char* bends[] = { "only the bone above it", "the 2 bones above it (arm, leg)", "the 3 bones above it",
+      "the 4 bones above it" };
+    int bendIndex = g_MoveBones - 1;
+    ImGui::PushItemWidth(fontSize * 9.f);
+    if (ImGui::Combo("A dragged bone bends", &bendIndex, bends, 4))
+    {
+      g_MoveBones = bendIndex + 1;
+      configChanged = true;
+    }
+    ImGui::PopItemWidth();
+    ImGui::Checkbox("Free move", &g_FreeMove);
+    ImGui::HelpMarker("Dragging a bone moves the bone itself instead of bending the bones above it; the bones below it "
+      "go with it. Drag one of the picked bone's red, green or blue arrows to move it along that axis only.");
+    configChanged |= ImGui::Checkbox("Bones stop at walls", &g_StopAtWalls);
+    if (g_StopAtWalls && !g_WallsReady)
+    {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(not available now: see CT.log)");
+    }
+    ImGui::Checkbox("Idle movement", &g_IdleOn);
+    ImGui::HelpMarker("Lays the character's own idle animation (breathing, weight shifts) over the pose in small moves; "
+      "Amount scales them. It pauses while the character walks or runs, and under Freeze time.");
+    if (g_IdleOn)
+    {
+      ImGui::SliderFloat("Amount##PoseIdle", &g_IdleAmount, 0.f, 2.f, "%.2f");
+      if (g_IdleUnavailable[0])
+        ImGui::TextDisabled("%s", g_IdleUnavailable);
+    }
+    configChanged |= ImGui::Checkbox("Rings on the bone's own axes", &g_RingsOnBone);
+    ImGui::HelpMarker("Ticked, the picked bone's red, green and blue rings are its own X, Y and Z; unticked, the world's. "
+      "The white ring turns it about the view.");
+
+    // The kinematics (2026-11-16, PoseKinematics.inl, PoseMotion.inl)
+    ImGui::SubHeading("Joints");
+    configChanged |= ImGui::Checkbox("Elbows and knees bend like real joints", &g_JointHinges);
+    ImGui::HelpMarker("A dragged hand or foot bends its elbow or knee only the way it bends by nature, at most about 150 "
+      "degrees (with \"A dragged bone bends\" at 2 bones or more). Off: no hinge and no limit.");
+    configChanged |= ImGui::Checkbox("Dragged hands and feet keep their angle", &g_KeepEndTurn);
+    ImGui::HelpMarker("On: a hand or foot you drag stays turned the way it is in the world (a foot flat on the floor "
+      "stays flat). Off: it turns with its forearm or shin.");
+    configChanged |= ImGui::Checkbox("Feet stay where they stand when the Hips move", &g_FeetPlanted);
+    ImGui::HelpMarker("Dragging or turning the Hips bends the legs so the feet stay put, as far as the legs reach (the "
+      "Hips' Move field still moves the whole body). Off: the whole body moves with the Hips.");
+    configChanged |= ImGui::Checkbox("Collarbone joins an arm raise", &g_CollarFollows);
+    ImGui::HelpMarker("A dragged hand or elbow takes its collarbone along a little, so the shoulder rises with a raised arm "
+      "and comes forward with a reach.");
+    configChanged |= ImGui::Checkbox("Back and neck bend in a curve", &g_SpineCurve);
+    ImGui::HelpMarker("Dragging the chest or the head bends the spine or neck below it in a curve, not at one joint (with "
+      "\"A dragged bone bends\" at 2 bones or more).");
+    configChanged |= ImGui::Checkbox("A far reach bends the back", &g_FarReach);
+    ImGui::HelpMarker("A hand dragged past its arm's reach bends the back towards it (at most 35 degrees).");
+    configChanged |= ImGui::Checkbox("Roll and twist bones follow", &g_HelpersFollow);
+    ImGui::HelpMarker("The roll and twist bones follow their limb's turn, so a turned wrist doesn't twist like a sweet "
+      "wrapper.");
+
+    ImGui::SubHeading("While the keyframes play");
+    configChanged |= ImGui::SliderFloat("Loose timing", &g_LooseTiming, 0.f, 1.f, "%.2f");
+    ImGui::HelpMarker("While the keyframes play, the head and arms follow the chest a moment later, the hands later still. "
+      "0: off.");
+    configChanged |= ImGui::SliderFloat("Follow-through", &g_FollowThrough, 0.f, 1.f, "%.2f");
+    ImGui::HelpMarker("While the keyframes play, the arms, hands and head lag a little and settle, as if they had weight. "
+      "0: off.");
+    configChanged |= ImGui::Checkbox("Feet stay put between keyframes", &g_FootLock);
+    ImGui::HelpMarker("While the keyframes play, a foot that's in the same place at the keyframes either side stays there "
+      "instead of sliding. Not with an animation clip on.");
+
+    ImGui::SubHeading("On the picture");
+    configChanged |= ImGui::Checkbox("The picked bone's path over the keyframes", &g_ShowTrail);
+    ImGui::HelpMarker("An orange line of where the picked bone goes over the keyframes, with a dot at each keyframe time. "
+      "Drag a dot to move the bone at that time (keyframed when you let go); a click only moves the playhead there. "
+      "With Auto key off, keyframe or undo a change first.");
+    configChanged |= ImGui::Checkbox("Ghost poses at the keyframes either side", &g_ShowGhosts);
+    ImGui::HelpMarker("The pose at the keyframe time before the playhead (blue) and after it (green), as lines between "
+      "the bones.");
+
+    ImGui::SubHeading("Look at");
+    {
+      const char* looks[] = { "Off", "The camera", "A point (drag its dot)" };
+      int look = h.LookMode < Look_Off || h.LookMode > Look_Point ? Look_Off : h.LookMode;
+      if (ImGui::Combo("##PoseLook", &look, looks, 3) && look != h.LookMode)
+      {
+        if (look == Look_Point && !h.LookPointOk)
+          PlaceLookPoint(h);
+        h.LookMode = look;
+      }
+      ImGui::HelpMarker("The eyes look at the camera or at a point you drag, and the chest, neck and head turn part of the "
+        "way (Amount). It keeps looking while the body moves or the keyframes play.");
+      if (h.LookMode != Look_Off)
+      {
+        ImGui::SliderFloat("Amount##PoseLookAmount", &h.LookAmount, 0.f, 1.f, "%.2f");
+        if (!h.Kin.FaceOk)
+          ImGui::TextDisabled("This character's eyes or head weren't found: it can't look.");
+        else if (h.LookMode == Look_Point && !h.LookPointOk)
+          ImGui::TextDisabled("Its point is placed in front of the face once the pose is in the world.");
+      }
+    }
+
+    ImGui::SubHeading("Keyframes");
+    bool wasOn = h.Keys.On;
+    ImGui::Checkbox("Use the keyframes", &h.Keys.On);
+    if (h.Keys.On && !wasOn)
+      h.KeysAppliedOk = false;
+    configChanged |= ImGui::Checkbox("Auto key (every change is keyframed at once)", &g_AutoKey);
+    ImGui::HelpMarker("While the keyframes are on and not playing, every change to a bone is keyframed at the playhead (the "
+      "KEYFRAMES row's red Auto key is the same switch). Off: press Keyframe to keep a change.");
+    configChanged |= ImGui::Checkbox("Hold the times around a new keyframe", &g_KeyAnchors);
+    ImGui::HelpMarker("A bone's first keyframe also gets hollow keyframes at the nearest times before and after, so the "
+      "change shows only between them.");
+    configChanged |= ImGui::Checkbox("Times snap to 0.05 s", &g_SnapKeys);
+    ImGui::HelpMarker("Times you set by hand on the timeline snap to 0.05 s.");
+    if (h.Keys.Clock == pose_keys::Clock_Game || h.Keys.Clock == pose_keys::Clock_Real)
+      ImGui::SliderFloat("Speed", &h.Keys.Speed, 0.05f, 4.f, "%.2fx");
+    else if (h.Keys.Clock == pose_keys::Clock_Track)
+    {
+      float begins = h.Keys.Start == 0.0 ? 0.f : (float)-h.Keys.Start;
+      bool typing = TypingInField();
+      if (ImGui::DragFloat("Begins at", &begins, 0.01f, 0.f, 3600.f, "%.2f s") && DragTakes(typing))
+        h.Keys.Start = -(double)begins;   // (a click alone only rounds it: a file's -1.234 stays)
+    }
+    if (ImGui::ConfirmButton("Remove all keyframes"))
+      RemoveAllKeys(h);
+  }
+
+  void DrawFilesTab(Held& h)
+  {
+    float fontSize = ImGui::GetFontSize();
+    ImGui::InputText("Pose name", g_SaveName, sizeof(g_SaveName));
+    SameLineIfFits("Save");
+    if (ImGui::Button("Save"))
+      SavePose(h, g_SaveName);
+    ULONGLONG now = GetTickCount64();
+    if (now - g_FilesListedAt > 2000)
+    {
+      ListPoseFiles();
+      g_FilesListedAt = now;
+    }
+    if (!g_PoseFiles.empty())
+    {
+      ImGui::Text("Load onto %s:", h.Label);
+      ImGui::SameLine();
+      ImGui::HelpMarker("Each saved bone with the same name gets the saved turn, so a pose loads onto any skeleton "
+        "with those bones (Faith's onto a KrugerSec's and so on). Where two skeletons' bones are set up differently, "
+        "a bone can come out turned another way. Undo takes a load back.");
+      ImGui::BeginChild("##PoseFiles", ImVec2(0.f, fontSize * 5.f), true);
+      for (std::string const& file : g_PoseFiles)
+      {
+        std::string label = file + "##posefile";
+        if (ImGui::Selectable(label.c_str(), false))
+          LoadPose(h, file.c_str());
+      }
+      ImGui::EndChild();
+    }
+    if (g_FileMessage[0])
+    {
+      ImGui::PushTextWrapPos(0.f);
+      ImGui::TextDisabled("%s", g_FileMessage);
+      ImGui::PopTextWrapPos();
+    }
+
+    ImGui::SubHeading("Keyframes");
+    ImGui::InputText("Keyframes name", g_KeySaveName, sizeof(g_KeySaveName));
+    bool canSaveKeys = pose_keys::KeyCount(h.Keys) > 0 || AnyEdited(h);
+    SameLineIfFits("Save##PoseKeysSave");
+    if (!canSaveKeys)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    if (ImGui::Button("Save##PoseKeysSave") && canSaveKeys && SaveKeys(h, g_KeySaveName))
+    {
+      char clean[64];
+      if (CleanName(g_KeySaveName, clean, sizeof(clean)))
+        h.KeysFile = h.KeysSuggest = PoseKeysPath(clean);   // (the keyframes bar's Save writes there from now on)
+    }
+    if (!canSaveKeys)
+      ImGui::PopStyleVar();
+    if (now - g_KeyFilesListedAt > 2000)
+    {
+      ListKeyFiles();
+      g_KeyFilesListedAt = now;
+    }
+    ImGui::Text("Load keyframes onto %s:", h.Label);
+    ImGui::BeginChild("##PoseKeyFiles", ImVec2(0.f, fontSize * 5.f), true);
+    for (std::wstring const& file : g_KeyFiles)
+    {
+      std::string label = Utf8Of(file) + "##posekeysfile";
+      if (ImGui::Selectable(label.c_str(), false))
+      {
+        std::wstring path = PoseKeysPath(file);
+        if (LoadKeysFromPath(h, path))
+        {
+          h.KeysFile.clear();   // (Save asks after a load: a loaded file isn't written over by mistake)
+          h.KeysSuggest = path;
+        }
+      }
+    }
+    ImGui::EndChild();
+    if (g_FileMessage[0])
+    {
+      ImGui::PushTextWrapPos(0.f);
+      ImGui::TextDisabled("%s", g_FileMessage);
+      ImGui::PopTextWrapPos();
+    }
+    char autosave[128];
+    AutosaveName(h, autosave, sizeof(autosave));
+    char line[640];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "The keyframes go when the pose is let go (a respawn or a level load lets "
+      "go by itself): those at two times or more are then saved as \"%s\", and while you work too, at most every 30 s, "
+      "so a crash or closing the game loses little; keyframes at one time only (a still) aren't saved by themselves: "
+      "press Save above. A file of that name from before is kept once as \"%s before\".", autosave, autosave);
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextDisabled("%s", line);
+    ImGui::PopTextWrapPos();
+  }
+
+  void DrawBonesPane(Held& h, float height)
+  {
+    float fontSize = ImGui::GetFontSize();
+    ImGui::BeginChild("##PoseBonesPane", ImVec2(fontSize * 15.f, height), true);
+    ImGui::PushItemWidth(-1.f);
+    ImGui::InputText("##PoseFind", g_Filter, sizeof(g_Filter));
+    if (!g_Filter[0] && !ImGui::IsItemActive())
+    {
+      ImVec2 at = ImGui::GetItemRectMin();
+      at.x += ImGui::GetStyle().FramePadding.x;
+      at.y += ImGui::GetStyle().FramePadding.y;
+      ImGui::GetWindowDrawList()->AddText(at, ImGui::GetColorU32(ImGuiCol_TextDisabled), "Find a bone");
+    }
+    ImGui::PopItemWidth();
+    ImGui::BeginChild("##PoseBones", ImVec2(0.f, 0.f), true);
+    bool scrollGroup = g_SelectedGroup != g_BoneListGroup;
+    bool scrollBone = g_SelectedBone != g_BoneListBone;
+    bool groupDrawn = false, boneDrawn = false;
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n];
+      char const* name = BoneName(h, i);
+      if (g_Filter[0])
+      {
+        bool match = false;
+        size_t fl = strlen(g_Filter);
+        for (char const* p = name; *p && !match; ++p)
+          match = _strnicmp(p, g_Filter, fl) == 0;
+        if (!match)
+          continue;
+      }
+      else
+      {
+        if (GroupShown(h, h.Group[i]))
+        {
+          int g = h.Group[i];
+          if (h.GroupMembers[g][0] != i)
+            continue;
+          char row[200];
+          int indent = h.Depth[i] > 30 ? 30 : h.Depth[i];
+          _snprintf_s(row, sizeof(row), _TRUNCATE, "%*s%s (%d bones)##group%d", indent, "", FaceGroupNames[g], h.GroupSize[g],
+            g);
+          bool wasSelected = g_SelectedGroup == g;
+          bool clicked = ImGui::Selectable(row, wasSelected);
+          if (wasSelected && scrollGroup && !clicked)
+          {
+            ImGui::SetScrollHere();
+            g_BoneListGroup = g_SelectedGroup;
+          }
+          if (clicked)
+          {
+            g_SelectedGroup = g;
+            g_SelectedBone = -1;
+            g_SelectedWeapon = -1;
+            g_BoneListGroup = g_SelectedGroup;
+            g_BoneListBone = g_SelectedBone;
+          }
+          if (g_SelectedGroup == g)
+            groupDrawn = true;
+          bool keyed = false;
+          for (int k = 0; k < h.GroupSize[g]; ++k)
+            if (pose_keys::Find(h.Keys, h.GroupMembers[g][k]) != nullptr)
+            {
+              keyed = true;
+              break;
+            }
+          char marks[3];
+          int mark = 0;
+          if (GroupEdited(h, g))
+            marks[mark++] = '*';
+          if (keyed)
+            marks[mark++] = 'K';
+          marks[mark] = '\0';
+          if (marks[0])
+          {
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - fontSize * 1.8f);
+            ImGui::TextDisabled("%s", marks);
+          }
+          continue;
+        }
+        if (!BoneShown(h, i) && i != g_SelectedBone)
+          continue;
+      }
+      char row[200];
+      int indent = g_Filter[0] ? 0 : (h.Depth[i] > 30 ? 30 : h.Depth[i]);
+      _snprintf_s(row, sizeof(row), _TRUNCATE, "%*s%s##bone%d", indent, "", name, i);
+      bool wasSelected = g_SelectedBone == i;
+      bool clicked = ImGui::Selectable(row, wasSelected);
+      if (wasSelected && scrollBone && !clicked)
+      {
+        ImGui::SetScrollHere();
+        g_BoneListBone = g_SelectedBone;
+      }
+      if (clicked)
+      {
+        g_SelectedBone = i;
+        g_SelectedGroup = -1;
+        g_SelectedWeapon = -1;
+        g_BoneListBone = g_SelectedBone;
+        g_BoneListGroup = g_SelectedGroup;
+      }
+      if (g_SelectedBone == i)
+        boneDrawn = true;
+      char marks[3];
+      int mark = 0;
+      if (IsEdited(h, i))
+        marks[mark++] = '*';
+      if (pose_keys::Find(h.Keys, i) != nullptr)
+        marks[mark++] = 'K';
+      marks[mark] = '\0';
+      if (marks[0])
+      {
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - fontSize * 1.8f);
+        ImGui::TextDisabled("%s", marks);
+      }
+    }
+    if (!groupDrawn)
+      g_BoneListGroup = g_SelectedGroup;
+    if (!boneDrawn)
+      g_BoneListBone = g_SelectedBone;
+    ImGui::EndChild();
+    ImGui::EndChild();
+  }
+
+  // A Bone tab slider's edit (absolute: it sets the bone's turn or move from the slider) with the pins and planted feet
+  // kept: made each frame from the pose the slider was taken in (g_SliderPress), as a ring's drag is from its press
+  void SliderHold(Held& h, int bone, std::function<void()> const& edit, bool plantFeet = true)
+  {
+    if (!PlayingKeys(h) && h.Kin.Found && g_SliderPressHeld == h.Id &&
+        g_SliderPress.Turns.size() == (size_t)h.Bones * 4 && g_SliderPress.Moves.size() == (size_t)h.Bones * 3)
+      ApplySnapshot(h, g_SliderPress);
+    HoldAround(h, bone, edit, plantFeet);
+  }
+
+  // A bone of an arm or a leg (2026-11-16): its elbow's or knee's direction (swung about the line from the shoulder or
+  // hip to the hand or foot, which stay where they are), and a hand's or foot's pin
+  void DrawLimbControls(Held& h, int bone, bool& slidersActive)
+  {
+    int role = -1, l = h.Kin.Found ? LimbOf(h, bone, &role) : -1;
+    if (l < 0)
+      return;
+    KinLimb const& limb = h.Kin.Limbs[l];
+    static float swivel = 0.f;
+    static int swivelBone = -1;
+    if (swivelBone != bone)
+    {
+      swivel = 0.f;
+      swivelBone = bone;
+    }
+    // (not while the keyframes play with keys on the limb: they'd put it back each frame)
+    bool keyedLimb = pose_keys::Find(h.Keys, limb.Upper) || pose_keys::Find(h.Keys, limb.Mid) ||
+      pose_keys::Find(h.Keys, limb.End);
+    if (PlayingKeys(h) && keyedLimb)
+      ImGui::TextDisabled(limb.Arm ? "Elbow direction: pause the keyframes (the arm has keyframes)." :
+        "Knee direction: pause the keyframes (the leg has keyframes).");
+    else
+    {
+      float was = swivel;
+      ImGui::DragFloat(limb.Arm ? "Elbow direction##PoseSwivel" : "Knee direction##PoseSwivel", &swivel, 0.5f, -180.f,
+        180.f, "%+.0f deg");
+      bool active = ImGui::IsItemActive();
+      slidersActive |= active;
+      if (swivel != was && std::isfinite(swivel) && std::isfinite(was))
+        SwivelLimb(h, l, (swivel - was) * KinPi / 180.f);
+      if (!active)
+        swivel = 0.f;
+      ImGui::SameLine();
+      ImGui::HelpMarker(limb.Arm ? "Drag sideways: the elbow swings round the line from the shoulder to the hand, the "
+        "hand staying where it is and as it's turned (the upper arm and forearm turn). It shows how far this drag has "
+        "gone." : "Drag sideways: the knee swings round the line from the hip to the foot, the foot staying where it is "
+        "and as it's turned (the thigh and shin turn). It shows how far this drag has gone.");
+    }
+    if (role == 2)
+    {
+      bool pinned = h.Pins[l].On;
+      if (ImGui::Checkbox(limb.Arm ? "Pin the hand where it is##PosePin" : "Pin the foot where it is##PosePin", &pinned))
+      {
+        if (pinned)
+        {
+          static float w[MaxBones][FloatsPerBone];
+          ComposeHeld(h, w);
+          TakePin(h, l, w);
+        }
+        h.Pins[l].On = pinned;
+      }
+      ImGui::SameLine();
+      ImGui::HelpMarker("Pinned, it stays where it is (and as it's turned) while you pose the rest: drag the hips, bend the "
+        "back, turn the shoulders, and the arm or leg bends to keep it there (as far as it reaches). Drag it, its elbow or "
+        "knee, or a toe yourself to move it: the pin goes with it, and so it does when something else moves it (Undo, a "
+        "reset, the keyframes' time). Pins hold while you pose, not while keyframes or a clip play (keyframe the pose as "
+        "you want it). A magenta square shows it, with the bones.");
+    }
+  }
+
+  // A bone with keyframes before and after the playhead (2026-11-16): set it between them (a breakdown: 0 % its
+  // keyframe before, 100 % the one after, past them to overshoot); auto key keyframes it at the playhead
+  void DrawBetweenKeys(Held& h, int bone, bool& slidersActive)
+  {
+    pose_keys::Channel const* channel = h.Keys.On ? pose_keys::Find(h.Keys, bone) : nullptr;
+    if (!channel)
+      return;
+    int before = -1, after = -1;
+    for (size_t k = 0; k < channel->Keys.size(); ++k)
+    {
+      double t = channel->Keys[k].Time;
+      if (t < h.Keys.Time - pose_keys::TimeEpsilon)
+        before = (int)k;
+      else if (t > h.Keys.Time + pose_keys::TimeEpsilon && after < 0)
+        after = (int)k;
+    }
+    if (before < 0 || after < 0)
+      return;
+    static float between = 50.f;
+    static int betweenBone = -1;
+    static double betweenTime = -1.0;
+    if (betweenBone != bone || betweenTime != h.Keys.Time)
+    {
+      between = 50.f;
+      betweenBone = bone;
+      betweenTime = h.Keys.Time;
+    }
+    float was = between;
+    ImGui::SliderFloat("Between its keyframes##PoseBetween", &between, -25.f, 125.f, "%.0f %%");
+    slidersActive |= ImGui::IsItemActive();
+    if (between != was && std::isfinite(between))
+    {
+      pose_keys::Key const& a = channel->Keys[(size_t)before];
+      pose_keys::Key const& b = channel->Keys[(size_t)after];
+      float s = between / 100.f;
+      SliderHold(h, bone, [&]()
+      {
+        QSlerp(a.Turn, b.Turn, s, h.Turn[bone]);
+        for (int k = 0; k < 3; ++k)
+          h.Move[bone][k] = a.Move[k] + (b.Move[k] - a.Move[k]) * s;
+        ClampMove(h, bone);
+      });
+    }
+    ImGui::SameLine();
+    char help[400];
+    _snprintf_s(help, sizeof(help), _TRUNCATE, "Sets this bone between its keyframe before the playhead (0 %%, at %.2f s) "
+      "and its one after (100 %%, at %.2f s): 50 %% is halfway, past either end overshoots. With Auto key on it's "
+      "keyframed at the playhead.", channel->Keys[(size_t)before].Time, channel->Keys[(size_t)after].Time);
+    ImGui::HelpMarker(help);
+  }
+
+  void DrawBoneTab(Held& h, Snapshot const& before, bool& slidersActive)
+  {
+    for (int i = 0; i < h.WeaponCount; ++i)
+    {
+      HeldWeapon const& w = h.Weapons[i];
+      char row[200];
+      char where[64];
+      if (w.Bone == WorldFrame)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "put down");
+      else if (w.Bone >= 0)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "with %s", BoneName(h, w.Bone));
+      else
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "%s", w.Gone ? "the game's (dropped or gone)" :
+          "the game's (not on a bone when taken)");
+      char const* state = w.Bone == -1 ? "" : (!g_WeaponsFollow ? ", where the game has it (Weapons go with the hands is off)" :
+        (w.Drawing ? ", drawn by the tools" : (w.Holding ? ", its entity moved (its body not drawn by the tools)" : "")));
+      _snprintf_s(row, sizeof(row), _TRUNCATE, "Its %s: %s%s%s##weapon%d", w.Name, where, state,
+        i == g_SelectedWeapon ? "  (picked)" : "", i);
+      if (ImGui::Selectable(row, g_SelectedWeapon == i))
+      {
+        g_SelectedWeapon = i;
+        g_SelectedBone = -1;
+        g_SelectedGroup = -1;
+      }
+    }
+
+    ImGui::PushID(g_SelectedGroup >= 0 ? 10000 + g_SelectedGroup : (g_SelectedWeapon >= 0 ? 20000 + g_SelectedWeapon :
+      g_SelectedBone));
+    bool playing = PlayingKeys(h);
+    if (g_SelectedGroup >= 0 && g_SelectedGroup < FaceGroupCount && h.GroupSize[g_SelectedGroup] > 0)
+    {
+      int g = g_SelectedGroup, first = h.GroupMembers[g][0];
+      bool groupHasKeys = false;
+      for (int k = 0; k < h.GroupSize[g]; ++k)
+        if (pose_keys::Find(h.Keys, h.GroupMembers[g][k]) != nullptr)
+          groupHasKeys = true;
+      ImGui::Text("%s (%d bones)", FaceGroupNames[g], h.GroupSize[g]);
+      if (playing && groupHasKeys)
+        ImGui::TextDisabled("The keyframes are playing: pause them to pose.");
+      else
+      {
+        float angles[3];
+        QToAngles(h.Turn[first], angles);
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Turn X##PoseGroupX", &angles[0], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Y##PoseGroupY", &angles[1], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Z##PoseGroupZ", &angles[2], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        ImGui::SameLine();
+        ImGui::HelpMarker("Each bone of the group gets this turn about its parent bone's X, Y and Z, about its own place "
+          "(the values shown are its first bone's).");
+        if (changed)
+        {
+          float q[4];
+          QFromAngles(angles, q);
+          for (int k = 0; k < h.GroupSize[g]; ++k)
+            memcpy(h.Turn[h.GroupMembers[g][k]], q, sizeof(q));
+        }
+        float move[3] = { h.Move[first][0], h.Move[first][1], h.Move[first][2] };
+        if (ImGui::SliderFloat3("Move##PoseGroupMove", move, -MaxFaceMove, MaxFaceMove, "%.3f m"))
+          for (int k = 0; k < h.GroupSize[g]; ++k)
+          {
+            int m = h.GroupMembers[g][k];
+            memcpy(h.Move[m], move, sizeof(move));
+            ClampMove(h, m);
+          }
+        slidersActive |= ImGui::IsItemActive();
+        ImGui::SameLine();
+        ImGui::HelpMarker("Moves each bone of the group the same way, in its parent bone's frame (the face's; the jaw's "
+          "for the lower lip and the low cheeks).");
+      }
+      if (ImGui::Button("Reset this group"))
+      {
+        bool which[MaxBones] = {};
+        for (int k = 0; k < h.GroupSize[g]; ++k)
+        {
+          int m = h.GroupMembers[g][k];
+          bool below[MaxBones] = {};
+          for (int b = m; b < h.Bones; ++b)
+          {
+            below[b] = b == m || (h.Parents[b] >= m && below[h.Parents[b]]);
+            if (below[b])
+              which[b] = true;
+          }
+        }
+        RequestReset(h, which, false, before, "this group");
+      }
+    }
+    else if (g_SelectedBone >= 0 && g_SelectedBone < h.Bones && h.InHeld[g_SelectedBone])
+    {
+      int i = g_SelectedBone;
+      bool boneHasKeys = pose_keys::Find(h.Keys, i) != nullptr;
+      ImGui::Text("%s", BoneName(h, i));
+      if (playing && boneHasKeys)
+        ImGui::TextDisabled("The keyframes are playing: pause them to pose.");
+      else
+      {
+        if (playing && g_AutoKey)
+        {
+          ImGui::PushTextWrapPos(0.f);
+          if (h.KeysTimeMoved)
+            ImGui::TextDisabled("Playing: a change here isn't keyframed, and it stays at every time.");
+          else if (h.Keys.Clock == pose_keys::Clock_Track)
+            ImGui::TextDisabled("The track plays, but the keyframes' time is held (at their start or end, Loop off): "
+              "Auto key keyframes a change here once the track stops, unless the time moves first.");
+          else
+            ImGui::TextDisabled("Playing, but the keyframes' time is held (time frozen, the clip holding it, or the "
+              "keyframes at their start or end with Loop off): Auto key keyframes a change here when you pause, unless "
+              "the time moves first.");
+          ImGui::PopTextWrapPos();
+        }
+        float angles[3];
+        QToAngles(h.Turn[i], angles);
+        float shown[3] = { angles[0], angles[1], angles[2] };
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Turn X##PoseX", &shown[0], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Y##PoseY", &shown[1], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Z##PoseZ", &shown[2], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        ImGui::SameLine();
+        ImGui::HelpMarker("The bone's turn from the pose it was taken in, about its parent bone's X, Y and Z (in that "
+          "order). The rings on the picture turn it too (see Rings on the bone's own axes).");
+        if (changed)
+          SliderHold(h, i, [&]() { QFromAngles(shown, h.Turn[i]); });   // (pinned hands and feet, planted feet kept)
+        bool moved = h.Move[i][0] != 0.f || h.Move[i][1] != 0.f || h.Move[i][2] != 0.f;
+        if (i == h.Root || h.Face[i] || g_FreeMove || moved)
+        {
+          // (the root's is a drag field: a click alone rounds it to what it shows, ImGui 1.61, so only a drag or a
+          // typed number is applied, as the Time field does)
+          float moveShown[3] = { h.Move[i][0], h.Move[i][1], h.Move[i][2] };
+          bool typing = TypingInField();
+          bool changedMove = i == h.Root ? ImGui::DragFloat3("Move##PoseMove", moveShown, 0.01f, 0.f, 0.f, "%.3f m") :
+            ImGui::SliderFloat3("Move##PoseMove", moveShown, -MoveLimit(h, i), MoveLimit(h, i), "%.3f m");
+          if (changedMove && (i != h.Root || DragTakes(typing)))
+            SliderHold(h, i, [&]()
+            {
+              memcpy(h.Move[i], moveShown, sizeof(moveShown));
+              ClampMove(h, i);
+            }, false);   // (the Hips' Move moves the whole body: the feet go with it; pins hold)
+          slidersActive |= ImGui::IsItemActive();
+          ImGui::SameLine();
+          ImGui::HelpMarker(i == h.Root ? "Moves the whole body from where the character is, in the frame of the bone "
+            "under it (AITrajectory: where the game has the character, turned its way), as far as you like (up to 100 km): "
+            "drag a field sideways, or double-click it and type a number." : (h.Face[i] ? "Moves the face bone, in "
+            "its parent bone's frame." : "Moves the bone (and every bone below it) from where it is, in its parent bone's "
+            "frame. The mesh stretches between it and its parent."));
+        }
+        DrawLimbControls(h, i, slidersActive);
+        DrawBetweenKeys(h, i, slidersActive);
+      }
+      if (ImGui::Button("Reset this bone"))
+      {
+        bool which[MaxBones] = {};
+        which[i] = true;
+        RequestReset(h, which, false, before, "this bone");
+      }
+      SameLineIfFits("Reset it and the bones below");
+      if (ImGui::Button("Reset it and the bones below"))
+      {
+        bool below[MaxBones] = {};
+        for (int b = i; b < h.Bones; ++b)
+          below[b] = b == i || (h.Parents[b] >= 0 && h.Parents[b] >= i && below[h.Parents[b]]);
+        RequestReset(h, below, false, before, "it and the bones below");
+      }
+    }
+    else if (g_SelectedWeapon >= 0 && g_SelectedWeapon < h.WeaponCount)
+    {
+      HeldWeapon& w = h.Weapons[g_SelectedWeapon];
+      ImGui::Text("Its %s", w.Name);
+      if (w.Bone == -1)
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextDisabled(!w.Gone ? "It wasn't on one of its bones when the pose was taken, so the game has it." :
+          "It isn't its own any more (dropped or gone): the game has it.");
+        ImGui::PopTextWrapPos();
+        float local[FloatsPerBone], world[FloatsPerBone];
+        if (!w.Gone && ImGui::Button("Pose it where it is") && WeaponPlace(w, h.Entity, local, world))
+        {
+          PushUndo(h, before);
+          w.Bone = WorldFrame;
+          memcpy(w.OffsetLocal, local, sizeof(w.OffsetLocal));
+          memcpy(w.OffsetWorld, world, sizeof(w.OffsetWorld));
+          w.OffsetLocal[3] = w.OffsetWorld[3] = 1.f;
+          w.EditMove[0] = w.EditMove[1] = w.EditMove[2] = 0.f;
+          QIdentity(w.EditTurn);
+        }
+      }
+      else
+      {
+        int attachTo = w.TakenBone >= 0 ? w.TakenBone : (h.GripBone >= 0 ? h.GripBone : h.Root);
+        bool attached = w.Bone >= 0;
+        char label[96];
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "Goes with %s##PoseWeaponWith", BoneName(h, attached ? w.Bone : attachTo));
+        if (ImGui::Checkbox(label, &attached) && h.WorldOk)
+        {
+          PushUndo(h, before);
+          MoveWeaponTo(h, w, attached ? attachTo : WorldFrame);
+        }
+        ImGui::SameLine();
+        ImGui::HelpMarker("Ticked, it goes with that bone when you pose it (where it is on the bone stays). Unticked, "
+          "it's put down: it stays where it is in the world however the body moves. Either way, drag its square on the "
+          "picture to move it, turn it with its rings, or use the sliders.");
+        float angles[3];
+        QToAngles(w.EditTurn, angles);
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Turn X##PoseWeaponX", &angles[0], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Y##PoseWeaponY", &angles[1], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        changed |= ImGui::SliderFloat("Turn Z##PoseWeaponZ", &angles[2], -180.f, 180.f, "%.1f deg");
+        slidersActive |= ImGui::IsItemActive();
+        ImGui::SameLine();
+        ImGui::HelpMarker(w.Bone >= 0 ? "Its turn about its own place, about its bone's X, Y and Z (in that order)." :
+          "Its turn about its own place, about the world's X, Y (up) and Z (in that order).");
+        if (changed)
+          QFromAngles(angles, w.EditTurn);
+        float weaponMove[3] = { w.EditMove[0], w.EditMove[1], w.EditMove[2] };
+        bool typing = TypingInField();
+        if (ImGui::DragFloat3("Move##PoseWeaponMove", weaponMove, 0.005f, 0.f, 0.f, "%.3f m") &&
+            DragTakes(typing))   // (a click alone only rounds it)
+          for (int k = 0; k < 3; ++k)
+            w.EditMove[k] = std::isfinite(weaponMove[k]) ? weaponMove[k] : 0.f;
+        slidersActive |= ImGui::IsItemActive();
+        ImGui::SameLine();
+        ImGui::HelpMarker(w.Bone >= 0 ? "Its move from where it was on its bone, in the bone's frame. Drag a field "
+          "sideways, or double-click it and type a number." : "Its move from where it was put down, in the world's "
+          "frame (Y is up). Drag a field sideways, or double-click it and type a number.");
+      }
+      if (!w.Gone)
+      {
+        if (ImGui::Button("Reset this weapon"))
+        {
+          PushUndo(h, before);
+          ResetWeapon(w);
+        }
+        ImGui::SameLine();
+        ImGui::HelpMarker("Back as it was when the pose was taken: on the bone it was on (or the game's), not moved or "
+          "turned.");
+      }
+    }
+    else
+      ImGui::TextDisabled("Pick a bone in the list or click its dot on the picture");
+    ImGui::PopID();
+
+    if (SelectedKeysAtPlayhead(h) > 0)
+    {
+      int bones[MaxBones];
+      int count = SelectedBones(h, bones);
+      pose_keys::Ease ease = pose_keys::Ease_Smooth;
+      for (int k = 0; k < count; ++k)
+      {
+        pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+        int key = channel ? pose_keys::KeyAt(*channel, h.Keys.Time) : -1;
+        if (key >= 0)
+        {
+          ease = (pose_keys::Ease)channel->Keys[key].Ease;
+          break;
+        }
+      }
+      const char* eases[pose_keys::Ease_Count];
+      for (int e = 0; e < pose_keys::Ease_Count; ++e)
+        eases[e] = KeyEaseLabel(e);
+      int easeIndex = (int)ease;
+      if (easeIndex < 0 || easeIndex >= pose_keys::Ease_Count)
+        easeIndex = 0;
+      ImGui::Text("Its keyframe at %.2f s goes to the next:", h.Keys.Time);
+      if (ImGui::Combo("##PoseKeyEase", &easeIndex, eases, pose_keys::Ease_Count))
+      {
+        bool anyChange = false;
+        for (int k = 0; k < count; ++k)
+        {
+          pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+          int key = channel ? pose_keys::KeyAt(*channel, h.Keys.Time) : -1;
+          if (key >= 0 && channel->Keys[key].Ease != easeIndex)
+          {
+            anyChange = true;
+            break;
+          }
+        }
+        if (anyChange)
+        {
+          PushKeyUndo(h);
+          for (int k = 0; k < count; ++k)
+          {
+            pose_keys::Channel* channel = pose_keys::Find(h.Keys, bones[k]);
+            int key = channel ? pose_keys::KeyAt(*channel, h.Keys.Time) : -1;
+            if (key >= 0)
+              pose_keys::SetEase(h.Keys, bones[k], key, easeIndex);
+          }
+        }
+      }
+    }
+
+    if (ImGui::Button("Reset all"))
+    {
+      bool which[MaxBones] = {};
+      for (int b = 0; b < h.Bones; ++b)
+        which[b] = true;
+      RequestReset(h, which, true, before, "all");
+    }
+    DrawUndoButtons(h, "PoseBone");
+  }
+
+  void DrawClipTab(Held& h)
+  {
+    float fontSize = ImGui::GetFontSize();
+    ULONGLONG now = GetTickCount64();
+    ImGui::PushID("PoseClip");
+    ImGui::Separator();
+    ImGui::Text("Animation clip");
+    ImGui::SameLine();
+    ImGui::HelpMarker("Plays an animation of a human rig on the held character: Mixamo's or any other's (its bones are "
+      "found by their names and where they hang). Put its .fbx file in the game folder's Cinematic Tools\\Animations "
+      "(from Mixamo: FBX Binary, 30 frames per second, keyframe reduction none, With Skin; from Blender or another tool: "
+      "with its mesh, so its rest pose is in the file. Without one (an armature-only export) the rest is worked out "
+      "from the motion and the head, thumbs, feet and twists can be off, the more so the further the clip stays from "
+      "standing; the clip's check line says so). Its pose takes the place of the pose taken, and your edits stay on top "
+      "of it. Works on Faith, KrugerSec and people with a full skeleton. The elbow and knee rolls follow the forearm "
+      "and shin (and Faith's twist bones her own way of twisting); the face and other helper bones keep the pose taken's "
+      "turn, and the feet don't stick to the ground. The clip faces the way the character faced when it was put on; turn "
+      "the Hips to turn it. Bones can't be dragged while it plays: pause it first. When a clip jumps (its loop, a new "
+      "time, another clip), Faith's hair is reset to her head (the game's own cloth reset) rather than trailing after "
+      "it.\n\nUnity humanoid clips (.anim, Unity's binary asset; text .anim files aren't read yet) play too: they hold "
+      "Unity's muscles, not bones, and Unity's own numbers for turning those into bones aren't in the file, so the tools "
+      "use an approximate model of them (fitted to clips' own hand and foot goals): the hands and feet are put on those "
+      "goals on the tools' reference body, the spine, head and fingers are the model's (no goal to check them against). "
+      "The character's arms and legs are proportioned differently, so on it hand-to-hand or hand-to-face contacts can be "
+      "several cm off (and the feet don't stick to the ground, as above). The eyes, jaw, props and other objects in the "
+      "clip aren't played.");
+    if (now - g_ClipFilesListedAt > 2000)
+    {
+      ListClipFiles();
+      g_ClipFilesListedAt = now;
+    }
+    ClipPlay& clip = h.Clip;
+    if (g_ClipFiles.empty())
+      ImGui::TextDisabled("No .fbx or .anim files in Cinematic Tools\\Animations (in the game folder)");
+    else
+    {
+      ImGui::BeginChild("##ClipFiles", ImVec2(0.f, fontSize * 4.f), true);
+      for (size_t f = 0; f < g_ClipFiles.size(); ++f)
+      {
+        std::string name = Utf8Of(g_ClipFiles[f]);
+        bool current = clip.Clip && clip.Clip->File == name;
+        ImGui::PushID((int)f);
+        if (ImGui::Selectable(name.c_str(), current) && !g_ClipLoad)
+          StartClipLoad(h, g_ClipFiles[f]);
+        ImGui::PopID();
+      }
+      ImGui::EndChild();
+    }
+    ImGui::PushTextWrapPos(0.f);
+    if (g_ClipMessage[0])
+      ImGui::TextDisabled("%s", g_ClipMessage);
+    if (clip.Clip)
+    {
+      // A short line about the loaded clip (2026-11-16, the user: "a small paragraph about the loaded anim"); the
+      // reading's and the fit's full reports are in CT.log ("Pose: clip read", "Pose: clip ... on") and on hover
+      pose_clips::Clip const& c = *clip.Clip;
+      if (clip.Fit.Ok)
+        ImGui::TextDisabled("\"%s\" (%s): %.2f s, %d frames at %.0f fps%s. %d of its bones turn %s's.", c.Take.c_str(),
+          c.File.c_str(), c.Length(), c.Frames, c.Fps, c.FromUnity ? ", a Unity clip" : "", clip.Fit.Driven, h.Label);
+      else
+        ImGui::TextDisabled("\"%s\" (%s): %.2f s, %d frames at %.0f fps%s. It can't play on %s: %s.", c.Take.c_str(),
+          c.File.c_str(), c.Length(), c.Frames, c.Fps, c.FromUnity ? ", a Unity clip" : "", h.Label, clip.Fit.Report.c_str());
+      std::string details = c.Report + "\n\n" + clip.Fit.Report;
+      ImGui::ItemTooltip(details.c_str());
+      if (!c.Warning.empty())
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Check: %s", c.Warning.c_str());
+    }
+    ImGui::PopTextWrapPos();
+    if (clip.Clip && !clip.Clip->FromUnity)
+    {
+      if (ImGui::Button("Save its bone map to edit"))
+      {
+        std::string message;
+        pose_clips::SaveBoneMap(*clip.Clip, message);
+        _snprintf_s(g_ClipMessage, sizeof(g_ClipMessage), _TRUNCATE, "%s", message.c_str());
+      }
+      ImGui::SameLine();
+      ImGui::HelpMarker("The tools find which of a clip's bones plays each part (hips, spine, arms, hands, fingers, "
+        "legs, feet) by their names and where they hang, in any human rig. If one is wrong, this writes <the clip's "
+        "name>.bones.txt beside it: change the bone named for that part, then pick the clip again. While that file is "
+        "there it's used instead; delete it to go back. It also holds the file's up axis and unit as read (commented "
+        "out, unless they came from it already): if the clip plays lying, upside down or the wrong size, remove the # "
+        "before \"Up =\" or \"Unit =\" and set them.");
+      if (ImGui::TreeNode("Its bones"))
+      {
+        for (size_t k = 0; k < clip.Clip->Bones.size(); ++k)
+          ImGui::TextDisabled("%s = %s", clip.Clip->Bones[k].c_str(), clip.Clip->SourceNames[k].c_str());
+        ImGui::TreePop();
+      }
+    }
+    if (clip.Clip && clip.Fit.Ok)
+    {
+      ImGui::Checkbox("Use the clip", &clip.On);
+      SameLineIfFits(clip.Playing ? "Pause" : "Play");
+      if (ImGui::Button(clip.Playing ? "Pause" : "Play"))
+      {
+        clip.Playing = !clip.Playing;
+        if (clip.Playing)
+          clip.On = true;
+        if (clip.Playing && clip.Clock != ClipTrackTime && !clip.Loop && clip.Time >= clip.Clip->Length())
+          clip.Time = 0.0;
+      }
+      double trackAt = g_ClipTrackTime >= 0.0 ? g_ClipTrackTime * clip.Speed : 0.0;
+      if (clip.Clock != ClipTrackTime)
+      {
+        SameLineIfFits("From the start");
+        if (ImGui::Button("From the start"))
+        {
+          clip.Time = 0.0;
+          clip.TravelShift[0] = clip.TravelShift[1] = 0.f;
+        }
+      }
+      SameLineIfFits("Loop", true);
+      ImGui::Checkbox("Loop", &clip.Loop);
+      float length = (float)clip.Clip->Length();
+      bool track = clip.Clock == ClipTrackTime;
+      float shown = (float)(track ? clip.TrackStart : clip.Time);
+      if (ImGui::SliderFloat(track ? "Start (s)" : "Time (s)", &shown, 0.f, length > 0.f ? length : 0.01f, "%.2f"))
+      {
+        if (track)
+        {
+          clip.TrackStart = shown;
+          clip.Time = shown + trackAt;
+        }
+        else
+          clip.Time = shown;
+        clip.On = true;
+      }
+      ImGui::SliderFloat("Speed", &clip.Speed, 0.05f, 4.f, "%.2fx");
+      const char* clocks[] = { "Game time (Game speed; stops with Freeze time)", "Real time (plays with time frozen too)",
+        "The camera track's time" };
+      ImGui::Combo("Clock", &clip.Clock, clocks, 3);
+      const char* hips[] = { "Stay in place (only up and down)", "Follow the clip's travel" };
+      ImGui::Combo("Hips", &clip.Hips, hips, 2);
+      if (track)
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextDisabled("The clip plays from Start as the camera track plays (a shot sequence's time goes on "
+          "through its cuts), and waits at Start while no track plays.");
+        ImGui::PopTextWrapPos();
+      }
+      if (ImGui::Button("Use this frame as the pose"))
+        BakeClipFrame(h);
+      ImGui::HelpMarker("The clip's pose now becomes the held pose (as if taken so): the clip goes off, your edits "
+        "stay on it, and Reset goes back to it.");
+      SameLineIfFits("Remove the clip");
+      if (ImGui::Button("Remove the clip"))
+      {
+        clip.Clip.reset();
+        clip.On = clip.Playing = clip.LocalOk = false;
+      }
+    }
+    ImGui::PopID();
+  }
+
+  void VoiceStretchTooltip(VoicePlay const& v, size_t i, bool own);
+
+  // The Voice tab's picture of the file: where the mouth opens over its length, the time now as a line; held with
+  // the mouse (its own clock only) it sets the time. Drawn by hand on an invisible button.
+  void DrawVoicePicture(VoicePlay& v, bool own, ULONGLONG now)
+  {
+    float fontSize = ImGui::GetFontSize();
+    float length = (float)v.Sound->Seconds;
+    ImVec2 size(ImGui::GetContentRegionAvailWidth(), fontSize * 2.5f);
+    if (size.x < fontSize * 4.f)
+      size.x = fontSize * 4.f;
+    ImVec2 from = ImGui::GetCursorScreenPos();
+    ImVec2 to(from.x + size.x, from.y + size.y);
+    ImGui::InvisibleButton("##VoicePicture", size);
+    ReportItemForTests("voice picture");
+    if (own && ImGui::IsItemActive() && length > 0.f)
+    {
+      float share = (ImGui::GetIO().MousePos.x - from.x) / size.x;
+      if (!(share > 0.f))
+        share = 0.f;
+      if (share > 1.f)
+        share = 1.f;
+      v.Time = (double)share * (double)length;
+      v.SetByHandAt = now;
+    }
+    // [STRIP] The voice's feeling stretch by stretch, a strip along the picture's top (when its reading is there)
+    size_t stretches = v.EmotionStretches.size();
+    bool strip = v.FeelAuto && v.FeelRig.Ok && v.EmotionReadings && v.EmotionReadings->size() == stretches &&
+      stretches > 0 && length > 0.f;
+    float stripHeight = fontSize * 0.3f;
+    int under = -1;
+    if (strip && ImGui::IsItemHovered() && ImGui::GetIO().MousePos.y < from.y + stripHeight + 1.f)
+    {
+      double t = (double)((ImGui::GetIO().MousePos.x - from.x) / size.x) * (double)length;
+      for (size_t i = 0; i < stretches && under < 0; ++i)
+        if (t >= v.EmotionStretches[i].From && t <= v.EmotionStretches[i].To)
+          under = (int)i;
+    }
+    if (under >= 0)
+      VoiceStretchTooltip(v, (size_t)under, own);
+    else if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("%s%s", own ? "Where the mouth opens over the file. Hold and drag: its time." :
+        "Where the mouth opens over the file, and where it is now.", strip ? "\nThe strip along its top: the voice's "
+        "feeling, stretch by stretch (the mouse on one tells what it shows and why)." : "");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(from, to, ImGui::GetColorU32(ImGuiCol_FrameBg));
+    // (at the Mouth smoothing the face follows: voice::MouthAt and voice::OverviewOf choose alike)
+    std::vector<float> const* shown = &v.Sound->Overview;
+    if (v.Smoothing != 1.f && v.Smoothing == v.Smoothing)
+    {
+      if (v.OverviewSound.lock() != v.Sound || v.OverviewSmoothing != v.Smoothing || v.Overview.empty())
+      {
+        voice::OverviewOf(*v.Sound, v.Smoothing, v.Overview);
+        v.OverviewSmoothing = v.Smoothing;
+        v.OverviewSound = v.Sound;
+      }
+      shown = &v.Overview;
+    }
+    std::vector<float> const& overview = *shown;
+    int points = (int)overview.size();
+    ImU32 bar = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+    for (int p = 0; p < points; ++p)
+    {
+      float value = overview[p];
+      if (!(value > 0.f))
+        continue;
+      if (value > 1.f)
+        value = 1.f;
+      float x0 = from.x + size.x * (float)p / (float)points;
+      float x1 = from.x + size.x * (float)(p + 1) / (float)points;
+      draw->AddRectFilled(ImVec2(x0, to.y - value * size.y), ImVec2(x1, to.y), bar);
+    }
+    // [STRIP] Over the bars: each stretch's feeling, stronger the more of the face it has; the feeling picked faint;
+    // a stretch set by hand outlined, the one shown now outlined brighter
+    if (strip)
+      for (size_t i = 0; i < stretches; ++i)
+      {
+        voice_emotion::Stretch const& st = v.EmotionStretches[i];
+        voice_emotion::Look look = voice_emotion::LookOf(&(*v.EmotionReadings)[i], i < v.FeelSetting.size() ?
+          v.FeelSetting[i] : voice_emotion::FromVoice, v.FeelWeights, v.FeelSure);
+        float x0 = from.x + size.x * (float)(st.From / (double)length);
+        float x1 = from.x + size.x * (float)(st.To / (double)length);
+        if (x1 < x0 + 1.f)
+          x1 = x0 + 1.f;
+        ImVec2 a(x0, from.y), b(x1, from.y + stripHeight);
+        bool feeling = look.Shown >= 0 && look.Share > 0.f;
+        draw->AddRectFilled(a, b, feeling ? ImGui::GetColorU32(ImGuiCol_CheckMark, 0.25f + 0.75f * look.Share) :
+          ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.35f));
+        if ((int)i == v.FeelStretchNow)
+          draw->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Text));
+        else if (look.ByHand)
+          draw->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Text, 0.6f));
+      }
+    if (length > 0.f && v.Time >= 0.0 && v.Time <= (double)length)
+    {
+      float x = from.x + size.x * (float)(v.Time / (double)length);
+      draw->AddLine(ImVec2(x, from.y), ImVec2(x, to.y), ImGui::GetColorU32(ImGuiCol_Text), 1.f);
+    }
+  }
+
+  // [EMOTION] "From the voice": the tick, what its reading is doing, how sure the voice must be
+  void DrawVoiceEmotion(VoicePlay& v)
+  {
+    ImGui::Checkbox("From the voice", &v.FeelAuto);
+    ImGui::SameLine();
+    ImGui::HelpMarker(VoiceEmotionHelp);
+    ImVec4 const warn(1.f, 0.75f, 0.3f, 1.f);
+    voice_emotion::Status s;
+    if (v.Emotion)
+      s = voice_emotion::StatusOf(*v.Emotion);
+    bool going = v.Emotion && (s.Now == voice_emotion::Waiting || s.Now == voice_emotion::Running);
+    // [STOP] A reading stopped (its helper ended at once): From the voice goes off, and ticked again the voice is read
+    // anew. On its own line (a wrapped text has no end to sit beside).
+    auto stop = [&]()
+    {
+      bool pressed = ImGui::SmallButton("Stop##EmotionStop");
+      ReportItemForTests("emotion stop");
+      if (pressed)
+      {
+        voice_emotion::Cancel(v.Emotion);
+        v.Emotion.reset();
+        v.EmotionReadings.reset();
+        v.FeelAuto = false;
+      }
+      // ([REVIEW] by what it is doing: a reading still waiting has no helper of its own, another voice's goes on)
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s%s Ticked again, the voice is read anew from the start.", s.Now == voice_emotion::Running ?
+          "Stops reading this voice's feeling: its EmotionHelper.exe is ended now." : "Takes this voice out of the wait: "
+          "nothing of it has been heard yet, and another voice's reading goes on.", v.FeelAuto ? " From the voice goes off."
+          : "");
+    };
+    if (!v.FeelAuto)
+    {
+      // [STOP] A reading still going while unticked goes on (kept for when it's ticked again): said, and stoppable
+      if (going)
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextDisabled("Still reading this voice's feeling (%d of %d stretches): kept for when From the voice is "
+          "ticked again.", s.Done, s.Total);
+        ImGui::PopTextWrapPos();
+        stop();
+      }
+      return;
+    }
+    ImGui::PushTextWrapPos(0.f);
+    std::string why;
+    if (v.EmotionStretches.empty())
+    {
+      // [NO PHRASES] Its phrases were never looked for (the analysis runs at 8,000 - 192,000 Hz, Voice.cpp) or it failed:
+      // not "no speech"
+      if (v.Sound && v.Sound->LifeTrack.Frames.empty())
+      {
+        if (v.Sound->Rate < 8000 || v.Sound->Rate > 192000)
+          ImGui::TextColored(warn, "Its phrases couldn't be looked for, so its feeling can't be read: the sound is %d Hz, "
+            "and phrases are found at 8,000 - 192,000 Hz (save it again at such a rate). The feeling picked shows.",
+            v.Sound->Rate);
+        else
+          ImGui::TextColored(warn, "Its phrases couldn't be found, so its feeling can't be read: the feeling picked "
+            "shows. (%s.)", v.Sound->LifeNote.empty() ? "The analysis of its loudness and pitch failed" :
+            v.Sound->LifeNote.c_str());
+      }
+      else
+        ImGui::TextColored(warn, "No speech was found in this sound: there is no feeling to read in it (the feeling "
+          "picked shows).");
+    }
+    else if (!v.Emotion && !voice_emotion::Available(&why))
+      ImGui::TextColored(warn, "%s. The feeling picked shows meanwhile.", why.c_str());
+    else if (!v.Emotion || s.Now == voice_emotion::Waiting || s.Now == voice_emotion::Cancelled)
+    {
+      ImGui::TextDisabled("Waiting to read the voice's feeling (one voice at a time)...");
+      if (going)
+        stop();
+    }
+    else if (s.Now == voice_emotion::Running)
+    {
+      // [PROGRESS] The model starting (before its first stretch: it reads the job, loads, checks itself), then stretch
+      // by stretch, and the seconds so far
+      if (!s.ModelReady)
+        ImGui::TextDisabled("Reading the voice's feeling with EmotionHelper.exe, outside the game at idle priority (about "
+          "1.7 GB of memory meanwhile): starting the model, %.0f s so far. The feeling picked shows until it's done.",
+          s.Elapsed);
+      else
+        ImGui::TextDisabled("Reading the voice's feeling with EmotionHelper.exe, outside the game at idle priority (about "
+          "1.7 GB of memory meanwhile): %d of %d stretches, %.0f s so far. The feeling picked shows until it's done.",
+          s.Done, s.Total, s.Elapsed);
+      stop();
+    }
+    else if (s.Now == voice_emotion::Failed)
+    {
+      ImGui::TextColored(warn, "The voice's feeling couldn't be read: %s.", s.Message.c_str());
+      if (s.CanRetry)
+      {
+        bool again = ImGui::Button("Try again");
+        ReportItemForTests("emotion try again");
+        if (again)
+        {
+          v.Emotion.reset();
+          v.EmotionReadings.reset();
+        }
+      }
+    }
+    else if (v.EmotionReadings && v.EmotionReadings->size() == v.EmotionStretches.size())
+    {
+      // [WHY] What the stretches show and why: the voice's feeling on half the face or more, on less, or the feeling
+      // picked (not sure enough, heard as neutral, too short to hear); the stretches set by hand apart
+      int shown[voice_feel::FeelingCount] = {}, count[6] = {};
+      for (size_t i = 0; i < v.EmotionStretches.size(); ++i)
+      {
+        voice_emotion::Reading const& r = (*v.EmotionReadings)[i];
+        voice_emotion::Look look = voice_emotion::LookOf(&r, i < v.FeelSetting.size() ? v.FeelSetting[i] :
+          voice_emotion::FromVoice, v.FeelWeights, v.FeelSure);
+        voice_emotion::Why w = voice_emotion::WhyOf(&r, look);
+        ++count[w];
+        if (w == voice_emotion::WhyShown && look.Shown >= 0 && look.Shown < voice_feel::FeelingCount)
+          ++shown[look.Shown];
+      }
+      std::string line;
+      char part[96];
+      for (int f = 0; f < voice_feel::FeelingCount; ++f)
+        if (shown[f] > 0)
+        {
+          _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%s %d", line.empty() ? "" : ", ", voice_feel::Presets[f].Name,
+            shown[f]);
+          line += part;
+        }
+      if (!line.empty())
+        line += " (on half the face or more)";
+      if (count[voice_emotion::WhyPartly] > 0)
+      {
+        _snprintf_s(part, sizeof(part), _TRUNCATE, "%spartly %d", line.empty() ? "" : ", ",
+          count[voice_emotion::WhyPartly]);
+        line += part;
+      }
+      int kept = count[voice_emotion::WhyNotSure] + count[voice_emotion::WhyNeutral] + count[voice_emotion::WhyTooShort];
+      if (kept > 0)
+      {
+        _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%s %d (", line.empty() ? "" : ", ", v.Feel >= 0 ?
+          "the feeling picked" : "no feeling (none picked)", kept);
+        line += part;
+        bool first = true;
+        int const reasons[3] = { voice_emotion::WhyNotSure, voice_emotion::WhyNeutral, voice_emotion::WhyTooShort };
+        char const* const names[3] = { "not sure enough", "heard as neutral", "too short to hear" };
+        for (int k = 0; k < 3; ++k)
+          if (count[reasons[k]] > 0)
+          {
+            _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%s %d", first ? "" : ", ", names[k], count[reasons[k]]);
+            line += part;
+            first = false;
+          }
+        line += ")";
+      }
+      if (count[voice_emotion::WhyByHand] > 0)
+      {
+        _snprintf_s(part, sizeof(part), _TRUNCATE, "%sset by hand %d", line.empty() ? "" : ", ",
+          count[voice_emotion::WhyByHand]);
+        line += part;
+      }
+      ImGui::TextDisabled("The voice's feeling, %d stretches%s: %s", (int)v.EmotionStretches.size(),
+        s.FromCache ? " (kept from an earlier reading)" : "", line.c_str());
+    }
+    ImGui::PopTextWrapPos();
+    if (v.EmotionReadings)
+    {
+      ImGui::SliderFloat("Sureness needed", &v.FeelSure, voice_emotion::SureLeast, voice_emotion::SureMost, "%.2f");
+      ImGui::SameLine();
+      ImGui::HelpMarker(VoiceSureHelp);
+    }
+  }
+
+  // [WHY] A stretch's whole story, for its row's tooltip and the voice picture's: when, what it is heard as (and with
+  // which stretches together), all 8 chances, the model's own three numbers, and why the face shows what it shows
+  void VoiceStretchTooltip(VoicePlay const& v, size_t i, bool own)
+  {
+    size_t n = v.EmotionStretches.size();
+    if (i >= n || !v.EmotionReadings || v.EmotionReadings->size() != n)
+      return;
+    voice_emotion::Stretch const& st = v.EmotionStretches[i];
+    voice_emotion::Reading const& r = (*v.EmotionReadings)[i];
+    int setting = i < v.FeelSetting.size() ? v.FeelSetting[i] : voice_emotion::FromVoice;
+    voice_emotion::Look look = voice_emotion::LookOf(&r, setting, v.FeelWeights, v.FeelSure);
+    voice_emotion::Look heard = voice_emotion::LookOf(&r, voice_emotion::FromVoice, v.FeelWeights, v.FeelSure);
+    voice_emotion::Why w = voice_emotion::WhyOf(&r, look);
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.f);
+    // When, and what was heard for it
+    size_t first = i, last = i;
+    while (first > 0 && v.EmotionStretches[first - 1].HeardFrom == st.HeardFrom &&
+      v.EmotionStretches[first - 1].HeardTo == st.HeardTo)
+      --first;
+    while (last + 1 < n && v.EmotionStretches[last + 1].HeardFrom == st.HeardFrom &&
+      v.EmotionStretches[last + 1].HeardTo == st.HeardTo)
+      ++last;
+    std::string together;
+    if (last > first)
+    {
+      // (two: the other one; more: all of them, this one among them)
+      char t[96];
+      if (last - first == 1)
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "; heard together with stretch %d (one reading)", (int)(first == i ? last :
+          first) + 1);
+      else
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "; heard together, stretches %d - %d (one reading)", (int)first + 1,
+          (int)last + 1);
+      together = t;
+    }
+    // ([REVIEW] a phrase of 3 s or more is heard as itself, its window's edges an ulp or so off its own)
+    bool aroundIt = fabs(st.HeardFrom - st.From) > 1e-6 || fabs(st.HeardTo - st.To) > 1e-6;
+    if (own)
+      ImGui::Text("Stretch %d of %d: %.2f - %.2f s", (int)i + 1, (int)n, st.From, st.To);
+    else
+      ImGui::Text("Stretch %d of %d: %.2f - %.2f s into the voice (from %.2f s on the %s time)", (int)i + 1, (int)n,
+        st.From, st.To, st.From + v.Start, v.Clock == VoiceKeysTime ? "keyframes'" : "camera track's");
+    if (aroundIt || !together.empty())
+      ImGui::Text("Heard: %.2f - %.2f s%s%s", st.HeardFrom, st.HeardTo, aroundIt ? " (with the voice around it)" : "",
+        together.c_str());
+    if (!r.Ok)
+      ImGui::Text("Too short to hear (under 0.1 s): no reading.");
+    else
+    {
+      int order[voice_emotion::ClassCount];
+      voice_emotion::ChancesInOrder(r, order);
+      std::string chances;
+      char t[48];
+      for (int c = 0; c < voice_emotion::ClassCount; ++c)
+      {
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "%s%s %.1f %%", c ? ", " : "", voice_emotion::ClassNames[order[c]],
+          100.f * r.Chance[order[c]]);
+        chances += t;
+      }
+      ImGui::TextWrapped("The model's chances: %s", chances.c_str());
+      ImGui::Text("Arousal %.2f, dominance %.2f, valence %.2f (the model's own, about 0 - 1)", r.Arousal, r.Dominance,
+        r.Valence);
+    }
+    float sure = v.FeelSure, top1 = sure + voice_emotion::SureSpan < 1.f ? sure + voice_emotion::SureSpan : 1.f;
+    float topChance = 0.f;
+    int top = 0;
+    for (int c = 1; r.Ok && c < voice_emotion::ClassCount; ++c)
+      if (r.Chance[c] > r.Chance[top])
+        top = c;
+    if (r.Ok)
+      topChance = r.Chance[top];
+    char const* picked = v.Feel >= 0 ? "the feeling picked" : "no feeling (none picked)";
+    switch (w)
+    {
+    case voice_emotion::WhyShown:
+    case voice_emotion::WhyPartly:
+      ImGui::TextWrapped("Shows %s on %.0f %% of the face (the rest: %s): its chance, %.3f, against Sureness needed "
+        "%.2f; all of it from a chance of %.2f.", voice_feel::Presets[look.Shown].Name, 100.f * look.Share, picked,
+        topChance, sure, top1);
+      if (look.Scale != 1.f)
+        ImGui::TextWrapped("Its own part %.2f times as strong, by the voice's arousal.", look.Scale);
+      break;
+    case voice_emotion::WhyNotSure:
+      if (topChance > voice_emotion::SureLeast)
+      {
+        voice_emotion::Look least = voice_emotion::LookOf(&r, voice_emotion::FromVoice, v.FeelWeights,
+          voice_emotion::SureLeast);
+        ImGui::TextWrapped("Not sure enough: its chance, %.3f, isn't above Sureness needed (%.2f), so %s shows. It "
+          "would show with Sureness needed under %.3f (at the least, %.2f: %s on %.0f %% of the face).", topChance,
+          sure, picked, topChance, voice_emotion::SureLeast, least.Shown >= 0 ? voice_feel::Presets[least.Shown].Name :
+          "it", 100.f * least.Share);
+      }
+      else
+        ImGui::TextWrapped("Not sure enough: its chance, %.3f, is under the least Sureness needed (%.2f), so it never "
+          "shows from the voice: %s shows (or set it by hand).", topChance, voice_emotion::SureLeast, picked);
+      break;
+    case voice_emotion::WhyNeutral:
+      ImGui::TextWrapped("Heard as neutral: %s shows.", picked);
+      break;
+    case voice_emotion::WhyTooShort:
+      ImGui::TextWrapped("%s shows.", v.Feel >= 0 ? "The feeling picked" : "No feeling (none picked)");
+      break;
+    case voice_emotion::WhyByHand:
+      if (heard.Shown >= 0 && heard.Share > 0.f)
+        ImGui::TextWrapped("Set by hand. From the voice it would show %s on %.0f %% of the face.",
+          voice_feel::Presets[heard.Shown].Name, 100.f * heard.Share);
+      else
+        ImGui::TextWrapped("Set by hand. From the voice it would show %s.", picked);
+      break;
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+  }
+
+  // [EMOTION] The stretches one by one: when, what the voice was heard as, what the face shows, and each one's own
+  // setting (only the rows in view are made: a long voice has hundreds). [JUMP] On the voice's own clock, a row's time
+  // takes the voice there.
+  void DrawVoiceEmotionStretches(VoicePlay& v, bool own, ULONGLONG now)
+  {
+    size_t n = v.EmotionStretches.size();
+    if (!v.EmotionReadings || v.EmotionReadings->size() != n || n == 0)
+      return;
+    if (v.FeelSetting.size() != n)
+      v.FeelSetting.assign(n, voice_emotion::FromVoice);
+    bool open = ImGui::TreeNode("The voice's feeling, stretch by stretch");
+    ReportItemForTests("emotion stretches");
+    if (!open)
+      return;
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextDisabled("Each stretch: from the voice (as far as the model is sure), the feeling picked, none, or a "
+      "feeling of its own. Then when it is%s, what the model heard most (its chance) and what the face shows; the mouse "
+      "on a row tells why. > : the stretch shown now.", own ? " (press it: the voice goes there)" : "");
+    ImGui::PopTextWrapPos();
+    const char* items[3 + voice_feel::FeelingCount];
+    items[0] = "From the voice";
+    items[1] = "The feeling picked";
+    items[2] = "None";
+    for (int f = 0; f < voice_feel::FeelingCount; ++f)
+      items[3 + f] = voice_feel::Presets[f].Name;
+    ImGuiListClipper clipper((int)n, ImGui::GetFrameHeightWithSpacing());
+    while (clipper.Step())
+      for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+      {
+        ImGui::PushID(i);
+        int& setting = v.FeelSetting[i];
+        int item = setting == voice_emotion::AsPicked ? 1 : (setting == voice_emotion::NoFeeling ? 2 :
+          (setting >= 0 && setting < voice_feel::FeelingCount ? 3 + setting : 0));
+        ImGui::PushItemWidth(ImGui::GetFontSize() * 8.f);
+        if (ImGui::Combo("##setting", &item, items, 3 + voice_feel::FeelingCount))
+          setting = item == 1 ? voice_emotion::AsPicked : (item == 2 ? voice_emotion::NoFeeling :
+            (item >= 3 && item < 3 + voice_feel::FeelingCount ? item - 3 : voice_emotion::FromVoice));
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        voice_emotion::Stretch const& st = v.EmotionStretches[i];
+        voice_emotion::Reading const& r = (*v.EmotionReadings)[i];
+        voice_emotion::Look look = voice_emotion::LookOf(&r, setting, v.FeelWeights, v.FeelSure);
+        char heard[48] = "too short to hear";
+        if (r.Ok)
+        {
+          int top = 0;
+          for (int c = 1; c < voice_emotion::ClassCount; ++c)
+            if (r.Chance[c] > r.Chance[top])
+              top = c;
+          _snprintf_s(heard, sizeof(heard), _TRUNCATE, "%s %.0f %%", voice_emotion::ClassNames[top], r.Chance[top] * 100.f);
+        }
+        char face[64];
+        if (look.Shown >= 0 && look.Share > 0.f)
+          _snprintf_s(face, sizeof(face), _TRUNCATE, "%s %.0f %%%s", voice_feel::Presets[look.Shown].Name, look.Share * 100.f,
+            look.ByHand ? " (set by hand)" : "");
+        else
+          _snprintf_s(face, sizeof(face), _TRUNCATE, "%s%s", look.Share > 0.f ? "none" : "the feeling picked",
+            look.ByHand ? " (set by hand)" : "");
+        bool hovered = false;
+        if (own)
+        {
+          // [JUMP] The voice to the stretch's start (held there a moment, as the Time slider holds it)
+          char when[48];
+          // ("###go": its ID the same with or without the "> " shown now; [REVIEW] with "##go" a press held while the
+          // voice played into or out of the stretch was lost)
+          _snprintf_s(when, sizeof(when), _TRUNCATE, "%s%.1f - %.1f s###go", i == v.FeelStretchNow ? "> " : "", st.From,
+            st.To);
+          bool go = ImGui::SmallButton(when);
+          char what[48];
+          _snprintf_s(what, sizeof(what), _TRUNCATE, "emotion row %d time", i);
+          ReportItemForTests(what);
+          if (go)
+          {
+            v.Time = st.From;
+            v.SetByHandAt = now;
+          }
+          hovered = ImGui::IsItemHovered();
+          ImGui::SameLine();
+          ImGui::Text("heard: %s  shows: %s", heard, face);
+        }
+        else
+          ImGui::Text("%s%.1f - %.1f s  heard: %s  shows: %s", i == v.FeelStretchNow ? "> " : "", st.From, st.To, heard, face);
+        {
+          char what[48];
+          _snprintf_s(what, sizeof(what), _TRUNCATE, "emotion row %d text", i);
+          ReportItemForTests(what);
+        }
+        hovered = hovered || ImGui::IsItemHovered();
+        if (hovered)
+          VoiceStretchTooltip(v, (size_t)i, own);
+        ImGui::PopID();
+      }
+    ImGui::TreePop();
+  }
+
+  void DrawVoiceTab(Held& h)
+  {
+    float fontSize = ImGui::GetFontSize();
+    ULONGLONG now = GetTickCount64();
+    ImGui::PushID("PoseVoice");
+    ImGui::Separator();
+    ImGui::Text("Voice");
+    ImGui::SameLine();
+    ImGui::HelpMarker(VoiceHelp);
+    if (now - g_VoiceFilesListedAt > 2000)
+    {
+      ListVoiceFiles();
+      g_VoiceFilesListedAt = now;
+    }
+    VoicePlay& v = h.Voice;
+    if (g_VoiceFiles.empty())
+      ImGui::TextDisabled("No sound files in Cinematic Tools\\Voices (in the game folder)");
+    else
+    {
+      ImGui::BeginChild("##VoiceFiles", ImVec2(0.f, fontSize * 4.f), true);
+      for (size_t f = 0; f < g_VoiceFiles.size(); ++f)
+      {
+        std::string name = Utf8Of(g_VoiceFiles[f]);
+        bool current = v.Sound && v.Sound->File == name;
+        ImGui::PushID((int)f);
+        if (ImGui::Selectable(name.c_str(), current) && !g_VoiceLoad)
+          StartVoiceLoad(h, g_VoiceFiles[f]);
+        ImGui::PopID();
+      }
+      ImGui::EndChild();
+    }
+    ImGui::PushTextWrapPos(0.f);
+    if (g_VoiceMessage[0])
+      ImGui::TextDisabled("%s", g_VoiceMessage);
+    if (v.Sound)
+    {
+      ImGui::TextDisabled("%s", v.Sound->Report.c_str());
+      if (!v.Sound->Warning.empty())
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Check: %s", v.Sound->Warning.c_str());
+      if (!v.Rig.Ok)
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "This character has no mouth bones the tools know (Faith, "
+          "KrugerSec and people with a full skeleton have them): no mouth moves.");
+      if (v.Player < 0)
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "The player has no place for this sound (it holds 16 at "
+          "most, of up to 200,000 samples a second): no sound is heard.");
+      else
+      {
+        voice_player::EngineInfo info{};
+        voice_player::GetEngineInfo(info);
+        if (!info.Open && info.Failures > 0)
+          ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Windows' audio couldn't be opened (no output device?): no "
+            "sound is heard. The player tries again every few seconds (see CT.log).");
+      }
+      // (the player is silent outside its rates: VoicePlayer.h, MinRate - MaxRate)
+      if (v.On && v.Heard && v.Moving && v.Player >= 0 &&
+          (v.Rate < voice_player::MinRate || v.Rate > voice_player::MaxRate))
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "The voice's time runs at %.2f times the recording's pace: the "
+          "sound is only played from about 0.25 to 2 times it (the mouth still moves).", v.Rate);
+    }
+    ImGui::PopTextWrapPos();
+    if (!v.Sound)
+    {
+      ImGui::PopID();
+      return;
+    }
+
+    float length = (float)v.Sound->Seconds;
+    bool own = v.Clock == VoiceOwnTime;
+    ImGui::Checkbox("Use the voice", &v.On);
+    if (own)
+    {
+      SameLineIfFits(v.Playing ? "Pause" : "Play");
+      if (ImGui::Button(v.Playing ? "Pause" : "Play"))
+      {
+        v.Playing = !v.Playing;
+        if (v.Playing)
+        {
+          v.On = true;
+          if (!v.Loop && v.Time >= (double)length - 0.01)
+            v.Time = 0.0;
+          if (v.Time <= 0.0)
+            v.Time = -VoiceRunIn;
+        }
+      }
+      SameLineIfFits("From the start");
+      if (ImGui::Button("From the start"))
+        v.Time = v.Playing ? -VoiceRunIn : 0.0;
+      SameLineIfFits("Loop", true);
+      ImGui::Checkbox("Loop", &v.Loop);
+    }
+    DrawVoicePicture(v, own, now);
+    if (own)
+    {
+      float shown = (float)v.Time;
+      if (ImGui::SliderFloat("Time (s)", &shown, 0.f, length > 0.f ? length : 0.01f, "%.2f"))
+        v.Time = shown;
+      if (ImGui::IsItemActive())
+        v.SetByHandAt = now;
+    }
+    else
+    {
+      bool keys = v.Clock == VoiceKeysTime;
+      float start = (float)v.Start;
+      if (ImGui::DragFloat("Begins at (s)", &start, 0.01f, -length, (float)pose_keys::MaxTime, "%.2f"))
+        v.Start = start;
+      ImGui::SameLine();
+      ImGui::HelpMarker(keys ? "The keyframes' time at which the voice begins. Below 0: the voice is already that far "
+        "in when the keyframes begin. Let it begin 0.1 s or more after the time playing starts from: the sound needs "
+        "that long to come in, and a voice already running when playing starts loses its first tenth of a second." :
+        "The camera track's time at which the voice begins (a shot sequence's time goes on through its cuts). Below 0: "
+        "the voice is already that far in when the track begins. Let it begin 0.1 s or more into the track: the sound "
+        "needs that long to come in, and a voice already running when the track starts loses its first tenth of a "
+        "second.");
+      ImGui::PushTextWrapPos(0.f);
+      if (v.Time < 0.0)
+        ImGui::TextDisabled("Begins in %.2f s", -v.Time);
+      else if (v.Time >= (double)length)
+        ImGui::TextDisabled("Over (%.2f s long)", length);
+      else
+        ImGui::TextDisabled("At %.2f of %.2f s", v.Time, length);
+      if (keys && h.Keys.Channels.empty())
+        ImGui::TextDisabled("No keyframes yet: the voice follows the keyframes' time when you move it, and plays with "
+          "them once there are keyframes to play.");
+      else if (!keys)
+        ImGui::TextDisabled("The voice plays as the camera track plays, and waits at the track's start while no track "
+          "plays.");
+      ImGui::PopTextWrapPos();
+    }
+    // [REVIEW 7] The face (the living face, its settings folded, then the feeling) before the sound's and the mouth's
+    // sliders: the Feeling list is found without scrolling far (the review: it was 2.5 - 3.4 panel heights down)
+    // The life around the mouth: a living face (the eyes, blinks, brows, breathing and the head)
+    ImGui::Checkbox("A living face", &v.Life);
+    ImGui::SameLine();
+    ImGui::HelpMarker(VoiceLifeHelp);
+    // [FIX CHECK] The Feeling list on the tick's own row where it fits, and the face part before the Clock (the fix
+    // check: 1.05 - 1.39 tab heights down, under what the tab shows at all three sizes, when it came after the clock
+    // and under the tick)
+    // The feeling: picked by the user, made of the game's own face poses
+    {
+      float comboWidth = fontSize * 8.f;
+      float rowWidth = comboWidth + ImGui::CalcTextSize("Feeling").x + ImGui::GetStyle().ItemInnerSpacing.x +
+        ImGui::GetStyle().ItemSpacing.x + fontSize;
+      if (ImGui::GetContentRegionAvailWidth() >= rowWidth)
+        ImGui::SameLine(0.f, fontSize);
+      const char* feelings[voice_feel::FeelingCount + 1];
+      feelings[0] = "None";
+      for (int f = 0; f < voice_feel::FeelingCount; ++f)
+        feelings[f + 1] = voice_feel::Presets[f].Name;
+      int feel = v.Feel >= 0 && v.Feel < voice_feel::FeelingCount ? v.Feel + 1 : 0;
+      ImGui::PushItemWidth(comboWidth);
+      bool picked = ImGui::Combo("Feeling", &feel, feelings, voice_feel::FeelingCount + 1);
+      ImGui::PopItemWidth();
+      if (picked && feel >= 0 && feel <= voice_feel::FeelingCount)
+        v.Feel = feel - 1;
+      // (Feeling's (?) taken out 2026-11-16: VoiceFeelHelp is no longer shown)
+      if (!v.FeelRig.Ok)
+      {
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "This character has no face a feeling can be laid on (a Face bone "
+          "with both eye bones and HeadEnd, its left and right known).");
+        ImGui::PopTextWrapPos();
+      }
+      if (v.FeelRig.Ok)
+        DrawVoiceEmotion(v);   // [EMOTION] "From the voice"
+      if (v.FeelRig.Ok && (v.Feel >= 0 || v.FeelAuto))
+      {
+        ImGui::SliderFloat("Strength", &v.FeelStrength, 0.f, 2.f, "%.2f");
+        ImGui::SameLine();
+        ImGui::HelpMarker("How strongly the feeling shows. 1: as designed, a clear face but not an extreme one. 2: twice "
+          "that, up to the game's own poses at their fullest (never past them). 0: none (and the voice's brow raises "
+          "aren't held back).");
+        ImGui::SliderFloat("Follows the voice", &v.FeelFollow, 0.f, 1.f, "%.2f");
+        ImGui::SameLine();
+        ImGui::HelpMarker("How much the feeling's strength follows the voice: stronger on stressed words, weaker in "
+          "pauses. 0: the same all through. 1: the brows ease to about two thirds in the pauses between words and towards "
+          "half in long silences (the eyes and the mouth ease less: to 0.7 and 0.85 at most), about nine tenths on the "
+          "most stressed words. It never goes while the voice is on.");
+        // [SMILE]
+        ImGui::SliderFloat("Smile comes and goes", &v.FeelComes, 0.f, 1.f, "%.2f");
+        ImGui::SameLine();
+        ImGui::HelpMarker(VoiceSmileHelp);
+        ImGui::SliderFloat("Uneven", &v.FeelUneven, 0.f, 0.3f, "%.2f");
+        ImGui::SameLine();
+        ImGui::HelpMarker("One side of the face this much stronger, the other this much weaker: real faces are seldom "
+          "even (the game's own recorded brows: in the most uneven people one side moves nearly twice as far as the "
+          "other). 0.2 here makes one side 1.5 times the other, up to Strength 1; stronger, the strongest parts reach the "
+          "game's own poses on both sides and even out. 0: both sides the same.");
+        if (v.FeelUneven > 0.f)
+        {
+          ImGui::SameLine();
+          ImGui::Checkbox("Its left stronger", &v.FeelLeftStronger);
+        }
+      }
+      if (v.FeelRig.Ok && v.FeelAuto)
+        DrawVoiceEmotionStretches(v, own, now);   // [EMOTION]
+    }
+    if (v.Life)
+    {
+      ImGui::PushTextWrapPos(0.f);
+      if (v.Sound->Life.empty())
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "For this sound %s: no blinks, brow raises, eye or head movement "
+          "(a feeling picked above still shows).", v.Sound->LifeNote.empty() ? "they couldn't be worked out" :
+          v.Sound->LifeNote.c_str());
+      else
+      {
+        // [REVIEW 8] With a take in use its blinks are the face's: the sound's own count (the analysis' blinks, which
+        // the take replaces) is left out of the found line, so the tab gives one blink count
+        std::string found = v.Sound->LifeFound;
+        if (v.Alive && !v.AliveFound.empty())
+        {
+          size_t comma = found.find(", ");
+          found = comma == std::string::npos ? std::string() : found.substr(comma + 2);
+        }
+        if (!found.empty())
+          ImGui::TextDisabled("Found in this sound: %s.", found.c_str());
+        if (!v.AliveFound.empty())
+          ImGui::TextDisabled("This take: %s.", v.AliveFound.c_str());
+        if (!v.Sound->LifeNote.empty())
+          ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Check: %s.", v.Sound->LifeNote.c_str());
+      }
+      // (the face's own directions come from the Face bone, both eye bones and HeadEnd: without them no part can be
+      // made, the head included, though the Head bone may be there and held)
+      if (v.LifeRig.Face < 0)
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "This character has no face bones the tools can use (a Face bone "
+          "with both eye bones and HeadEnd; the low-detail people and the animals have none): no blinks, no brow raises, "
+          "no eye movement, and no head movement either (the head's directions are taken from the eyes).");
+      else if (!v.LifeRig.Ok || !v.LifeRig.Eyes || !v.LifeRig.Brows || !v.LifeRig.Head || v.LifeRig.EyeBone[0] < 0)
+      {
+        // (the four parts in one text: a comma between two of them)
+        bool lids = !(v.LifeRig.Ok && v.LifeRig.Eyes), brows = !(v.LifeRig.Ok && v.LifeRig.Brows),
+          head = !(v.LifeRig.Ok && v.LifeRig.Head), eyes = !(v.LifeRig.Ok && v.LifeRig.EyeBone[0] >= 0);
+        std::string missing;
+        for (auto part : { std::make_pair(lids, " its eyelids"), std::make_pair(brows, " its eyebrows"),
+          std::make_pair(head, " its head"), std::make_pair(eyes, " its eyes") })
+          if (part.first)
+            missing += (missing.empty() ? "" : ",") + std::string(part.second);
+        ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Not found on this character, or not all held in this pose:%s.",
+          missing.c_str());
+      }
+      // A part there and held that the pose as it is now gives no directions for (its eye bones, HeadEnd or nose tip
+      // edited out of place): it stops while that lasts
+      if (v.LifeTried && v.LifeRig.Ok)
+      {
+        bool eyes = v.LifeRig.Eyes && !v.LifeEyesNow, brows = v.LifeRig.Brows && !v.LifeBrowsNow,
+          head = v.LifeRig.Head && !v.LifeHeadNow;
+        if (eyes || brows || head)
+          ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Not made as the face is posed now:%s%s%s%s%s (its eye bones, "
+            "HeadEnd or nose tip as edited give no directions).", eyes ? " its eyelids" : "", eyes && (brows || head) ? "," : "",
+            brows ? " its eyebrows" : "", brows && head ? "," : "", head ? " its head" : "");
+      }
+      ImGui::PopTextWrapPos();
+      if (ImGui::TreeNode("Settings of the living face"))
+      {
+        ImGui::SliderFloat("Blinks", &v.Blinks, 0.f, 1.f, "%.2f");
+        ImGui::SliderFloat("Brows", &v.Brows, 0.f, 2.f, "%.2f");
+        ImGui::SliderFloat("Head", &v.Head, 0.f, 2.f, "%.2f");
+        ImGui::SliderFloat("Eyes", &v.Eyes, 0.f, 1.f, "%.2f");
+        float lookAway = v.LookAway;
+        if (ImGui::SliderFloat("Looks away", &lookAway, 0.f, 2.f, "%.2f"))
+        {
+          v.LookAway = !(lookAway > 0.f) ? 0.f : (lookAway > 2.f ? 2.f : lookAway);
+          v.AliveWantedAt = now;
+        }
+        ImGui::Checkbox("Eyes hold their target", &v.HoldGaze);
+        int take = v.Take;
+        if (ImGui::SliderInt("Take", &take, 1, 99))
+        {
+          v.Take = take < 1 ? 1 : (take > 99 ? 99 : take);
+          v.AliveWantedAt = now;
+        }
+        ImGui::TreePop();
+      }
+    }
+
+    const char* clocks[] = { "Its own (real time: plays with time frozen too)", "The keyframes' time",
+      "The camera track's time" };
+    int clock = v.Clock;
+    if (ImGui::Combo("Clock", &clock, clocks, 3) && clock != v.Clock && clock >= 0 && clock < 3)
+    {
+      v.Clock = clock;
+      v.Playing = false;
+    }
+    ImGui::Checkbox("The sound is heard", &v.Heard);
+    ImGui::SliderFloat("Volume", &v.Volume, 0.f, 2.f, "%.2f");
+    ImGui::SliderFloat("Mouth opening", &v.Jaw, 0.f, 2.f, "%.2f");
+    ImGui::SameLine();
+    ImGui::HelpMarker("How far the jaw opens with the voice. 1: about 9 degrees on the loudest open vowels; raise it for "
+      "a shouted line. This is what the sound gives best: about one opening a syllable, shut in every pause (a feeling "
+      "of Surprised or Afraid holds it a little open there; this scales that too).");
+    ImGui::SliderFloat("Lip shapes", &v.Lips, 0.f, 2.f, "%.2f");
+    ImGui::SameLine();
+    ImGui::HelpMarker("How much the lips and the mouth's corners take the shapes heard in the sound: wide for \"ee\", "
+      "rounded for \"oo\", the teeth for s and sh. These are worked out from how the voice sounds, not from its words, "
+      "and can be wrong (an \"oo\" said far forward reads as \"ee\", an l as rounded), so they start at half. 0: only "
+      "the jaw moves.");
+    ImGui::SliderFloat("Lip closing", &v.Closure, 0.f, 2.f, "%.2f");
+    ImGui::SameLine();
+    ImGui::HelpMarker("How much the mouth shuts where a p, b or m is heard. The sound alone only hints at these (an m "
+      "and an n are the same hum: on test voices the hint was sure of a third to a half of them, and now and then took "
+      "a t, k or n for one), so the mouth shuts by how sure the hint is. 0: left out (for a voice over music or "
+      "noise).");
+    ImGui::SliderFloat("Mouth smoothing", &v.Smoothing, 0.f, 2.f, "%.2f");
+    ImGui::SameLine();
+    ImGui::HelpMarker("How smoothly the mouth goes from one shape to the next. 1: the jaw and lips ease into and out of "
+      "each shape and still shut on p, b and m. 0: quicker and harder. 2: softer still, the "
+      "closures eased too. In between, the two are mixed. The smoother, the more quick syllables run together and open "
+      "the mouth less; on computer-made test voices the jaw opened to a fifth of its full opening on 91 % of the vowels at 0, 87 % at 1 "
+      "and 81 % at 2, and in fast speech on 84, 75 and 65 %. If the mouth still looks too busy, lowering Mouth "
+      "opening also slows it: it then has less far to go.");
+    ImGui::SliderFloat("Mouth ahead by (s)", &v.Lead, -MaxVoiceLead, MaxVoiceLead, "%.2f");
+    ImGui::SameLine();
+    ImGui::HelpMarker("The mouth moves this much before its sound is heard (a mouth that's late looks wrong sooner "
+      "than one that's early). Raise it if the mouth looks late, lower it if early.");
+    if ((v.Rig.Ok || (v.Life && v.LifeRig.Ok) || v.FeelRig.Ok) && ImGui::TreeNode("The face now"))
+    {
+      auto bar = [&](float amount, char const* name)
+      {
+        ImGui::ProgressBar(amount > 0.f ? (amount < 1.f ? amount : 1.f) : 0.f, ImVec2(fontSize * 8.f, 0.f), "");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(name);
+      };
+      if (v.Rig.Ok)
+      {
+        float const amounts[5] = { v.Shape.Open, v.Shape.Wide, v.Shape.Round, v.Shape.Closed, v.Shape.Teeth };
+        char const* const names[5] = { "Open (ah)", "Wide (ee)", "Rounded (oo)", "Pressed (p, b, m)", "Teeth (s, sh)" };
+        for (int k = 0; k < 5; ++k)
+          bar(amounts[k], names[k]);
+      }
+      // (as numbers that are numbers: these go into a text; and what rounds to 0.0 as 0: no "-0.0")
+      auto shown = [](float value) { return !std::isfinite(value) || fabsf(value) < 0.05f ? 0.f : value; };
+      float const degrees = 57.29578f;
+      if (v.Life && v.LifeRig.Ok)
+      {
+        // What the face is given this frame: each part that moves now, times its amount as the face takes it
+        auto given = [](float shape, float amount)
+        {
+          float a = !(amount > 0.f) ? 0.f : (amount > 2.f ? 2.f : amount);
+          return std::isfinite(shape) && a > 0.f ? shape * a : 0.f;
+        };
+        if (v.LifeEyesNow)
+          bar(given(v.LifeShape.Blink, v.Blinks) * v.LifeBlinkTaken, "Blink");   // (lids already turned shut take less)
+        if (v.LifeBrowsNow)
+        {
+          // (times the share a feeling keeps of the voice's raises)
+          float brow = given(v.LifeShape.Brow, v.Brows) * (v.FeelNow ? v.FeelKeep : 1.f);
+          char name[48];
+          _snprintf_s(name, sizeof(name), _TRUNCATE, "Brows up (%.1f mm)", shown(1000.f * voice_face::BrowLift * brow));
+          bar(brow, name);
+        }
+        if (v.LifeHeadNow)
+        {
+          float nod = given(v.LifeShape.Nod, v.Head) * degrees, turn = given(v.LifeShape.Turn, v.Head) * degrees,
+            tilt = given(v.LifeShape.Tilt, v.Head) * degrees;
+          ImGui::TextWrapped("Head: chin down %+.1f, nose to its right %+.1f, top to its right %+.1f degrees", shown(nod),
+            shown(turn), shown(tilt));
+        }
+        if (v.EyesNow)
+          ImGui::TextWrapped("Eyes, as laid: %+.1f to its right, %+.1f down against the pose (degrees; %s)",
+            shown(v.GazeNow[0]), shown(v.GazeNow[1]), v.HoldGaze ? "held against the voice's head" : "riding with the head");
+      }
+      if (v.FeelNow)
+      {
+        // The feeling as shown: the one picked, or while another still goes out, both; and its own head posture
+        int picked = v.Feel >= 0 && v.Feel < voice_feel::FeelingCount ? v.Feel + 1 : 0, going = -1;
+        for (int f = 0; f <= voice_feel::FeelingCount; ++f)
+          if (f != picked && v.FeelWeights[f] > 0.f && (going < 0 || v.FeelWeights[f] > v.FeelWeights[going]))
+            going = f;
+        auto nameOf = [](int f) { return f <= 0 ? "none" : voice_feel::Presets[f - 1].Name; };
+        // [EMOTION] [REVIEW] With the voice's feeling on, the feeling picked has only the share the voice leaves it
+        float pickedShare = 1.f - (v.FeelVoiceShareNow > 1.f ? 1.f : v.FeelVoiceShareNow);
+        char onFace[48] = "";
+        if (v.FeelVoiceShareNow > 0.f)
+          _snprintf_s(onFace, sizeof(onFace), _TRUNCATE, ", on %.0f %% of the face", pickedShare * 100.f);
+        if (going >= 0)
+          ImGui::TextWrapped("Feeling picked: going from %s to %s%s", nameOf(going), nameOf(picked), onFace);
+        else if (picked > 0)
+          ImGui::TextWrapped("Feeling picked: %s at %.2f%s", nameOf(picked), v.FeelStrengthNow, onFace);
+        // and the voice's own over it
+        if (v.FeelAutoNow > 0.f && v.FeelStretchNow >= 0 && v.FeelStretchNow < (int)v.FeelLooks.size() &&
+          v.FeelStretchNow < (int)v.EmotionStretches.size())
+        {
+          voice_emotion::Look const& look = v.FeelLooks[v.FeelStretchNow];
+          char const* how = look.ByHand ? "set by hand" : "from the voice";
+          // [FIX CHECK] While two stretches change into each other the voice's share is theirs together: named, not
+          // given to one of them
+          bool changing = v.FeelStretchWeightNow < 0.999f;
+          char scale[48] = "";
+          if (!look.ByHand && look.Shown >= 0 && look.Share > 0.f && fabsf(look.Scale - 1.f) > 0.005f)
+            _snprintf_s(scale, sizeof(scale), _TRUNCATE, ", its own part x%.2f by the voice", look.Scale);
+          if (changing)
+            ImGui::TextWrapped("Stretch %d of %d, %s: %s%s; changing with the stretch next to it: the voice's feelings on "
+              "%.0f %% of the face", v.FeelStretchNow + 1, (int)v.EmotionStretches.size(), how, look.Shown >= 0 &&
+              look.Share > 0.f ? voice_feel::Presets[look.Shown].Name : (look.Share > 0.f ? "no feeling" :
+              "the feeling picked"), scale, v.FeelVoiceShareNow * 100.f);
+          else if (look.Shown >= 0 && look.Share > 0.f)
+            ImGui::TextWrapped("Stretch %d of %d, %s: %s on %.0f %% of the face%s%s", v.FeelStretchNow + 1,
+              (int)v.EmotionStretches.size(), how, voice_feel::Presets[look.Shown].Name, v.FeelVoiceShareNow * 100.f,
+              scale, v.FeelAutoNow < 1.f ? " (coming in or going out)" : "");
+          else
+            ImGui::TextWrapped("Stretch %d of %d, %s: %s", v.FeelStretchNow + 1, (int)v.EmotionStretches.size(), how,
+              look.Share > 0.f ? "no feeling" : "the feeling picked");
+        }
+        float nod = shown(v.FeelNod * degrees), tilt = shown(v.FeelTilt * degrees);
+        if (nod != 0.f || tilt != 0.f)
+          ImGui::TextWrapped("The feeling's own head: chin down %+.1f, top to its right %+.1f degrees", nod, tilt);
+        // [SMILE] [JAW]
+        if (v.FeelComes > 0.f && !v.SmileTimes.From.empty())
+          ImGui::TextWrapped("Its smile (where it has one): %.0f %% of it, coming and going with the speech",
+            100.f * v.FeelSmileNow);
+        // ([FIX CHECK] the line stays while the feeling has a jaw, also where it is gone for a p, b or m: it no longer
+        // comes and goes, moving the button under it)
+        if (v.FeelJawOn && v.FeelJawNow > 0.f)
+          ImGui::TextWrapped("Its jaw: %.0f %% of the way open beneath the speech's own (%.1f degrees in a pause, with "
+            "Mouth opening at %.2f)", 100.f * v.FeelJawNow, v.FeelJawNow * voice_face::JawOpenAngle * degrees *
+            (!(v.Jaw > 0.f) ? 0.f : (v.Jaw > 2.f ? 2.f : v.Jaw)), !(v.Jaw > 0.f) ? 0.f : (v.Jaw > 2.f ? 2.f : v.Jaw));
+        else if (v.FeelJawOn)
+          ImGui::TextWrapped("Its jaw: shut here (the lips close for a p, b or m)");
+      }
+      ImGui::TreePop();
+    }
+    if (ImGui::Button("Remove the voice"))
+      RemoveVoice(h);
+    ImGui::PopID();
+  }
+
+  void DrawPosePanel(Held& h, float height, bool& configChanged)
+  {
+    float fontSize = ImGui::GetFontSize();
+    if (g_PoseTab < 0)
+      g_PoseTab = 0;
+    if (g_PoseTab > 4)
+      g_PoseTab = 4;
+    static char const* tabIds[] = { "##PoseTabBone", "##PoseTabClip", "##PoseTabVoice", "##PoseTabFiles",
+      "##PoseTabOptions" };
+    ImGui::BeginChild("##PosePanel", ImVec2(0.f, height), false);
+    float width = (ImGui::GetContentRegionAvailWidth() - ImGui::GetStyle().ItemSpacing.x * 4.f) / 5.f;
+    if (width < 1.f)
+      width = 1.f;
+    if (TabButton("Bone", g_PoseTab == 0, width))
+      g_PoseTab = 0;
+    ImGui::SameLine();
+    if (TabButton("Clip", g_PoseTab == 1, width))
+      g_PoseTab = 1;
+    ImGui::SameLine();
+    if (TabButton("Voice", g_PoseTab == 2, width))
+      g_PoseTab = 2;
+    ImGui::SameLine();
+    if (TabButton("Files", g_PoseTab == 3, width))
+      g_PoseTab = 3;
+    ImGui::SameLine();
+    if (TabButton("Options", g_PoseTab == 4, width))
+      g_PoseTab = 4;
+
+    Snapshot before = SnapshotOf(h);
+    if (!g_SlidersWereActive || g_SliderPressHeld != h.Id)
+    {
+      g_SliderPress = before;   // (the frame a slider is taken, this is the pose it's taken in: SliderHold)
+      g_SliderPressHeld = h.Id;
+    }
+    bool slidersActive = false;
+    ImGui::BeginChild(tabIds[g_PoseTab], ImVec2(0.f, 0.f), false);
+    ImGui::PushItemWidth(fontSize * 11.f);
+    if (g_PoseTab == 0)
+      DrawBoneTab(h, before, slidersActive);
+    else if (g_PoseTab == 1)
+      DrawClipTab(h);
+    else if (g_PoseTab == 2)
+      DrawVoiceTab(h);
+    else if (g_PoseTab == 3)
+      DrawFilesTab(h);
+    else
+      DrawOptionsTab(h, configChanged);
+    ImGui::PopItemWidth();
+    ImGui::EndChild();
+    if (slidersActive && !g_SlidersWereActive)
+      PushUndo(h, before);
+    g_SlidersWereActive = slidersActive;
+    ImGui::EndChild();
+  }
+
+  void DrawPoseMiddle(Held& h, bool& configChanged)
+  {
+    float fontSize = ImGui::GetFontSize();
+    float middleHeight = (std::min)((std::max)(ImGui::GetContentRegionAvail().y - fontSize * 16.5f, fontSize * 10.f),
+      fontSize * 20.f);
+    DrawBonesPane(h, middleHeight);
+    ImGui::SameLine();
+    DrawPosePanel(h, middleHeight, configChanged);
+  }
+
+  char const* KeyEaseLabel(int ease)
+  {
+    switch (ease)
+    {
+    case pose_keys::Ease_Linear:
+      return "Linear";
+    case pose_keys::Ease_EaseInOut:
+      return "Ease in and out";
+    case pose_keys::Ease_Hold:
+      return "Hold";
+    case pose_keys::Ease_In:
+      return "Ease in (starts slow)";
+    case pose_keys::Ease_Out:
+      return "Ease out (ends slow)";
+    case pose_keys::Ease_Overshoot:
+      return "Overshoot and settle";
+    default:
+      return "Smooth";
+    }
+  }
+
+  void CancelKeyMouse()
+  {
+    g_KeyDrag.Pending = false;
+    g_KeyDrag.On = false;
+    g_KeyScrub = false;
+  }
+
+  void UpdateKeyTimeCache(Held const& h)
+  {
+    if (g_KeyTimesHeld == h.Id && g_KeyTimesRevision == h.Keys.Revision &&
+        g_KeyTimesChannels == h.Keys.Channels.size())
+      return;
+    std::vector<double> times;
+    for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+    {
+      std::vector<pose_keys::Key> const& keys = h.Keys.Channels[c].Keys;
+      for (size_t k = 0; k < keys.size(); ++k)
+        times.push_back(keys[k].Time);
+    }
+    std::sort(times.begin(), times.end());
+    g_KeyTimes.clear();
+    for (size_t i = 0; i < times.size(); ++i)
+      if (g_KeyTimes.empty() || times[i] - g_KeyTimes.back() > pose_keys::TimeEpsilon)
+        g_KeyTimes.push_back(times[i]);
+    g_KeyTimesHeld = h.Id;
+    g_KeyTimesRevision = h.Keys.Revision;
+    g_KeyTimesChannels = h.Keys.Channels.size();
+  }
+
+  void DrawKeyTimeline(Held& h)
+  {
+    if ((g_KeyDrag.Pending || g_KeyDrag.On || g_KeyScrub) && g_KeyDrag.Held != h.Id)
+      CancelKeyMouse();
+    ULONGLONG now = GetTickCount64();
+    if ((g_KeyDrag.Pending || g_KeyDrag.On || g_KeyScrub) && now - g_KeyDrag.LastTick > 500)
+      CancelKeyMouse();
+    if (!(h.Keys.Length > 0.0))
+    {
+      CancelKeyMouse();
+      return;
+    }
+    UpdateKeyTimeCache(h);
+
+    float fontSize = ImGui::GetFontSize();
+    ImVec2 mouse = ImGui::GetMousePos();
+    bool mouseDown = ImGui::IsMouseDown(0);
+    bool released = !mouseDown;
+
+    float fullWidth = ImGui::GetContentRegionAvail().x;
+    float totalHeight = (std::max)(fontSize * 5.f, ImGui::GetContentRegionAvail().y);
+    ImVec2 headerMin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##PoseKeyHeader", ImVec2(fullWidth, fontSize * 2.7f));
+    bool headerHovered = ImGui::IsItemHovered();
+    bool headerActive = ImGui::IsItemActive();
+    ImVec2 headerMax = ImGui::GetItemRectMax();
+
+    float namesWidth = fontSize * 9.f;
+    float halfHover = fontSize * 0.42f;
+    float scrollbar = ImGui::GetStyle().ScrollbarSize;
+    float areaLeft = headerMin.x + namesWidth;
+    float areaRight = headerMax.x - scrollbar - halfHover;
+    float areaWidth = areaRight - areaLeft;
+    if (areaWidth < fontSize * 4.f)
+    {
+      areaWidth = fontSize * 4.f;
+      areaRight = areaLeft + areaWidth;
+    }
+    float headerHeight = fontSize * 2.7f;
+    float rulerHeight = fontSize * 1.4f;
+    float allHeight = fontSize * 1.3f;
+    float allTop = headerMin.y + rulerHeight;
+    float rowHeight = fontSize * 1.3f;
+    float half = fontSize * 0.32f;
+    float restHeight = (std::max)(fontSize * 2.3f, totalHeight - headerHeight);
+
+    auto keyX = [&](double time)
+    {
+      return areaLeft + (float)((time / h.Keys.Length) * (double)areaWidth);
+    };
+    auto snapTime = [&](double time)
+    {
+      if (g_SnapKeys)
+        time = std::floor(time / 0.05 + 0.5) * 0.05;
+      return time;
+    };
+    auto scrubTime = [&]()
+    {
+      double time = ((double)mouse.x - (double)areaLeft) / (double)areaWidth * h.Keys.Length;
+      double best = fontSize * 0.45f;
+      bool found = false;
+      for (size_t i = 0; i < g_KeyTimes.size(); ++i)
+      {
+        float x = keyX(g_KeyTimes[i]);
+        float distance = std::fabs(x - mouse.x);
+        if (distance <= best)
+        {
+          best = distance;
+          time = g_KeyTimes[i];
+          found = true;
+        }
+      }
+      if (!found)
+        time = snapTime(time);
+      if (time < 0.0)
+        time = 0.0;
+      if (time > h.Keys.Length)
+        time = h.Keys.Length;
+      return time;
+    };
+
+    int selectedChannel = -1;
+    for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+      if (h.Keys.Channels[c].Bone == g_SelectedBone)
+        selectedChannel = (int)c;
+    size_t channelCount = h.Keys.Channels.size();
+    float contentHeight = (float)channelCount * rowHeight;
+    ImVec2 rowsMin(0.f, 0.f);
+    float childTop = 0.f;
+    float childBottom = 0.f;
+
+    struct TimelineHit
+    {
+      bool Any;
+      bool Name;
+      int Bone;
+      double Time;
+      int KeyIndex;
+    };
+    auto hitTest = [&](bool overHeader, bool overRows, ImVec2 at)
+    {
+      TimelineHit hit{};
+      hit.Bone = -3;
+      if (overHeader && at.x >= areaLeft - fontSize * 0.45f && at.x <= areaRight + fontSize * 0.45f &&
+          at.y >= allTop && at.y <= headerMax.y)
+      {
+        float best = fontSize * 0.45f;
+        for (size_t i = 0; i < g_KeyTimes.size(); ++i)
+        {
+          float x = keyX(g_KeyTimes[i]);
+          float distance = std::fabs(x - at.x);
+          if (distance <= best)
+          {
+            best = distance;
+            hit.Any = true;
+            hit.Bone = -2;
+            hit.Time = g_KeyTimes[i];
+          }
+        }
+      }
+      if (overRows && at.y >= childTop && at.y <= childBottom)
+      {
+        float localY = at.y - rowsMin.y;
+        if (localY >= 0.f && localY < contentHeight)
+        {
+          int row = (int)(localY / rowHeight);
+          if (row >= 0 && row < (int)channelCount)
+          {
+            pose_keys::Channel const& channel = h.Keys.Channels[(size_t)row];
+            if (at.x >= areaLeft - fontSize * 0.45f && at.x <= areaRight + fontSize * 0.45f)
+            {
+              float best = fontSize * 0.45f;
+              for (size_t k = 0; k < channel.Keys.size(); ++k)
+              {
+                float x = keyX(channel.Keys[k].Time);
+                float distance = std::fabs(x - at.x);
+                if (distance <= best)
+                {
+                  best = distance;
+                  hit.Any = true;
+                  hit.Bone = channel.Bone;
+                  hit.Time = channel.Keys[k].Time;
+                  hit.KeyIndex = (int)k;
+                }
+              }
+            }
+            if (!hit.Any && at.x >= headerMin.x && at.x < areaLeft)
+            {
+              hit.Name = true;
+              hit.Bone = channel.Bone;
+              hit.Time = -1.0;
+            }
+          }
+        }
+      }
+      return hit;
+    };
+
+    auto dragTime = [&]()
+    {
+      double time = ((double)mouse.x - (double)areaLeft) / (double)areaWidth * g_KeyDrag.Length;
+      time = snapTime(time);
+      if (time < 0.0)
+        time = 0.0;
+      if (time > g_KeyDrag.Length)
+        time = g_KeyDrag.Length;
+      return time;
+    };
+    ImGui::SetCursorScreenPos(ImVec2(headerMin.x, headerMin.y + headerHeight));
+    ImDrawList* rootDraw = ImGui::GetWindowDrawList();
+    // (A child without a border has no window padding in this ImGui. No style is pushed before BeginChild and popped
+    // after it: ImGui 1.61 ends the game when a window's style stack differs between its Begin and its End.)
+    ImGui::BeginChild("##PoseKeyRows", ImVec2(0.f, restHeight), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+    if (selectedChannel >= 0 && g_SelectedBone != g_KeyTimelineBone)
+    {
+      float rowTop = (float)selectedChannel * rowHeight;
+      float visibleTop = ImGui::GetScrollY();
+      float visibleHeight = ImGui::GetWindowHeight();
+      if (rowTop < visibleTop || rowTop + rowHeight > visibleTop + visibleHeight)
+      {
+        float target = rowTop - (restHeight - rowHeight) * 0.5f;
+        float maxScroll = (std::max)(0.f, contentHeight - restHeight);
+        if (target < 0.f)
+          target = 0.f;
+        if (target > maxScroll)
+          target = maxScroll;
+        ImGui::SetScrollY(target);
+      }
+    }
+    g_KeyTimelineBone = g_SelectedBone;
+
+    ImGui::InvisibleButton("##PoseKeyRowsArea", ImVec2(namesWidth + areaWidth + halfHover, contentHeight));
+    bool rowsHovered = ImGui::IsItemHovered();
+    bool rowsActive = ImGui::IsItemActive();
+    rowsMin = ImGui::GetItemRectMin();
+    childTop = ImGui::GetWindowPos().y;
+    childBottom = childTop + ImGui::GetWindowHeight();
+    ImDrawList* childDraw = ImGui::GetWindowDrawList();
+
+    TimelineHit press = hitTest(headerHovered, rowsHovered, mouse);
+    bool leftClick = ImGui::IsMouseClicked(0);
+    bool rightClick = ImGui::IsMouseClicked(1);
+    bool pointerActive = headerActive || rowsActive;
+    if (leftClick && pointerActive && (headerHovered || rowsHovered) &&
+        !g_KeyDrag.Pending && !g_KeyDrag.On && !g_KeyScrub)
+    {
+      if (press.Any)
+      {
+        if (press.Bone >= 0)
+        {
+          g_SelectedBone = press.Bone;
+          g_KeyTimelineBone = g_SelectedBone;
+          g_SelectedGroup = -1;
+          g_SelectedWeapon = -1;
+          g_BoneListBone = g_SelectedBone;
+          g_BoneListGroup = g_SelectedGroup;
+        }
+        if (!TrackHoldsTime(h) && !PlayingKeys(h))
+          SetPlayhead(h, press.Time);
+        g_KeyDrag.Pending = true;
+        g_KeyDrag.On = false;
+        g_KeyDrag.Held = h.Id;
+        g_KeyDrag.Bone = press.Bone;
+        g_KeyDrag.StartTime = press.Time;
+        g_KeyDrag.PressX = mouse.x;
+        g_KeyDrag.LastTick = now;
+        g_KeyScrub = false;
+      }
+      else if (mouse.x >= areaLeft && mouse.x <= areaRight && !TrackHoldsTime(h))
+      {
+        g_KeyDrag.Pending = false;
+        g_KeyDrag.On = false;
+        g_KeyDrag.Held = h.Id;
+        g_KeyScrub = true;
+        g_KeyDrag.LastTick = now;
+        SetPlayhead(h, scrubTime());
+      }
+    }
+    if (rightClick && (headerHovered || rowsHovered) && !g_KeyDrag.Pending && !g_KeyDrag.On && !g_KeyScrub)
+    {
+      if (press.Any)
+      {
+        g_KeyMenuHeld = h.Id;
+        g_KeyMenuBone = press.Bone;
+        g_KeyMenuTime = press.Time;
+        g_KeyMenuOpen = true;
+      }
+      else if (press.Name)
+      {
+        g_KeyMenuHeld = h.Id;
+        g_KeyMenuBone = press.Bone;
+        g_KeyMenuTime = -1.0;
+        g_KeyMenuOpen = true;
+      }
+    }
+
+    auto applyDrag = [&](double time)
+    {
+      if (h.History.empty())
+      {
+        CancelKeyMouse();
+      }
+      else
+      {
+        h.Keys.Channels = h.History.back().Keys;
+        h.Keys.Length = h.History.back().Length;
+        if (g_KeyDrag.Bone == -2)
+        {
+          pose_keys::MoveKeysAt(h.Keys, g_KeyDrag.StartTime, time);
+          ++h.Keys.Revision;
+          g_KeyDrag.LastTime = time;
+          if (!TrackHoldsTime(h))
+            SetPlayhead(h, time);
+        }
+        else
+        {
+          pose_keys::Channel* channel = pose_keys::Find(h.Keys, g_KeyDrag.Bone);
+          int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyDrag.StartTime) : -1;
+          if (channel == nullptr || key < 0)
+          {
+            ++h.Keys.Revision;
+            CancelKeyMouse();
+          }
+          else
+          {
+            pose_keys::MoveKey(h.Keys, g_KeyDrag.Bone, key, time);
+            ++h.Keys.Revision;
+            g_KeyDrag.LastTime = time;
+            if (!TrackHoldsTime(h))
+              SetPlayhead(h, time);
+          }
+        }
+      }
+    };
+
+    if (g_KeyDrag.On)
+    {
+      if (g_KeyDrag.Held != h.Id || h.History.empty())
+      {
+        CancelKeyMouse();
+      }
+      else if (released)
+      {
+        if (std::fabs(g_KeyDrag.LastTime - g_KeyDrag.StartTime) <= pose_keys::TimeEpsilon)
+        {
+          h.Keys.Channels = h.History.back().Keys;
+          h.Keys.Length = h.History.back().Length;
+          DropLastStep(h);   // its own step, and the Redo it cleared put back
+          ++h.Keys.Revision;
+        }
+        CancelKeyMouse();
+      }
+      else if (mouseDown)
+      {
+        applyDrag(dragTime());
+      }
+    }
+    else if (g_KeyDrag.Pending)
+    {
+      if (g_KeyDrag.Held != h.Id || released)
+      {
+        CancelKeyMouse();
+      }
+      else if (mouseDown && std::fabs(mouse.x - g_KeyDrag.PressX) > MoveStartPixels && !PlayingKeys(h) &&
+               h.Keys.On)
+      {
+        PushKeyUndo(h);
+        g_KeyDrag.Length = h.Keys.Length;
+        g_KeyDrag.On = true;
+        g_KeyDrag.Pending = false;
+        g_KeyDrag.LastTick = now;
+        applyDrag(dragTime());
+      }
+    }
+    else if (g_KeyScrub)
+    {
+      if (g_KeyDrag.Held != h.Id || released)
+      {
+        CancelKeyMouse();
+      }
+      else if (mouseDown)
+      {
+        SetPlayhead(h, scrubTime());
+      }
+    }
+    if (g_KeyDrag.Pending || g_KeyDrag.On || g_KeyScrub)
+      g_KeyDrag.LastTick = now;
+
+    UpdateKeyTimeCache(h);
+    TimelineHit hitDraw = hitTest(headerHovered, rowsHovered, mouse);
+
+    float scrollY = ImGui::GetScrollY();
+    int firstRow = (int)(scrollY / rowHeight);
+    if (firstRow < 0)
+      firstRow = 0;
+    int lastRow = (int)((scrollY + childBottom - childTop) / rowHeight);
+    if (lastRow >= (int)channelCount)
+      lastRow = (int)channelCount - 1;
+
+    auto drawDiamond = [&](ImDrawList* draw, float x, float y, float size, ImU32 colour, bool hollow)
+    {
+      if (draw->VtxBuffer.Size > 60000)
+        return;
+      ImVec2 a(x, y - size), b(x + size, y), c(x, y + size), d(x - size, y);
+      if (hollow)
+      {
+        // A hold keyframe the editor made with a bone's first one (Key::Auto): its outline only
+        draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 153), 3.f);
+        draw->AddQuad(a, b, c, d, colour, 1.5f);
+        return;
+      }
+      draw->AddQuadFilled(a, b, c, d, colour);
+      draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 153), 1.f);
+    };
+
+    ImU32 textColour = ImGui::GetColorU32(ImGuiCol_Text);
+    ImU32 dimColour = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    ImU32 grabColour = ImGui::GetColorU32(ImGuiCol_SliderGrab);
+    ImU32 grabActiveColour = ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+
+    for (int row = firstRow; row <= lastRow; ++row)
+      if (row % 2 == 1)
+        childDraw->AddRectFilled(ImVec2(headerMin.x, rowsMin.y + row * rowHeight),
+          ImVec2(areaRight + halfHover, rowsMin.y + (row + 1) * rowHeight), ImGui::GetColorU32(ImGuiCol_Text, 0.04f));
+
+    childDraw->PushClipRect(ImVec2(headerMin.x, childTop), ImVec2(areaLeft, childBottom), true);
+    for (int row = firstRow; row <= lastRow; ++row)
+    {
+      ImVec2 at(headerMin.x + fontSize * 0.3f, rowsMin.y + row * rowHeight + fontSize * 0.15f);
+      childDraw->AddText(at, h.Keys.Channels[(size_t)row].Bone == g_SelectedBone ? textColour : dimColour,
+        BoneName(h, h.Keys.Channels[(size_t)row].Bone));
+    }
+    childDraw->PopClipRect();
+
+    childDraw->PushClipRect(ImVec2(areaLeft - halfHover, childTop), ImVec2(areaRight + halfHover, childBottom), true);
+    for (int row = firstRow; row <= lastRow; ++row)
+    {
+      pose_keys::Channel const& channel = h.Keys.Channels[(size_t)row];
+      int playKey = channel.Bone == g_SelectedBone ? pose_keys::KeyAt(channel, h.Keys.Time) : -1;
+      float y = rowsMin.y + row * rowHeight + rowHeight * 0.5f;
+      float lastX = -1e30f;
+      for (size_t k = 0; k < channel.Keys.size(); ++k)
+      {
+        float x = keyX(channel.Keys[k].Time);
+        if (x < areaLeft - halfHover || x > areaRight + halfHover)
+          continue;
+        bool hovered = hitDraw.Any && hitDraw.Bone == channel.Bone && hitDraw.KeyIndex == (int)k;
+        if (!hovered && (int)k != playKey && x - lastX < half)
+          continue;
+        lastX = x;
+        float size = hovered ? halfHover : half;
+        ImU32 colour = hovered ? grabActiveColour : ((int)k == playKey ? textColour : grabColour);
+        drawDiamond(childDraw, x, y, size, colour, channel.Keys[k].Auto);
+      }
+    }
+    childDraw->PopClipRect();
+
+    float playheadX = keyX(h.Keys.Time);
+    childDraw->AddLine(ImVec2(playheadX, childTop), ImVec2(playheadX, childBottom), textColour, 2.f);
+    ImGui::EndChild();
+
+    rootDraw->PushClipRect(ImVec2(headerMin.x, allTop), ImVec2(areaLeft, headerMax.y), true);
+    rootDraw->AddText(ImVec2(headerMin.x + fontSize * 0.3f, allTop + fontSize * 0.15f), dimColour, "All bones");
+    rootDraw->PopClipRect();
+
+    double steps[] = { 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0 };
+    double step = 600.0;
+    for (int i = 0; i < 12; ++i)
+      if (steps[i] / h.Keys.Length * (double)areaWidth >= (double)fontSize * 4.0)
+      {
+        step = steps[i];
+        break;
+      }
+    for (double time = 0.0; time <= h.Keys.Length + 1e-9; time += step)
+    {
+      if (rootDraw->VtxBuffer.Size > 60000)
+        continue;
+      float x = keyX(time);
+      if (x < areaLeft - 1.f || x > areaRight + 1.f)
+        continue;
+      rootDraw->AddLine(ImVec2(x, headerMin.y), ImVec2(x, headerMin.y + fontSize * 0.5f), dimColour, 1.f);
+      char label[32];
+      if (time < 60.0)
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "%gs", time);
+      else
+      {
+        double minutes = time / 60.0;
+        if (std::fabs(minutes - std::floor(minutes + 0.5)) < 1e-9)
+          _snprintf_s(label, sizeof(label), _TRUNCATE, "%gm", minutes);
+        else
+          _snprintf_s(label, sizeof(label), _TRUNCATE, "%gs", time);
+      }
+      float labelWidth = ImGui::CalcTextSize(label).x;
+      float labelX = x + 2.f + labelWidth > headerMax.x ? x - 2.f - labelWidth : x + 2.f;
+      rootDraw->AddText(ImVec2(labelX, headerMin.y + fontSize * 0.35f), dimColour, label);
+    }
+
+    rootDraw->PushClipRect(ImVec2(areaLeft - halfHover, allTop), ImVec2(areaRight + halfHover, headerMax.y), true);
+    float lastX = -1e30f;
+    for (size_t i = 0; i < g_KeyTimes.size(); ++i)
+    {
+      float x = keyX(g_KeyTimes[i]);
+      if (x < areaLeft - halfHover || x > areaRight + halfHover)
+        continue;
+      bool hovered = hitDraw.Any && hitDraw.Bone == -2 && hitDraw.Time == g_KeyTimes[i];
+      bool atPlayhead = std::fabs(g_KeyTimes[i] - h.Keys.Time) <= pose_keys::TimeEpsilon;
+      if (!hovered && !atPlayhead && x - lastX < half)
+        continue;
+      lastX = x;
+      float size = hovered ? halfHover : half;
+      ImU32 colour = hovered ? grabActiveColour : (atPlayhead ? textColour : grabColour);
+      drawDiamond(rootDraw, x, allTop + allHeight * 0.5f, size, colour, false);
+    }
+    rootDraw->PopClipRect();
+
+    rootDraw->AddLine(ImVec2(playheadX, headerMin.y), ImVec2(playheadX, headerMax.y), textColour, 2.f);
+    rootDraw->AddTriangleFilled(ImVec2(playheadX - fontSize * 0.3f, headerMin.y),
+      ImVec2(playheadX + fontSize * 0.3f, headerMin.y), ImVec2(playheadX, headerMin.y + fontSize * 0.5f), textColour);
+
+    if (hitDraw.Any)
+    {
+      char tooltip[256];
+      tooltip[0] = '\0';
+      if (hitDraw.Bone == -2)
+      {
+        int count = 0;
+        for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+          if (pose_keys::KeyAt(h.Keys.Channels[c], hitDraw.Time) >= 0)
+            ++count;
+        _snprintf_s(tooltip, sizeof(tooltip), _TRUNCATE, "%d keyframes at %.2f s", count, hitDraw.Time);
+      }
+      else
+      {
+        pose_keys::Channel* channel = pose_keys::Find(h.Keys, hitDraw.Bone);
+        int key = channel != nullptr ? pose_keys::KeyAt(*channel, hitDraw.Time) : -1;
+        if (key >= 0)
+          _snprintf_s(tooltip, sizeof(tooltip), _TRUNCATE, "%s at %.2f s, %s to the next%s", BoneName(h, hitDraw.Bone),
+            channel->Keys[(size_t)key].Time, KeyEaseLabel(channel->Keys[(size_t)key].Ease),
+            !channel->Keys[(size_t)key].Auto ? "" : (g_AutoKey && h.Keys.On && !PlayingKeys(h) ? "\nHollow: made "
+            "with the bone's first keyframe, holding it as it was here (press Keyframe: this bone here, or change it "
+            "here, to make it your own)" : "\nHollow: made with the bone's first keyframe, holding it as it was here "
+            "(press Keyframe: this bone here to make it your own)"));
+      }
+      if (tooltip[0] != '\0')
+        ImGui::SetTooltip("%s", tooltip);
+    }
+  }
+
+  // The Reset question (RequestReset), in a popup opened at the Pose window's top level
+  void DrawResetAsk()
+  {
+    ResetAsk const& a = g_ResetAsk;
+    Held* found = nullptr;
+    for (int i = 0; i < MaxHeld; ++i)
+      if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Id == a.HeldId)
+        found = &g_Held[i];
+    if (!found)
+    {
+      ImGui::CloseCurrentPopup();
+      return;
+    }
+    Held& h = *found;
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
+    if (a.Keyed == 1)
+      ImGui::Text("Reset %s: %s has keyframes, and they put it back when the time moves.", a.What,
+        BoneName(h, a.First));
+    else
+      ImGui::Text("Reset %s: %d of these bones have keyframes, and they put them back when the time moves.", a.What,
+        a.Keyed);
+    ImGui::PopTextWrapPos();
+    bool canKey = h.Keys.On && !PlayingKeys(h);
+    char label[96];
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "Keyframe the reset at %.2f s###PoseResetKey", h.Keys.Time);
+    if (!canKey)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool key = ImGui::Button(label);
+    if (!canKey)
+      ImGui::PopStyleVar();
+    if (!h.Keys.On)
+      ImGui::ItemTooltip("The keyframes are off: tick Use the keyframes (Options)");
+    else if (PlayingKeys(h))
+      ImGui::ItemTooltip("Pause the keyframes first");
+    else
+      ImGui::ItemTooltip("Resets them and keyframes that at the playhead; their keyframes at other times stay");
+    if (key && canKey)
+    {
+      DoReset(h, true);
+      ImGui::CloseCurrentPopup();
+    }
+    bool remove = ImGui::Button("Reset and remove their keyframes###PoseResetRemove");
+    ImGui::ItemTooltip("Resets them and takes all their keyframes away: they stay so at every time");
+    if (remove)
+    {
+      DoReset(h, false);
+      ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::Button("Cancel###PoseResetCancel"))
+      ImGui::CloseCurrentPopup();
+  }
+
+  void DrawKeyMenu()
+  {
+    Held* active = g_Active >= 0 && g_Held[g_Active].Used && !g_Held[g_Active].Restoring ? &g_Held[g_Active] : nullptr;
+    bool valid = active != nullptr && active->Id == g_KeyMenuHeld;
+    if (valid && g_KeyMenuTime >= 0.0)
+    {
+      if (g_KeyMenuBone == -2)
+      {
+        bool found = false;
+        for (size_t c = 0; c < active->Keys.Channels.size(); ++c)
+          if (pose_keys::KeyAt(active->Keys.Channels[c], g_KeyMenuTime) >= 0)
+            found = true;
+        valid = found;
+      }
+      else if (g_KeyMenuBone >= 0 && g_KeyMenuBone < active->Bones)
+      {
+        pose_keys::Channel* channel = pose_keys::Find(active->Keys, g_KeyMenuBone);
+        int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+        valid = key >= 0;
+      }
+      else
+        valid = false;
+    }
+    else if (valid)
+    {
+      if (g_KeyMenuBone < 0 || g_KeyMenuBone >= active->Bones)
+        valid = false;
+    }
+
+    if (!valid)
+    {
+      ImGui::CloseCurrentPopup();
+    }
+    else
+    {
+      Held& h = *active;
+      if (g_KeyMenuTime < 0.0)
+      {
+        ImGui::TextDisabled("%s", BoneName(h, g_KeyMenuBone));
+        if (ImGui::MenuItem("Remove this bone's keyframes"))
+        {
+          pose_keys::Channel* channel = pose_keys::Find(h.Keys, g_KeyMenuBone);
+          if (channel != nullptr)
+          {
+            PushKeyUndo(h);
+            pose_keys::RemoveChannel(h.Keys, g_KeyMenuBone);
+            if (h.Keys.Channels.empty())
+              h.Keys.Playing = false;
+          }
+        }
+      }
+      else if (g_KeyMenuBone == -2)
+      {
+        ImGui::TextDisabled("All bones, %.2f s", g_KeyMenuTime);
+        if (ImGui::MenuItem("Delete the keyframes at this time"))
+        {
+          PushKeyUndo(h);
+          pose_keys::RemoveKeysAt(h.Keys, g_KeyMenuTime);
+          if (h.Keys.Channels.empty())
+            h.Keys.Playing = false;
+        }
+        ImGui::Separator();
+        bool allEase[pose_keys::Ease_Count];
+        for (int e = 0; e < pose_keys::Ease_Count; ++e)
+          allEase[e] = true;
+        for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+        {
+          pose_keys::Channel* channel = pose_keys::Find(h.Keys, h.Keys.Channels[c].Bone);
+          int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+          if (key >= 0)
+            for (int e = 0; e < pose_keys::Ease_Count; ++e)
+              if (channel->Keys[(size_t)key].Ease != e)
+                allEase[e] = false;
+        }
+        for (int e = 0; e < pose_keys::Ease_Count; ++e)
+          if (ImGui::MenuItem(KeyEaseLabel(e), nullptr, allEase[e]) && !allEase[e])
+          {
+            PushKeyUndo(h);
+            for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+            {
+              int bone = h.Keys.Channels[c].Bone;
+              pose_keys::Channel* channel = pose_keys::Find(h.Keys, bone);
+              int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+              if (key >= 0)
+                pose_keys::SetEase(h.Keys, bone, key, e);
+            }
+          }
+        ImGui::Separator();
+        char copy[96];
+        _snprintf_s(copy, sizeof(copy), _TRUNCATE, "Copy to the timeline's time (%.2f s)", h.Keys.Time);
+        bool canCopy = std::fabs(h.Keys.Time - g_KeyMenuTime) > pose_keys::TimeEpsilon;
+        if (ImGui::MenuItem(copy, nullptr, false, canCopy))
+        {
+          struct CopyKey
+          {
+            int Bone;
+            float Turn[4];
+            float Move[3];
+            int Ease;
+          };
+          std::vector<CopyKey> copies;
+          for (size_t c = 0; c < h.Keys.Channels.size(); ++c)
+          {
+            int bone = h.Keys.Channels[c].Bone;
+            pose_keys::Channel* channel = pose_keys::Find(h.Keys, bone);
+            int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+            if (key >= 0)
+            {
+              CopyKey copyKey;
+              copyKey.Bone = bone;
+              memcpy(copyKey.Turn, channel->Keys[(size_t)key].Turn, sizeof(copyKey.Turn));
+              memcpy(copyKey.Move, channel->Keys[(size_t)key].Move, sizeof(copyKey.Move));
+              copyKey.Ease = channel->Keys[(size_t)key].Ease;
+              copies.push_back(copyKey);
+            }
+          }
+          if (!copies.empty())
+          {
+            PushKeyUndo(h);
+            for (size_t i = 0; i < copies.size(); ++i)
+              pose_keys::SetKey(h.Keys, copies[i].Bone, h.Keys.Time, copies[i].Turn, copies[i].Move, copies[i].Ease);
+          }
+        }
+      }
+      else
+      {
+        ImGui::TextDisabled("%s, %.2f s", BoneName(h, g_KeyMenuBone), g_KeyMenuTime);
+        if (ImGui::MenuItem("Delete keyframe"))
+        {
+          pose_keys::Channel* channel = pose_keys::Find(h.Keys, g_KeyMenuBone);
+          int key = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+          if (key >= 0)
+          {
+            PushKeyUndo(h);
+            pose_keys::RemoveKey(h.Keys, g_KeyMenuBone, key);
+            if (h.Keys.Channels.empty())
+              h.Keys.Playing = false;
+          }
+        }
+        ImGui::Separator();
+        pose_keys::Channel* channel = pose_keys::Find(h.Keys, g_KeyMenuBone);
+        int currentKey = channel != nullptr ? pose_keys::KeyAt(*channel, g_KeyMenuTime) : -1;
+        int currentEase = currentKey >= 0 ? channel->Keys[(size_t)currentKey].Ease : -1;
+        for (int e = 0; e < pose_keys::Ease_Count; ++e)
+          if (ImGui::MenuItem(KeyEaseLabel(e), nullptr, currentEase == e) && currentEase != e)
+          {
+            pose_keys::Channel* found = pose_keys::Find(h.Keys, g_KeyMenuBone);
+            int key = found != nullptr ? pose_keys::KeyAt(*found, g_KeyMenuTime) : -1;
+            if (key >= 0)
+            {
+              PushKeyUndo(h);
+              pose_keys::SetEase(h.Keys, g_KeyMenuBone, key, e);
+            }
+          }
+        ImGui::Separator();
+        char copy[96];
+        _snprintf_s(copy, sizeof(copy), _TRUNCATE, "Copy to the timeline's time (%.2f s)", h.Keys.Time);
+        bool canCopy = std::fabs(h.Keys.Time - g_KeyMenuTime) > pose_keys::TimeEpsilon;
+        if (ImGui::MenuItem(copy, nullptr, false, canCopy))
+        {
+          pose_keys::Channel* found = pose_keys::Find(h.Keys, g_KeyMenuBone);
+          int key = found != nullptr ? pose_keys::KeyAt(*found, g_KeyMenuTime) : -1;
+          if (key >= 0)
+          {
+            float turn[4];
+            float move[3];
+            int ease = found->Keys[(size_t)key].Ease;
+            memcpy(turn, found->Keys[(size_t)key].Turn, sizeof(turn));
+            memcpy(move, found->Keys[(size_t)key].Move, sizeof(move));
+            PushKeyUndo(h);
+            pose_keys::SetKey(h.Keys, g_KeyMenuBone, h.Keys.Time, turn, move, ease);
+          }
+        }
+      }
+    }
+  }
+
+  void DrawKeyframes(Held& h)
+  {
+    float fontSize = ImGui::GetFontSize();
+    int keyCount = pose_keys::KeyCount(h.Keys);
+    bool noKeys = keyCount == 0;
+    bool timeLocked = TrackHoldsTime(h);
+    bool jumpsLocked = noKeys || timeLocked;
+    bool keysOn = h.Keys.On;
+    bool playing = PlayingKeys(h);
+    bool clipClock = h.Keys.Clock == pose_keys::Clock_Clip && ClipUsable(h);
+    bool shownPlaying = clipClock ? (h.Keys.Playing && h.Clip.Playing) : h.Keys.Playing;
+    ImGui::SubHeading("KEYFRAMES");
+    ImGui::HelpMarker("A keyframe holds a bone's turn and move at a time, over the pose taken or over the animation clip "
+      "when one is on. Auto key (red when on): while the keyframes are on and not playing, every change you make is "
+      "keyframed at the playhead, from the first one; "
+      "off, press Keyframe: the changes. Move the time, pose again: Play goes from one keyframe to the other. A bone with "
+      "keyframes follows them when the time moves (a change of it not keyframed goes then); a bone without keyframes "
+      "keeps its pose. A bone's first keyframe, made while the pose has keyframes at other times, comes with hollow ones "
+      "holding it as it was at the keyframe times around it (Options). Click a keyframe to go to it, drag it to move it "
+      "in time, right click for its menu. Undo and Redo take back and put back changes of the pose and of its keyframes "
+      "alike. Save keeps the keyframes in a .posekeys file: the one they were last saved in, else (none yet, or after a "
+      "Load) it asks where, as Save as does (any folder, the Windows file window). Load puts a file's back (the Files "
+      "tab does the same by name, in Cinematic Tools\\Poses). With the Pose window closed, Auto key waits: a change made "
+      "on the picture is keyframed once the window is open again (a path dot's drag at once). Hotkeys (by default on the numpad with Num Lock on; change them in the tools' Hotkeys window): in the "
+      "buttons' and the Time field's tips. Weapons aren't keyframed; the keyframes go when the pose is let go (save them in Files); the "
+      "camera track's clock gives no time after a track ends, the keyframes hold their place then.");
+    char status[256];
+    status[0] = '\0';
+    if (h.Keys.Clock == pose_keys::Clock_Game && h.Keys.Playing && g_ClipGameScale == 0.f)
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "Time is frozen: the keyframes wait (Clock: Real time plays with "
+        "time frozen)");
+    else if (h.Keys.Clock == pose_keys::Clock_Track && g_ClipTrackTime < 0.0)
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "Waits for the camera track: play it (CAMERA tab)");
+    else if (h.Keys.Clock == pose_keys::Clock_Track && g_ClipTrackTime >= 0.0 && !h.KeyTrackMoving)
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "The camera track is paused at %.2f s and holds the time",
+        g_ClipTrackTime);
+    else if (h.Keys.Clock == pose_keys::Clock_Clip && !ClipUsable(h))
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "No clip is on");
+    else if (clipClock && TrackHoldsTime(h))
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "The clip follows the camera track and holds the time: pause to move it");
+    else if (h.Keys.Clock == pose_keys::Clock_Clip && ClipUsable(h) && !h.Clip.Playing)
+      _snprintf_s(status, sizeof(status), _TRUNCATE, "The clip is paused");
+    if (status[0])
+    {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "%s", status);
+    }
+
+    if (jumpsLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool press = ImGui::Button("|<");
+    if (jumpsLocked)
+      ImGui::PopStyleVar();
+    if (press && !jumpsLocked)
+      SetPlayhead(h, 0.0);
+    ImGui::ItemTooltip("To the start");
+    SameLineIfFits("<");
+    if (jumpsLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    press = ImGui::Button("<");
+    if (jumpsLocked)
+      ImGui::PopStyleVar();
+    if (press && !jumpsLocked)
+      JumpToKey(h, -1);
+    ItemTooltipKey("To the keyframe before", Action::Pose_PreviousKey);
+    const char* playLabel = shownPlaying ? "Pause###PoseKeysPlay" : "Play###PoseKeysPlay";
+    SameLineIfFits(playLabel);
+    bool playLocked = noKeys || h.Keys.Clock == pose_keys::Clock_Track;
+    if (playLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    press = ImGui::Button(playLabel, ImVec2(fontSize * 4.f, 0.f));
+    if (playLocked)
+      ImGui::PopStyleVar();
+    if (press && !playLocked)
+      TogglePlay(h);
+    if (playLocked && h.Keys.Clock == pose_keys::Clock_Track && !noKeys)
+      ImGui::ItemTooltip("On the camera track's clock the track plays them: play it (CAMERA tab)");
+    else
+      ItemTooltipKey(shownPlaying ? "Pause" : "Play", Action::Pose_Play);
+    SameLineIfFits(">");
+    if (jumpsLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    press = ImGui::Button(">");
+    if (jumpsLocked)
+      ImGui::PopStyleVar();
+    if (press && !jumpsLocked)
+      JumpToKey(h, 1);
+    ItemTooltipKey("To the next keyframe", Action::Pose_NextKey);
+    SameLineIfFits(">|");
+    if (jumpsLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    press = ImGui::Button(">|");
+    if (jumpsLocked)
+      ImGui::PopStyleVar();
+    if (press && !jumpsLocked)
+      SetPlayhead(h, h.Keys.Length);
+    ImGui::ItemTooltip("To the end");
+
+    ImGui::SameLine();
+    if (timeLocked)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    ImGui::PushItemWidth(fontSize * 5.f);
+    float timeValue = (float)h.Keys.Time;
+    bool timeChanged = ImGui::DragFloat("Time", &timeValue, 0.01f, 0.f, (float)h.Keys.Length, "%.2f s");
+    ImGui::PopItemWidth();
+    if (timeLocked)
+      ImGui::PopStyleVar();
+    {
+      std::string back = HotkeyName(Action::Pose_FrameBack), on = HotkeyName(Action::Pose_FrameOn);
+      if (!back.empty() || !on.empty())
+      {
+        char tip[200];
+        _snprintf_s(tip, sizeof(tip), _TRUNCATE, "The playhead. One frame back / on (a 30th of a second, while "
+          "paused): %s / %s", back.empty() ? "none" : back.c_str(), on.empty() ? "none" : on.c_str());
+        ImGui::ItemTooltip(tip);
+      }
+      else
+        ImGui::ItemTooltip("The playhead");
+    }
+    if (timeChanged && !timeLocked && (!ImGui::IsMouseDown(0) || ImGui::IsMouseDragging(0, 1.f)))
+    {
+      double t = (double)timeValue, key = 0.0, best = 0.0;
+      bool have = false;
+      // A keyframe the field would show as this same value: go exactly to the nearest one
+      for (double from = t - 0.005 - pose_keys::TimeEpsilon;
+           pose_keys::KeyTimeAfter(h.Keys, from, key) && key <= t + 0.005 + pose_keys::TimeEpsilon; from = key)
+        if (!have || std::fabs(key - t) < std::fabs(best - t))
+        {
+          best = key;
+          have = true;
+        }
+      if (have)
+        t = best;
+      SetPlayhead(h, t);
+    }
+
+    // (counted before Length and Loop: their change makes the keyframes not current for a frame, which would read 0)
+    int changedCount = 0;
+    if (KeysCurrent(h))
+    {
+      int changedBones[MaxBones];
+      changedCount = ChangedBones(h, changedBones);
+    }
+    ImGui::SameLine();
+    ImGui::PushItemWidth(fontSize * 5.f);
+    float lengthValue = (float)h.Keys.Length;
+    bool lengthTyping = TypingInField();
+    bool lengthChanged = ImGui::DragFloat("Length", &lengthValue, 0.05f, 0.1f, 3600.f, "%.2f s");
+    bool lengthActive = ImGui::IsItemActive();
+    if (lengthActive && !g_LengthWasActive)
+      PushKeyUndo(h);
+    if (lengthChanged && DragTakes(lengthTyping))   // (a click alone only rounds it)
+    {
+      double lengthBefore = h.Keys.Length;
+      pose_keys::SetLength(h.Keys, (double)lengthValue);
+      if (h.Keys.Length != lengthBefore)
+        ++h.Keys.Revision;   // the loop's curve depends on it: the pose is made again from the keyframes
+    }
+    g_LengthWasActive = lengthActive;
+    ImGui::PopItemWidth();
+    SameLineIfFits("Loop", true);
+    if (ImGui::Checkbox("Loop", &h.Keys.Loop))
+      ++h.Keys.Revision;   // the curve depends on it (a bone keyed at 0 s and at the end carries on through the wrap)
+    ImGui::ItemTooltip("Plays them over and over; a bone keyed at 0 s and at the end carries on through the wrap");
+    char changesLabel[64];
+    _snprintf_s(changesLabel, sizeof(changesLabel), _TRUNCATE, "the changes (%d)###PoseKeyChanges", changedCount);
+    bool autoShown = g_AutoKey;
+    bool autoLive = g_AutoKey && keysOn && !playing;   // it keyframes now: not with the keyframes off or playing
+    char const* autoSays = !g_AutoKey ? (!keysOn ? "Auto key is off, and the keyframes are off (Options: Use the "
+      "keyframes)" : (playing ? "Auto key is off: pause the keyframes, then pose and press Keyframe: the changes (a "
+      "change made while they play isn't counted there once the time moves; a bone without keyframes keeps it: pick it "
+      "and press Keyframe: this bone)" :
+      "Auto key is off: press Keyframe: the changes to keep a change")) :
+      (!keysOn ? "Auto key is on, but the keyframes are off (Options: Use the keyframes): changes aren't keyframed now" :
+      (playing ? "Auto key waits while the keyframes play: a change now isn't keyframed" :
+      "Auto key is on: each change you make is keyframed at the playhead"));
+    if (autoShown)
+    {
+      ImVec4 red = autoLive ? ImVec4(1.f, 0.35f, 0.3f, 1.f) : ImVec4(0.65f, 0.42f, 0.4f, 1.f);
+      ImGui::PushStyleColor(ImGuiCol_Text, red);
+      ImGui::PushStyleColor(ImGuiCol_CheckMark, red);
+    }
+    if (ImGui::Checkbox("Auto key###PoseAutoKey", &g_AutoKey))
+      g_ConfigWanted = true;
+    if (autoShown)
+      ImGui::PopStyleColor(2);
+    ImGui::ItemTooltip(autoSays);
+    SameLineIfFits("Keyframe:");
+    ImGui::TextUnformatted("Keyframe:");
+    SameLineIfFits(changesLabel);
+    bool changesGate = keysOn && !playing && changedCount > 0;
+    if (changedCount > 0)
+      ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    if (!changesGate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool changes = ImGui::Button(changesLabel);
+    if (!changesGate)
+      ImGui::PopStyleVar();
+    if (changedCount > 0)
+      ImGui::PopStyleColor();
+    if (changes && changesGate)
+      KeyChanges(h);
+    if (!keysOn)
+      ImGui::ItemTooltip("The keyframes are off: tick Use the keyframes (Options)");
+    else if (playing)
+      ImGui::ItemTooltip("Pause the keyframes first");
+    else if (changedCount > 0)
+      ItemTooltipKey("Keyframes them at the playhead. Not keyframed, a change of a bone that has keyframes goes when "
+        "the time moves (they put it back); a bone without keyframes keeps it", Action::Pose_KeyChanges);
+    else
+      ItemTooltipKey(g_AutoKey ? "Nothing to keyframe now: Auto key keyframes each change at once" : "Nothing to "
+        "keyframe now: change a bone first", Action::Pose_KeyChanges);
+
+    bool hasSelection = (g_SelectedGroup >= 0 && g_SelectedGroup < FaceGroupCount &&
+      h.GroupSize[g_SelectedGroup] > 0) || (g_SelectedBone >= 0 && g_SelectedBone < h.Bones && h.InHeld[g_SelectedBone]);
+    bool boneGate = keysOn && !playing && hasSelection;
+    SameLineIfFits("this bone");
+    if (!boneGate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool bone = ImGui::Button("this bone");
+    if (!boneGate)
+      ImGui::PopStyleVar();
+    if (bone && boneGate)
+      KeySelection(h);
+    if (!keysOn)
+      ImGui::ItemTooltip("The keyframes are off: tick Use the keyframes (Options)");
+    else if (playing)
+      ImGui::ItemTooltip("Pause the keyframes first");
+    else if (!hasSelection)
+      ImGui::ItemTooltip("Pick a bone or face group first");
+    else
+      ImGui::ItemTooltip("Keyframes the picked bone (or face group) at the playhead, as it is");
+
+    bool wholeAny = false;
+    for (int n = 0; n < h.Count && !wholeAny; ++n)
+    {
+      int b = (int)h.List[n];
+      wholeAny = pose_keys::Find(h.Keys, b) != nullptr || IsEdited(h, b) || KeyRefDiffers(h, b);
+    }
+    bool wholeGate = keysOn && !playing && wholeAny;
+    SameLineIfFits("the whole pose");
+    if (!wholeGate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool whole = ImGui::Button("the whole pose");
+    if (!wholeGate)
+      ImGui::PopStyleVar();
+    if (whole && wholeGate)
+      KeyWholePose(h);
+    if (!keysOn)
+      ImGui::ItemTooltip("The keyframes are off: tick Use the keyframes (Options)");
+    else if (playing)
+      ImGui::ItemTooltip("Pause the keyframes first");
+    else if (!wholeAny)
+      ImGui::ItemTooltip("Nothing is posed yet: change a bone first, or pick a bone and press this bone");
+    else
+      ItemTooltipKey("Keyframes every bone that is posed or has keyframes, at the playhead", Action::Pose_KeyWholePose);
+
+    int selected = SelectedKeysAtPlayhead(h);
+    bool removeGate = keysOn && !playing && selected > 0;
+    if (!removeGate)
+      ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+    bool remove = ImGui::Button("Remove keyframe");
+    if (!removeGate)
+      ImGui::PopStyleVar();
+    if (remove && removeGate)
+      RemoveSelectedKeys(h);
+    if (!keysOn)
+      ImGui::ItemTooltip("The keyframes are off: tick Use the keyframes (Options)");
+    else if (playing)
+      ImGui::ItemTooltip("Pause the keyframes first");
+    else if (selected == 0)
+      ImGui::ItemTooltip("Pick a bone that has a keyframe at the playhead");
+    else
+      ItemTooltipKey("Removes the picked bone's keyframe at the playhead", Action::Pose_RemoveKey);
+
+    DrawUndoButtons(h, "PoseKeys");
+    // The keyframes in a file (2026-11-16, the user: "also make it possible to save the keyframes to a file"): Save
+    // into the file they were last saved in by hand (none, or after a load: as Save as), Save as (the Windows file
+    // window: any folder), Load (a file of Cinematic Tools\Poses, or another through the file window). The window and
+    // the file's writing or reading go on a thread of their own (AskKeyFile).
+    {
+      int busy = KeyFileBusy();
+      bool asking = busy >= 0;
+      bool canSave = pose_keys::KeyCount(h.Keys) > 0 || AnyEdited(h);
+      char const* askingSays = busy == KeyFile_Save ? "The keyframes are being saved" :
+        "A file window is open: if it isn't in front, it's behind the game (Alt+Tab to it)";
+      std::string fileName = h.KeysFile.empty() ? std::string() : FileNameOf(h.KeysFile);
+      auto seen = [](char const* what)
+      {
+        if (g_KeyFileItemStub)
+          g_KeyFileItemStub(what, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+      };
+      SameLineIfFits("Save##PoseKeysBarSave");
+      bool gate = canSave && !asking;
+      if (!gate)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+      bool press = ImGui::Button("Save##PoseKeysBarSave");
+      if (!gate)
+        ImGui::PopStyleVar();
+      seen("Save");
+      if (press && gate)
+        AskKeyFile(h, h.KeysFile.empty() ? KeyFile_SaveAs : KeyFile_Save);
+      if (asking)
+        ImGui::ItemTooltip(askingSays);
+      else if (!canSave)
+        ImGui::ItemTooltip("Nothing to save yet: pose it or keyframe it first");
+      else if (h.KeysFile.empty())
+        ImGui::ItemTooltip("Saves the keyframes in a file: where, the file window asks first (as Save as). After a Load "
+          "it asks too, so a loaded file isn't written over by mistake.");
+      else
+      {
+        std::string tip = "Saves the keyframes into " + Utf8Of(h.KeysFile) + ", the file they were last saved in "
+          "(Save as: another file)";
+        ImGui::ItemTooltip(tip.c_str());
+      }
+      SameLineIfFits("Save as...##PoseKeysBarSaveAs");
+      if (!gate)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+      press = ImGui::Button("Save as...##PoseKeysBarSaveAs");
+      if (!gate)
+        ImGui::PopStyleVar();
+      seen("Save as");
+      if (press && gate)
+        AskKeyFile(h, KeyFile_SaveAs);
+      ImGui::ItemTooltip(asking ? askingSays : (!canSave ? "Nothing to save yet: pose it or keyframe it first" :
+        "Saves the keyframes in a .posekeys file you pick, in any folder (the Windows file window); Save writes into it "
+        "next. Load puts them back on a pose with those bones' names (on another skeleton, the bones' turns only)."));
+      SameLineIfFits("Load##PoseKeysBarLoad");
+      if (asking)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+      press = ImGui::Button("Load##PoseKeysBarLoad");
+      if (asking)
+        ImGui::PopStyleVar();
+      seen("Load");
+      if (press && !asking)
+      {
+        ListKeyFiles();
+        g_KeyFilesListedAt = GetTickCount64();
+        ImGui::OpenPopup("##PoseKeysBarLoadMenu");
+      }
+      {
+        char tip[240];
+        _snprintf_s(tip, sizeof(tip), _TRUNCATE, "Loads keyframes onto %s: a file of Cinematic Tools\\Poses, or another "
+          "one anywhere (the file window). They replace its keyframes; Undo takes a load back.", h.Label);
+        ImGui::ItemTooltip(asking ? askingSays : tip);
+      }
+      if (ImGui::BeginPopup("##PoseKeysBarLoadMenu"))
+      {
+        if (g_KeyFiles.empty())
+          ImGui::TextDisabled("No keyframes files in Cinematic Tools\\Poses yet");
+        for (std::wstring const& file : g_KeyFiles)
+        {
+          std::string name = Utf8Of(file), label = name + "##posekeysbarfile";
+          bool picked = ImGui::Selectable(label.c_str(), false);
+          seen(name.c_str());
+          if (picked)
+          {
+            std::wstring path = PoseKeysPath(file);
+            if (LoadKeysFromPath(h, path))
+            {
+              h.KeysFile.clear();   // (Save asks after a load: a loaded file isn't written over by mistake)
+              h.KeysSuggest = path;
+            }
+            SayKeyNote(h, g_FileMessage);
+          }
+        }
+        ImGui::Separator();
+        bool other = ImGui::Selectable("Another file...##posekeysbarother", false);
+        seen("Another file");
+        if (other && !KeyFileWindowOpen())
+          AskKeyFile(h, KeyFile_Load);
+        ImGui::EndPopup();
+      }
+      if (!fileName.empty() && !asking)
+      {
+        // (which file Save writes: shown in its tip; here only when the line has room)
+        std::string shown = "(" + fileName + ")";
+        SameLineIfFits(shown.c_str());
+        ImGui::TextDisabled("%s", shown.c_str());
+      }
+    }
+    {
+      ImGuiStyle const& style = ImGui::GetStyle();
+      float comboWidth = fontSize * 11.f + style.ItemInnerSpacing.x + ImGui::CalcTextSize("Clock").x;
+      if (ImGui::GetItemRectMax().x + style.ItemSpacing.x + comboWidth <=
+          ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x)
+        ImGui::SameLine();
+    }
+    ImGui::PushItemWidth(fontSize * 11.f);
+    const char* clocks[] = { "Game time (Game speed; stops with Freeze time)", "Real time (plays with time frozen too)",
+      "The camera track's time", "The animation clip's time" };
+    int clock = h.Keys.Clock;
+    if (ImGui::Combo("Clock", &clock, clocks, 4))
+    {
+      h.Keys.Clock = clock;
+      if (clock == pose_keys::Clock_Track)
+      {
+        h.Keys.Speed = 1.f;
+        h.Keys.Playing = true;
+      }
+      else if (clock == pose_keys::Clock_Clip)
+      {
+        h.Keys.Speed = 1.f;
+        h.Keys.Start = 0.0;
+        h.Keys.Playing = true;
+        if (h.Clip.Clip)
+        {
+          double length = h.Clip.Clip->Length();
+          if (pose_keys::LastKeyTime(h.Keys) <= length)
+          {
+            double lengthBefore = h.Keys.Length;
+            pose_keys::SetLength(h.Keys, length);
+            if (h.Keys.Length != lengthBefore)
+              ++h.Keys.Revision;   // (the loop's curve depends on it)
+          }
+        }
+      }
+      else
+        h.Keys.Playing = false;
+    }
+    ImGui::PopItemWidth();
+    // What the last keyframing did (bright a while, then dim; the line stays so the timeline doesn't jump)
+    ImGui::PushTextWrapPos(0.f);
+    if (g_KeyNote[0] && g_KeyNoteHeld == h.Id)
+    {
+      if (GetTickCount64() - g_KeyNoteAt < KeyNoteMs)
+        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.55f, 1.f), "%s", g_KeyNote);
+      else
+        ImGui::TextDisabled("%s", g_KeyNote);
+    }
+    else
+      ImGui::TextDisabled("%s", autoSays);
+    ImGui::PopTextWrapPos();
+
+
+    if (noKeys)
+    {
+      CancelKeyMouse();
+      ImGui::PushTextWrapPos(0.f);
+      if (g_AutoKey && h.Keys.On)
+        ImGui::TextDisabled("No keyframes yet. Auto key is on: pose it and each change is keyframed at this time. Move "
+          "the time, pose again: Play goes from one to the other.");
+      else if (g_AutoKey)
+        ImGui::TextDisabled("No keyframes yet. Auto key is on, but the keyframes are off: tick Use the keyframes "
+          "(Options) to keyframe the changes.");
+      else if (!h.Keys.On)
+        ImGui::TextDisabled("No keyframes yet. The keyframes are off: tick Use the keyframes (Options), then pose it "
+          "and press Keyframe: the changes (or tick Auto key).");
+      else
+        ImGui::TextDisabled("No keyframes yet. Pose it, then press Keyframe: the changes (or tick Auto key). Move the "
+          "time, pose again, keyframe again: Play goes from one to the other.");
+      ImGui::PopTextWrapPos();
+    }
+    else
+      DrawKeyTimeline(h);
+  }
+}
+
+// [CPU] The game's pose blend hooked at the tools' start, on the init thread with the other hooks (Main::Init), and
+// not at the first Take on the game's thread: that frame took 45 - 53 ms (measured in CT.log; that making the hook,
+// MinHook's thread snapshot and freeze, is why is inferred: Research_CPU_Memory_2026-11-13 section 2.3). Until a pose
+// is taken the hook only passes the call on: about 9 - 12 ns more a call, measured offline with the tools' own MinHook
+// on a copy of the blend's entry (scratchpad voice\hitch; how many calls the game makes a frame wasn't measured).
+void pose_editor::Init()
+{
+  BlendHook();
 }
 
 void pose_editor::OnViewWritten()
 {
-  if (g_shutdown || !g_mainHandle || !g_mainHandle->GetUI() || !g_mainHandle->GetUI()->IsEnabled() || !Available() ||
-      !g_ppGameRenderer)
+  // (with the menu open: the dots; closed too while a pose looks at the camera: Look at, 2026-11-16)
+  if (g_shutdown || !g_mainHandle || !g_mainHandle->GetUI() || (!g_mainHandle->GetUI()->IsEnabled() &&
+      !g_LookCameraWanted.load(std::memory_order_relaxed)) || !Available() || !g_ppGameRenderer)
     return;
   View view{};
   view.Ok = ReadMainView(view.T, view.P);
@@ -4209,7 +11890,7 @@ void pose_editor::OnViewWritten()
   g_View = view;
 }
 
-void pose_editor::Update(__int64 soldier, bool replayBusy, bool timeFrozen)
+void pose_editor::Update(__int64 soldier, bool replayBusy, bool timeFrozen, float gameTimeScale, double trackTime)
 {
   // Her hair while frozen (its own checks of the game's code)
   paused_hair::Update(soldier, timeFrozen, g_HairWhilePaused);
@@ -4217,6 +11898,25 @@ void pose_editor::Update(__int64 soldier, bool replayBusy, bool timeFrozen)
     return;
   std::lock_guard<std::mutex> lock(g_Mutex);
   ULONGLONG now = GetTickCount64();
+  // The clips' clocks: this frame's real time (the performance counter), the
+  // game's time scale, the camera track's time
+  {
+    static LARGE_INTEGER frequency{}, last{};
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    if (!frequency.QuadPart)
+      QueryPerformanceFrequency(&frequency);
+    double dt = last.QuadPart && frequency.QuadPart ? (double)(counter.QuadPart - last.QuadPart) / frequency.QuadPart : 0.0;
+    last = counter;
+    g_ClipCounterSeconds = frequency.QuadPart ? (double)counter.QuadPart / (double)frequency.QuadPart : 0.0;
+    g_ClipRealDtBefore = g_ClipRealDt;
+    g_ClipRealDt = dt < 0.0 ? 0.0 : (dt > 0.25 ? 0.25 : dt);
+    g_ClipLongFrames = g_ClipRealDt > 0.1 ? (g_ClipLongFrames < 1000 ? g_ClipLongFrames + 1 : 1000) : 0;
+    g_ClipGameScale = gameTimeScale >= 0.f && gameTimeScale < 100.f ? gameTimeScale : 1.f;
+    g_ClipTrackTime = trackTime;
+  }
+  KeepClipLoad();
+  KeepVoiceLoad();
 
   // What the menu asked for
   if (g_ReleaseRequest != -2)
@@ -4241,6 +11941,74 @@ void pose_editor::Update(__int64 soldier, bool replayBusy, bool timeFrozen)
   for (int i = 0; i < MaxHeld; ++i)
     if (g_Held[i].Used)
       KeepHeld(g_Held[i], soldier, replayBusy, timeFrozen, now);
+  // (Look at the camera: the camera's place is read with the menu closed too, while filming: OnViewWritten)
+  bool lookCamera = false;
+  for (int i = 0; i < MaxHeld; ++i)
+    lookCamera |= g_Held[i].Used && g_Held[i].LookMode == Look_Camera;
+  g_LookCameraWanted.store(lookCamera, std::memory_order_relaxed);
+
+  // Her hair while she's posed: reset when her pose jumps (PausedHair.h, KeepReset), and a read-only log with
+  // [Debug] Diagnostics (Watch), with her pose's clip and head
+  {
+    paused_hair::PoseState pose;
+    void const* clipNow = nullptr;
+    bool keysNow = false;
+    double keysTime = 0.0;
+    for (int i = 0; i < MaxHeld; ++i)
+    {
+      Held const& h = g_Held[i];
+      // (not while her pose isn't handed: a replay's or another override's is drawn)
+      if (!h.Used || h.Kind != Kind_Faith || h.Entity != soldier || h.Restoring || h.Aside || h.Refused)
+        continue;
+      pose.Held = true;
+      ClipPlay const& c = h.Clip;
+      pose.ClipOn = c.On && c.Clip && c.Fit.Ok && c.LocalOk;
+      pose.Playing = pose.ClipOn && c.Playing;
+      if (c.Clip)
+      {
+        strncpy_s(pose.File, c.Clip->File.c_str(), _TRUNCATE);
+        pose.Fps = c.Clip->Fps;
+      }
+      clipNow = pose.ClipOn ? c.Clip.get() : nullptr;
+      pose.Time = c.Time;
+      keysNow = h.Keys.On && !h.Keys.Channels.empty();
+      keysTime = h.Keys.Time;
+      int head = BoneByName(h.Skeleton, "Head");
+      if (h.WorldOk && head >= 0 && head < h.Bones)
+      {
+        memcpy(pose.Head, h.World[head], sizeof(pose.Head));
+        pose.HeadOk = true;
+      }
+      break;
+    }
+    // A jump: the clip's loop or a new time (back, or on by more than 0.25 s), a clip put on, taken off or another,
+    // the keyframes' playhead doing the same, with her head moved 10 cm or more in the frame; or her head moved
+    // 50 cm or more in one frame, whatever did it
+    static paused_hair::PoseState last;
+    static void const* lastClip = nullptr;
+    static bool lastKeysNow = false;
+    static double lastKeysTime = 0.0;
+    bool jump = false;
+    if (pose.Held && last.Held && pose.HeadOk && last.HeadOk)
+    {
+      float d[3] = { pose.Head[0] - last.Head[0], pose.Head[1] - last.Head[1], pose.Head[2] - last.Head[2] };
+      float moved = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      bool keysJump = keysNow && lastKeysNow &&
+        (keysTime < lastKeysTime - 1e-6 || keysTime > lastKeysTime + 0.25);
+      bool clipJump = pose.ClipOn != last.ClipOn || clipNow != lastClip ||
+        (pose.ClipOn && (pose.Time < last.Time - 1e-6 || pose.Time > last.Time + 0.25)) || keysJump;
+      jump = (clipJump && moved >= 0.10f) || moved >= 0.5f;
+    }
+    // Let go (or stepped aside) from a clip's pose: the game's own pose takes over at once, maybe metres away
+    if (last.Held && !pose.Held && last.ClipOn)
+      jump = true;
+    last = pose;
+    lastClip = clipNow;
+    lastKeysNow = keysNow;
+    lastKeysTime = keysTime;
+    paused_hair::KeepReset(soldier, jump, gameTimeScale);
+    paused_hair::Watch(soldier, timeFrozen, pose);
+  }
 
   // How often the game tried to update or move the weapons the tools hold
   static ULONGLONG weaponsLoggedAt = 0;
@@ -4266,475 +12034,153 @@ void pose_editor::DrawUI()
     return;
   }
   std::lock_guard<std::mutex> lock(g_Mutex);
-  ULONGLONG now = GetTickCount64();
-  g_ListWantedAt = now;
-  float fontSize = ImGui::GetFontSize();
-
   ImGui::PushTextWrapPos(0.f);
-  ImGui::TextDisabled("Pose Faith, KrugerSec and other people bone by bone: pick one, Take pose, then drag its bones' "
-    "dots on the picture where you like, turn a bone with its rings, or use the sliders here. Freeze time holds "
-    "everyone while you pose (with time running, posed KrugerSec keep their AI: they walk, aim and fight in the "
-    "pose).");
+  ImGui::TextDisabled("Faith, KrugerSec and other people posed bone by bone, with keyframes and animation clips.");
   ImGui::PopTextWrapPos();
-
-  // Who can be posed
-  ImGui::Text("Near the camera (%d):", (int)g_Candidates.size());
-  ImGui::BeginChild("##PoseWho", ImVec2(0.f, fontSize * 6.5f), true);
-  for (Candidate const& c : g_Candidates)
+  if (ImGui::Button(g_WindowOpen ? "Show the Pose window" : "Open the Pose window..."))
   {
-    char row[200];
-    char const* note = c.LettingGo ? "  (being let go)" : c.Held ? "  (held)" : c.Skeleton < 0 ? "  (skeleton not known: can't be posed)" :
-      c.Animated == 0 ? "  (the game doesn't animate it now: can't be posed)" :
-      c.OtherOverride ? "  (a replay or Dash ghost poses it)" : "";
-    if (c.Kind == Kind_Faith)
-      sprintf_s(row, "Faith%s##%I64X", note, c.Entity);
-    else
-      sprintf_s(row, "%s, %.1f m%s##%I64X", KindName(c.Kind, c.Skeleton), c.Distance, note, c.Entity);
-    if (ImGui::Selectable(row, g_Picked == c.Entity))
-    {
-      g_Picked = c.Entity;
-      for (int i = 0; i < MaxHeld; ++i)
-        if (g_Held[i].Used && !g_Held[i].Restoring && g_Held[i].Entity == c.Entity && g_Active != i)
-        {
-          g_Active = i;
-          g_SelectedBone = g_Held[i].Root;
-          g_SelectedGroup = -1;
-          g_SelectedWeapon = -1;
-        }
-    }
+    g_WindowOpen = true;
+    g_WindowFocus = true;
   }
-  if (g_Candidates.empty())
-    ImGui::TextDisabled(g_ScannedAt ? "Nobody that can be posed within %.0f m of the camera" : "Looking...", ScanRadius);
-  ImGui::EndChild();
-
-  Candidate const* picked = nullptr;
-  for (Candidate const& c : g_Candidates)
-    if (c.Entity == g_Picked)
-      picked = &c;
-  bool canTake = picked && !picked->Held && picked->Skeleton >= 0 && picked->Animated != 0 && !picked->OtherOverride;
-  if (!canTake)
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-  if (ImGui::Button("Take pose", ImVec2(fontSize * 7.f, 0.f)) && canTake)
-  {
-    g_TakeWhat = *picked;
-    g_TakeRequest = true;
-  }
-  if (!canTake)
-    ImGui::PopStyleVar();
-  ImGui::SameLine();
-  ImGui::HelpMarker("Holds the picked one's pose as it is now: from then on it's drawn in the pose you make, from its "
-    "hips down to its fingers, while it stays where the game has it. Up to 8 at a time.");
-  Held* active = g_Active >= 0 && g_Held[g_Active].Used && !g_Held[g_Active].Restoring ? &g_Held[g_Active] : nullptr;
-  int heldCount = 0;
+  std::string status;
+  std::string labels;
+  int held = 0;
+  bool keysPlaying = false, clipPlaying = false, voicePlaying = false;
   for (int i = 0; i < MaxHeld; ++i)
-    heldCount += g_Held[i].Used;
-  ImGui::SameLine();
-  if (ImGui::Button("Let go", ImVec2(fontSize * 5.f, 0.f)) && active)
-    g_ReleaseRequest = g_Active;
-  ImGui::SameLine();
-  char allLabel[48];
-  sprintf_s(allLabel, "Let go of all (%d)", heldCount);
-  if (ImGui::Button(allLabel) && heldCount)
-    g_ReleaseRequest = -1;
-  for (int i = 0; i < MaxHeld; ++i)
-    if (g_Held[i].Used && g_Held[i].Restoring && g_Held[i].RestoreWaitLogged)
+    if (g_Held[i].Used)
     {
-      ImGui::PushTextWrapPos(0.f);
-      ImGui::TextDisabled("%s: let go, its bones put back when the game animates it again (it doesn't now). Let go of all "
-        "lets it go now, as posed.", g_Held[i].Label);
-      ImGui::PopTextWrapPos();
+      ++held;
+      if (!labels.empty())
+        labels += ", ";
+      labels += g_Held[i].Label;
+      if (PlayingKeys(g_Held[i]))
+        keysPlaying = true;
+      if (g_Held[i].Clip.On && g_Held[i].Clip.Playing)
+        clipPlaying = true;
+      if (g_Held[i].Voice.Sound && g_Held[i].Voice.On && g_Held[i].Voice.Moving)
+        voicePlaying = true;
     }
-
-  // Faith's hair while frozen: always on, no tick since 2026-11-09 (g_HairWhilePaused)
-  if (g_HairWhilePaused)
+  if (held == 0)
+    status = "No pose held";
+  else
   {
-    char hairStatus[160];
-    paused_hair::Status(hairStatus, sizeof(hairStatus));
-    if (hairStatus[0])
-      ImGui::TextDisabled("%s", hairStatus);
+    status = std::to_string(held) + " held: " + labels;
+    if (keysPlaying)
+      status += " (keyframes playing)";
+    if (clipPlaying)
+      status += " (clip playing)";
+    if (voicePlaying)
+      status += " (voice playing)";
   }
+  ImGui::PushTextWrapPos(0.f);
+  ImGui::TextDisabled("%s", status.c_str());
+  ImGui::PopTextWrapPos();
+}
 
-  if (!active)
-  {
-    ImGui::TextDisabled(heldCount ? "Pick a held one in the list to edit it" : "No pose held");
+void pose_editor::HotkeyUpdate()
+{
+  if (g_shutdown || !g_mainHandle || !g_mainHandle->GetUI() || !g_mainHandle->GetUI()->IsEnabled() || !Available())
     return;
-  }
-  Held& h = *active;
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  PoseHotkeys();
+}
 
-  ImGui::Separator();
-  ImGui::Text("Editing: %s", h.Label);
-  ImGui::PushTextWrapPos(0.f);
-  ImGui::TextDisabled("%s", h.Status[0] ? h.Status : "Being taken...");
-  if (h.CheckLine[0])
-    ImGui::TextDisabled("%s", h.CheckLine);
-  ImGui::PopTextWrapPos();
-  for (int i = 0; i < h.WeaponCount; ++i)
+void pose_editor::DrawWindow()
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  g_WindowRectOk = false;
+  if (!ImGui::IsMouseDown(0) &&
+      (!g_WindowOpen || !Available() || g_Active < 0 || g_Active >= MaxHeld || !g_Held[g_Active].Used ||
+       g_Held[g_Active].Restoring || pose_keys::KeyCount(g_Held[g_Active].Keys) == 0))
+    CancelKeyMouse();
+  if (!g_WindowOpen)
+    return;
+
+  float fontSize = ImGui::GetFontSize();
+  ImGuiIO& io = ImGui::GetIO();
+  float width = io.DisplaySize.x >= fontSize * 110.f ? fontSize * 46.f : fontSize * 40.f;
+  float height = (std::min)(fontSize * 44.f, io.DisplaySize.y - fontSize * 4.f);
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - width - fontSize * 2.f, fontSize * 2.f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSizeConstraints(ImVec2((std::min)(fontSize * 40.f, io.DisplaySize.x - fontSize * 2.f),
+    (std::min)(fontSize * 36.f, io.DisplaySize.y - fontSize * 2.f)), io.DisplaySize);
+  if (g_WindowFocus)
   {
-    HeldWeapon const& w = h.Weapons[i];
-    char row[200];
-    char where[64];
-    if (w.Bone == WorldFrame)
-      strcpy_s(where, "put down");
-    else if (w.Bone >= 0)
-      sprintf_s(where, "with %s", BoneName(h, w.Bone));
-    else
-      strcpy_s(where, w.Gone ? "the game's (dropped or gone)" : "the game's (not on a bone when taken)");
-    char const* state = w.Bone == -1 ? "" : (!g_WeaponsFollow ? ", where the game has it (Weapons go with the hands is off)" :
-      (w.Drawing ? ", drawn by the tools" : (w.Holding ? ", its entity moved (its body not drawn by the tools)" : "")));
-    sprintf_s(row, "Its %s: %s%s%s##weapon%d", w.Name, where, state, i == g_SelectedWeapon ? "  (picked)" : "", i);
-    if (ImGui::Selectable(row, g_SelectedWeapon == i))
-    {
-      g_SelectedWeapon = i;
-      g_SelectedBone = -1;
-      g_SelectedGroup = -1;
-    }
+    ImGui::SetNextWindowFocus();
+    ImGui::SetNextWindowCollapsed(false);
+    g_WindowFocus = false;
   }
 
-  // Undo is pushed when a slider starts moving: the pose before this frame's change
-  Snapshot before = SnapshotOf(h);
-  bool slidersActive = false;
-
-  // The bones
-  ImGui::Checkbox("Show the bones on the picture", &g_ShowBones);
-  ImGui::Checkbox("Face", &g_ShowFace);
-  ImGui::SameLine();
-  ImGui::Checkbox("Group the face", &g_GroupFace);
-  ImGui::SameLine();
-  ImGui::HelpMarker("The face's bones as groups: eyes, upper eyelids, lower eyelids, eyebrows, upper lip, lower lip, "
-    "mouth corners, cheeks and nose, with the jaw, tongue and chin on their own. A group's dot is in the middle of "
-    "its bones: turning it turns each of them the same way about its own place (the lids close), dragging it moves "
-    "them all the same way (a lip, the brows). Dragging the Eyes makes them look: both turn to look at one point, "
-    "which goes the way the cursor goes (an eye or an iris alone does the same for that eye). Untick it to work on "
-    "single face bones. Other face bones are moved when you drag them, not bent like an arm.");
-  ImGui::SameLine();
-  ImGui::Checkbox("Fingers", &g_ShowFingers);
-  ImGui::SameLine();
-  ImGui::Checkbox("Helper bones", &g_ShowHelpers);
+  bool open = true;
+  bool configChanged = false;
+  if (ImGui::Begin("Pose###PoseWindow", &open))
   {
-    const char* bends[] = { "only the bone above it", "the 2 bones above it (arm, leg)", "the 3 bones above it",
-      "the 4 bones above it" };
-    int bendIndex = g_MoveBones - 1;
-    ImGui::PushItemWidth(fontSize * 13.f);
-    if (ImGui::Combo("A dragged bone bends", &bendIndex, bends, 4))
-      g_MoveBones = bendIndex + 1;
-    ImGui::PopItemWidth();
-  }
-  ImGui::Checkbox("Free move", &g_FreeMove);
-  ImGui::SameLine();
-  ImGui::HelpMarker("Dragging a bone moves the bone itself instead of bending the bones above it; the bones below it "
-    "go with it. Drag one of the picked bone's red, green or blue arrows to move it along that axis only.");
-  ImGui::Checkbox("Bones stop at walls", &g_StopAtWalls);
-  if (g_StopAtWalls && !g_WallsReady)
-  {
-    ImGui::SameLine();
-    ImGui::TextDisabled("(not available now: see CT.log)");
-  }
-  ImGui::Checkbox("Idle movement", &g_IdleOn);
-  if (g_IdleOn)
-  {
-    ImGui::SliderFloat("Amount##PoseIdle", &g_IdleAmount, 0.f, 2.f, "%.2f");
-    if (g_IdleUnavailable[0])
-      ImGui::TextDisabled("%s", g_IdleUnavailable);
-  }
-  // Weapons go with the hands: always on, no tick since 2026-11-09 (g_WeaponsFollow)
-  ImGui::Checkbox("Rings on the bone's own axes", &g_RingsOnBone);
-  ImGui::SameLine();
-  ImGui::HelpMarker("The picked bone's rings: drag one to turn the bone about it. Ticked, red, green and blue are the "
-    "bone's own X, Y and Z (they turn with it); unticked, the world's X, Y (up) and Z. The white ring turns it about "
-    "the view.");
-  ImGui::InputText("Find a bone", g_Filter, sizeof(g_Filter));
-  ImGui::BeginChild("##PoseBones", ImVec2(0.f, fontSize * 10.f), true);
-  for (int n = 0; n < h.Count; ++n)
-  {
-    int i = (int)h.List[n];
-    char const* name = BoneName(h, i);
-    if (g_Filter[0])
+    ImVec2 pos = ImGui::GetWindowPos();
+    ImVec2 size = ImGui::GetWindowSize();
+    g_WindowMin = pos;
+    g_WindowMax = ImVec2(pos.x + size.x, pos.y + size.y);
+    g_WindowRectOk = true;
+    g_ListWantedAt = GetTickCount64();
+    if (g_KeyMenuOpen)
     {
-      // Case-insensitive part of the name
-      bool match = false;
-      size_t fl = strlen(g_Filter);
-      for (char const* p = name; *p && !match; ++p)
-        match = _strnicmp(p, g_Filter, fl) == 0;
-      if (!match)
-        continue;
+      ImGui::OpenPopup("##PoseKeyMenu");
+      g_KeyMenuOpen = false;
     }
-    else
+    if (ImGui::BeginPopup("##PoseKeyMenu"))
     {
-      // A face group's row, once, where its first bone is
-      if (GroupShown(h, h.Group[i]))
-      {
-        int g = h.Group[i];
-        if (h.GroupMembers[g][0] != i)
-          continue;
-        char row[160];
-        int indent = h.Depth[i] > 30 ? 30 : h.Depth[i];
-        sprintf_s(row, "%*s%s (%d bones)%s##group%d", indent * 2, "", FaceGroupNames[g], h.GroupSize[g],
-          GroupEdited(h, g) ? "  *" : "", g);
-        if (ImGui::Selectable(row, g_SelectedGroup == g))
-        {
-          g_SelectedGroup = g;
-          g_SelectedBone = -1;
-          g_SelectedWeapon = -1;
-        }
-        continue;
-      }
-      if (!BoneShown(h, i) && i != g_SelectedBone)
-        continue;
+      DrawKeyMenu();
+      ImGui::EndPopup();
     }
-    char row[160];
-    int indent = g_Filter[0] ? 0 : (h.Depth[i] > 30 ? 30 : h.Depth[i]);
-    sprintf_s(row, "%*s%s%s##bone%d", indent * 2, "", name, IsEdited(h, i) ? "  *" : "", i);
-    if (ImGui::Selectable(row, g_SelectedBone == i))
+    if (g_ResetAskOpen)
     {
-      g_SelectedBone = i;
-      g_SelectedGroup = -1;
-      g_SelectedWeapon = -1;
+      ImGui::OpenPopup("##PoseResetAsk");
+      g_ResetAskOpen = false;
     }
-  }
-  ImGui::EndChild();
-
-  // The picked thing's sliders under IDs of its own: a field being typed in
-  // isn't carried over to the next thing picked (the overlay takes the click
-  // that picks it from ImGui)
-  ImGui::PushID(g_SelectedGroup >= 0 ? 10000 + g_SelectedGroup : (g_SelectedWeapon >= 0 ? 20000 + g_SelectedWeapon :
-    g_SelectedBone));
-  if (g_SelectedGroup >= 0 && g_SelectedGroup < FaceGroupCount && h.GroupSize[g_SelectedGroup] > 0)
-  {
-    // A face group: every member gets the same turn (in its parent's frame,
-    // about its own place) and the same move
-    int g = g_SelectedGroup, first = h.GroupMembers[g][0];
-    ImGui::Text("%s (%d bones)", FaceGroupNames[g], h.GroupSize[g]);
-    float angles[3];
-    QToAngles(h.Turn[first], angles);
-    bool changed = false;
-    changed |= ImGui::SliderFloat("Turn X##PoseGroupX", &angles[0], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    changed |= ImGui::SliderFloat("Turn Y##PoseGroupY", &angles[1], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    changed |= ImGui::SliderFloat("Turn Z##PoseGroupZ", &angles[2], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    ImGui::SameLine();
-    ImGui::HelpMarker("Each bone of the group gets this turn about its parent bone's X, Y and Z, about its own place "
-      "(the values shown are its first bone's).");
-    if (changed)
+    if (ImGui::BeginPopup("##PoseResetAsk"))
     {
-      float q[4];
-      QFromAngles(angles, q);
-      for (int k = 0; k < h.GroupSize[g]; ++k)
-        memcpy(h.Turn[h.GroupMembers[g][k]], q, sizeof(q));
+      DrawResetAsk();
+      ImGui::EndPopup();
     }
-    float move[3] = { h.Move[first][0], h.Move[first][1], h.Move[first][2] };
-    if (ImGui::SliderFloat3("Move##PoseGroupMove", move, -MaxFaceMove, MaxFaceMove, "%.3f m"))
-      for (int k = 0; k < h.GroupSize[g]; ++k)
-      {
-        int m = h.GroupMembers[g][k];
-        memcpy(h.Move[m], move, sizeof(move));
-        ClampMove(h, m);
-      }
-    slidersActive |= ImGui::IsItemActive();
-    ImGui::SameLine();
-    ImGui::HelpMarker("Moves each bone of the group the same way, in its parent bone's frame (the face's; the jaw's "
-      "for the lower lip and the low cheeks).");
-    if (ImGui::Button("Reset this group"))
-    {
-      PushUndo(h, before);
-      for (int k = 0; k < h.GroupSize[g]; ++k)
-      {
-        int m = h.GroupMembers[g][k];
-        bool below[MaxBones] = {};
-        for (int b = m; b < h.Bones; ++b)
-        {
-          below[b] = b == m || (h.Parents[b] >= m && below[h.Parents[b]]);
-          if (below[b])
-            ResetBone(h, b);
-        }
-      }
-    }
-  }
-  else if (g_SelectedBone >= 0 && g_SelectedBone < h.Bones && h.InHeld[g_SelectedBone])
-  {
-    int i = g_SelectedBone;
-    ImGui::Text("%s", BoneName(h, i));
-    float angles[3];
-    QToAngles(h.Turn[i], angles);
-    float shown[3] = { angles[0], angles[1], angles[2] };
-    bool changed = false;
-    changed |= ImGui::SliderFloat("Turn X##PoseX", &shown[0], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    changed |= ImGui::SliderFloat("Turn Y##PoseY", &shown[1], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    changed |= ImGui::SliderFloat("Turn Z##PoseZ", &shown[2], -180.f, 180.f, "%.1f deg");
-    slidersActive |= ImGui::IsItemActive();
-    ImGui::SameLine();
-    ImGui::HelpMarker("The bone's turn from the pose it was taken in, about its parent bone's X, Y and Z (in that "
-      "order). The rings on the picture turn it too (see Rings on the bone's own axes).");
-    if (changed)
-      QFromAngles(shown, h.Turn[i]);
-    bool moved = h.Move[i][0] != 0.f || h.Move[i][1] != 0.f || h.Move[i][2] != 0.f;
-    if (i == h.Root || h.Face[i] || g_FreeMove || moved)
-    {
-      // The Hips: a drag field (a slider would need an end), up to 100 km
-      bool changedMove = i == h.Root ? ImGui::DragFloat3("Move##PoseMove", h.Move[i], 0.01f, 0.f, 0.f, "%.3f m") :
-        ImGui::SliderFloat3("Move##PoseMove", h.Move[i], -MoveLimit(h, i), MoveLimit(h, i), "%.3f m");
-      if (changedMove)
-        ClampMove(h, i);
-      slidersActive |= ImGui::IsItemActive();
-      ImGui::SameLine();
-      ImGui::HelpMarker(i == h.Root ? "Moves the whole body from where the character is, in the frame of the bone under "
-        "it (AITrajectory: where the game has the character, turned its way), as far as you like (up to 100 km): drag a "
-        "field sideways, or double-click it and type a number." : (h.Face[i] ? "Moves the face bone, in "
-        "its parent bone's frame." : "Moves the bone (and every bone below it) from where it is, in its parent bone's "
-        "frame. The mesh stretches between it and its parent."));
-    }
-    if (ImGui::Button("Reset this bone"))
-    {
-      PushUndo(h, before);
-      ResetBone(h, i);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset it and the bones below"))
-    {
-      PushUndo(h, before);
-      bool below[MaxBones] = {};
-      for (int b = i; b < h.Bones; ++b)
-        below[b] = b == i || (h.Parents[b] >= 0 && h.Parents[b] >= i && below[h.Parents[b]]);
-      for (int b = i; b < h.Bones; ++b)
-        if (below[b])
-          ResetBone(h, b);
-    }
-  }
-  else if (g_SelectedWeapon >= 0 && g_SelectedWeapon < h.WeaponCount)
-  {
-    HeldWeapon& w = h.Weapons[g_SelectedWeapon];
-    ImGui::Text("Its %s", w.Name);
-    if (w.Bone == -1)
+    if (!Available())
     {
       ImGui::PushTextWrapPos(0.f);
-      ImGui::TextDisabled(!w.Gone ? "It wasn't on one of its bones when the pose was taken, so the game has it." :
-        "It isn't its own any more (dropped or gone): the game has it.");
+      ImGui::TextDisabled("%s", g_Unavailable[0] ? g_Unavailable : "Not available (see CT.log)");
       ImGui::PopTextWrapPos();
-      float local[FloatsPerBone], world[FloatsPerBone];
-      if (!w.Gone && ImGui::Button("Pose it where it is") && WeaponPlace(w, h.Entity, local, world))
-      {
-        PushUndo(h, before);
-        w.Bone = WorldFrame;
-        memcpy(w.OffsetLocal, local, sizeof(w.OffsetLocal));
-        memcpy(w.OffsetWorld, world, sizeof(w.OffsetWorld));
-        w.OffsetLocal[3] = w.OffsetWorld[3] = 1.f;
-        w.EditMove[0] = w.EditMove[1] = w.EditMove[2] = 0.f;
-        QIdentity(w.EditTurn);
-      }
     }
     else
     {
-      int attachTo = w.TakenBone >= 0 ? w.TakenBone : (h.GripBone >= 0 ? h.GripBone : h.Root);
-      bool attached = w.Bone >= 0;
-      char label[96];
-      sprintf_s(label, "Goes with %s##PoseWeaponWith", BoneName(h, attached ? w.Bone : attachTo));
-      if (ImGui::Checkbox(label, &attached) && h.WorldOk)
+      Held* active = DrawWho();
+      if (active)
       {
-        PushUndo(h, before);
-        MoveWeaponTo(h, w, attached ? attachTo : WorldFrame);
+        DrawPoseMiddle(*active, configChanged);
+        DrawKeyframes(*active);
       }
-      ImGui::SameLine();
-      ImGui::HelpMarker("Ticked, it goes with that bone when you pose it (where it is on the bone stays). Unticked, it's "
-        "put down: it stays where it is in the world however the body moves. Either way, drag its square on the picture "
-        "to move it, turn it with its rings, or use the sliders.");
-      float angles[3];
-      QToAngles(w.EditTurn, angles);
-      bool changed = false;
-      changed |= ImGui::SliderFloat("Turn X##PoseWeaponX", &angles[0], -180.f, 180.f, "%.1f deg");
-      slidersActive |= ImGui::IsItemActive();
-      changed |= ImGui::SliderFloat("Turn Y##PoseWeaponY", &angles[1], -180.f, 180.f, "%.1f deg");
-      slidersActive |= ImGui::IsItemActive();
-      changed |= ImGui::SliderFloat("Turn Z##PoseWeaponZ", &angles[2], -180.f, 180.f, "%.1f deg");
-      slidersActive |= ImGui::IsItemActive();
-      ImGui::SameLine();
-      ImGui::HelpMarker(w.Bone >= 0 ? "Its turn about its own place, about its bone's X, Y and Z (in that order)." :
-        "Its turn about its own place, about the world's X, Y (up) and Z (in that order).");
-      if (changed)
-        QFromAngles(angles, w.EditTurn);
-      if (ImGui::DragFloat3("Move##PoseWeaponMove", w.EditMove, 0.005f, 0.f, 0.f, "%.3f m"))
-        for (int k = 0; k < 3; ++k)
-          if (!std::isfinite(w.EditMove[k]))
-            w.EditMove[k] = 0.f;
-      slidersActive |= ImGui::IsItemActive();
-      ImGui::SameLine();
-      ImGui::HelpMarker(w.Bone >= 0 ? "Its move from where it was on its bone, in the bone's frame. Drag a field "
-        "sideways, or double-click it and type a number." : "Its move from where it was put down, in the world's frame "
-        "(Y is up). Drag a field sideways, or double-click it and type a number.");
-    }
-    // (not one that was dropped: the game has it now)
-    if (!w.Gone)
-    {
-      if (ImGui::Button("Reset this weapon"))
-      {
-        PushUndo(h, before);
-        ResetWeapon(w);
-      }
-      ImGui::SameLine();
-      ImGui::HelpMarker("Back as it was when the pose was taken: on the bone it was on (or the game's), not moved or "
-        "turned.");
     }
   }
   else
-    ImGui::TextDisabled("Pick a bone in the list or click its dot on the picture");
-  ImGui::PopID();
+  {
+    if (!ImGui::IsMouseDown(0))
+      CancelKeyMouse();
+    ImVec2 pos = ImGui::GetWindowPos();
+    ImVec2 size = ImGui::GetWindowSize();
+    g_WindowMin = pos;
+    g_WindowMax = ImVec2(pos.x + size.x, pos.y + size.y);
+    g_WindowRectOk = true;
+  }
+  ImGui::End();
+  if (open && !ImGui::IsAnyItemActive() && !g_KeyDrag.On && !g_KeyDrag.Pending && !g_KeyScrub &&
+      !g_Drag.On && !g_Move.On && !g_Move.Pending)
+    AutosaveKeysNow();
+  g_WindowOpen = open;
+  configChanged |= g_ConfigWanted;
+  g_ConfigWanted = false;
+  if (configChanged && g_mainHandle)
+    g_mainHandle->OnConfigChanged();
+}
 
-  if (ImGui::Button("Reset all"))
-  {
-    PushUndo(h, before);
-    for (int b = 0; b < h.Bones; ++b)
-      ResetBone(h, b);
-    for (int i = 0; i < h.WeaponCount; ++i)
-      ResetWeapon(h.Weapons[i]);
-  }
-  ImGui::SameLine();
-  char undoLabel[32];
-  sprintf_s(undoLabel, "Undo (%d)", (int)h.Undo.size());
-  if (ImGui::Button(undoLabel) && !h.Undo.empty())
-  {
-    ApplySnapshot(h, h.Undo.back());
-    h.Undo.pop_back();
-  }
-  if (slidersActive && !g_SlidersWereActive)
-    PushUndo(h, before);
-  g_SlidersWereActive = slidersActive;
-
-  // Saved poses
-  ImGui::Separator();
-  ImGui::InputText("Pose name", g_SaveName, sizeof(g_SaveName));
-  ImGui::SameLine();
-  if (ImGui::Button("Save"))
-    SavePose(h, g_SaveName);
-  if (now - g_FilesListedAt > 2000)
-  {
-    ListPoseFiles();
-    g_FilesListedAt = now;
-  }
-  if (!g_PoseFiles.empty())
-  {
-    ImGui::Text("Load onto %s:", h.Label);
-    ImGui::SameLine();
-    ImGui::HelpMarker("Each saved bone with the same name gets the saved turn, so a pose loads onto any skeleton "
-      "with those bones (Faith's onto a KrugerSec's and so on). Where two skeletons' bones are set up differently, "
-      "a bone can come out turned another way. Undo takes a load back.");
-    ImGui::BeginChild("##PoseFiles", ImVec2(0.f, fontSize * 5.f), true);
-    for (std::string const& file : g_PoseFiles)
-    {
-      char label[128];
-      sprintf_s(label, "%s##posefile", file.c_str());
-      if (ImGui::Selectable(label, false))
-        LoadPose(h, file.c_str());
-    }
-    ImGui::EndChild();
-  }
-  if (g_FileMessage[0])
-  {
-    ImGui::PushTextWrapPos(0.f);
-    ImGui::TextDisabled("%s", g_FileMessage);
-    ImGui::PopTextWrapPos();
-  }
+void pose_editor::QuietMouse()
+{
+  QuietMouseAfterWindow();
 }
 
 void pose_editor::DrawOverlay()
@@ -4743,14 +12189,32 @@ void pose_editor::DrawOverlay()
     return;
   std::lock_guard<std::mutex> lock(g_Mutex);
   ImGuiIO& io = ImGui::GetIO();
+  // The keyframes' file (2026-11-16): a press as its window closed not taken; its answer taken (saved or loaded)
+  QuietMouseAfterWindow();
+  TakeKeyFileAnswer();
   Held* active = g_Active >= 0 && g_Held[g_Active].Used ? &g_Held[g_Active] : nullptr;
   if (g_Drag.On && (!io.MouseDown[0] || !active || g_Drag.Held != g_Active))
     g_Drag.On = false;
-  if ((g_Move.Pending || g_Move.On) && (!io.MouseDown[0] || !active || g_Move.Held != g_Active))
+  // A held dot let go; a path's dot after a drag: its change keyframed at its time (2026-11-16)
+  auto endMove = []()
+  {
+    if (g_Move.On && g_Move.Trail && g_Move.Held >= 0 && g_Move.Held < MaxHeld && g_Held[g_Move.Held].Used &&
+        !g_Held[g_Move.Held].Restoring)
+      KeyTrailDrag(g_Held[g_Move.Held], g_Move.Pose, g_Move.TrailMirror);
     g_Move.Pending = g_Move.On = false;
+  };
+  if ((g_Move.Pending || g_Move.On) && (!io.MouseDown[0] || !active || g_Move.Held != g_Active))
+    endMove();
+  AutoKeyChanges();
+  for (int i = 0; i < MaxHeld; ++i)
+    SettleLastStep(g_Held[i]);
+  // (the Pose window closed: its own autosave doesn't run, and a path dot's drag keyframes all the same)
+  if (!g_WindowOpen && !g_Drag.On && !g_Move.On && !g_Move.Pending)
+    AutosaveKeysNow();
   if (!active || !g_ShowBones || !active->WorldOk)
   {
-    g_Move.Pending = g_Move.On = false;
+    if (g_Move.Pending || g_Move.On)
+      endMove();
     return;
   }
   View view;
@@ -4762,6 +12226,18 @@ void pose_editor::DrawOverlay()
     return;
   Held& h = *active;
   float fontSize = ImGui::GetFontSize();
+  bool clipOverWindow = g_WindowOpen && g_WindowRectOk;
+  ImVec2 clipMin, clipMax;
+  if (clipOverWindow)
+  {
+    float grow = fontSize * 0.5f;
+    clipMin = ImVec2(g_WindowMin.x - grow, g_WindowMin.y - grow);
+    clipMax = ImVec2(g_WindowMax.x + grow, g_WindowMax.y + grow);
+  }
+  auto overWindow = [&](ImVec2 p)
+  {
+    return clipOverWindow && p.x >= clipMin.x && p.x <= clipMax.x && p.y >= clipMin.y && p.y <= clipMax.y;
+  };
 
   // The ring held with the mouse turns its bone, or each of its face group's
   // bones about its own place: by the angle the cursor went along the ring
@@ -4777,6 +12253,11 @@ void pose_editor::DrawOverlay()
     // turn = parent^-1 * q * parent * turn when taken
     auto turnOne = [&](int bone, float const* parent, float const* before)
     {
+      if (angle == 0.f)
+      {
+        memcpy(h.Turn[bone], before, sizeof(h.Turn[bone]));   // not turned: as taken, to the bit
+        return;
+      }
       float inverse[4], a[4], b[4];
       QConj(parent, inverse);
       QMul(inverse, q, a);
@@ -4789,11 +12270,16 @@ void pose_editor::DrawOverlay()
       // Its edit's turn, in its frame: frame^-1 * q * frame * the turn when taken
       float inverse[4], a[4], b[4];
       float* turn = h.Weapons[g_Drag.Weapon].EditTurn;
-      QConj(g_Drag.Parent, inverse);
-      QMul(inverse, q, a);
-      QMul(a, g_Drag.Parent, b);
-      QMul(b, g_Drag.Turn, turn);
-      QNorm(turn);
+      if (angle == 0.f)
+        memcpy(turn, g_Drag.Turn, 4 * sizeof(float));   // not turned: as taken, to the bit
+      else
+      {
+        QConj(g_Drag.Parent, inverse);
+        QMul(inverse, q, a);
+        QMul(a, g_Drag.Parent, b);
+        QMul(b, g_Drag.Turn, turn);
+        QNorm(turn);
+      }
     }
     else if (g_Drag.Group >= 0 && g_Drag.Group < FaceGroupCount)
     {
@@ -4801,7 +12287,13 @@ void pose_editor::DrawOverlay()
         turnOne(h.GroupMembers[g_Drag.Group][k], g_Drag.GroupParents[k], g_Drag.GroupTurns[k]);
     }
     else if (g_Drag.Bone >= 0 && g_Drag.Bone < h.Bones)
-      turnOne(g_Drag.Bone, g_Drag.Parent, g_Drag.Turn);
+    {
+      // (2026-11-16: from the pose when taken each frame, the pinned hands and feet, and the feet when it's the Hips,
+      // kept where they are: HoldAround)
+      if (g_Drag.Pose.Turns.size() == (size_t)h.Bones * 4 && g_Drag.Pose.Moves.size() == (size_t)h.Bones * 3)
+        ApplySnapshot(h, g_Drag.Pose);
+      HoldAround(h, g_Drag.Bone, [&]() { turnOne(g_Drag.Bone, g_Drag.Parent, g_Drag.Turn); });
+    }
   }
 
   // A bone's or a face group's dot held with the mouse: it's moved once the
@@ -4820,7 +12312,8 @@ void pose_editor::DrawOverlay()
       g_Move.On = true;
       PushUndo(h, g_Move.Pose);
       g_Move.Accepted = g_Move.Pose;
-      memcpy(g_Move.AcceptedPlace, g_Move.Start, sizeof(g_Move.AcceptedPlace));
+      // (a path's dot: the bone's real place when pressed, which its dot needn't be; the second review, 2026-11-16)
+      memcpy(g_Move.AcceptedPlace, g_Move.Trail ? g_Move.PressedPlace : g_Move.Start, sizeof(g_Move.AcceptedPlace));
       g_Move.WantOk = false;
     }
   }
@@ -4831,8 +12324,8 @@ void pose_editor::DrawOverlay()
     if (g_Move.On && poseOk)
     {
       ApplySnapshot(h, g_Move.Pose);
-      if (!h.Undo.empty())
-        h.Undo.pop_back();   // the drag's own step (pushed when it started)
+      DropLastStep(h);   // the drag's own step (pushed when it started), and the Redo it cleared put back
+      h.HistoryHasKeys = false;
     }
     g_Move.Pending = g_Move.On = false;
     io.MouseClicked[1] = false;
@@ -5087,6 +12580,22 @@ void pose_editor::DrawOverlay()
       }
   }
 
+  if (clipOverWindow)
+  {
+    for (int n = 0; n < h.Count; ++n)
+    {
+      int i = (int)h.List[n];
+      if (dots[i].Shown && overWindow(dots[i].Draw))
+        dots[i].Shown = false;
+    }
+    for (int g = 0; g < FaceGroupCount; ++g)
+      if (groupShown[g] && overWindow(groupDraw[g]))
+        groupShown[g] = false;
+    for (int i = 0; i < h.WeaponCount && i < MaxWeapons; ++i)
+      if (weaponShown[i] && overWindow(weaponDraw[i]))
+        weaponShown[i] = false;
+  }
+
   // The picked bone's or face group's rings (not while something is moved)
   Ring rings[4];
   float radius = 0.f;
@@ -5145,11 +12654,73 @@ void pose_editor::DrawOverlay()
     arrowCount = 3;
   }
 
+  if (clipOverWindow)
+  {
+    for (int r = 0; r < ringCount; ++r)
+      for (int s = 0; s <= RingSegments; ++s)
+        if (rings[r].Shown[s] && overWindow(rings[r].Points[s]))
+          rings[r].Shown[s] = false;
+    for (int a = 0; a < arrowCount; ++a)
+      if (arrows[a].Shown && (overWindow(arrows[a].From) || overWindow(arrows[a].To)))
+        arrows[a].Shown = false;
+  }
+
+  // The picked bone's path over the keyframes and its keyframe dots (2026-11-16), with what will be keyframed laid in
+  // (a path's dot dragged, or auto key's change), so the path and the dragged dot follow the cursor; its dots over the
+  // menu's windows not taken
+  static KinTrail trail;
+  bool trailDrag = (g_Move.On || g_Move.Pending) && g_Move.Trail && g_Move.Held == g_Active;
+  bool willKey = h.Keys.On && !PlayingKeys(h) && KeysCurrent(h) && (trailDrag || (g_AutoKey && g_WindowOpen));
+  MakeTrail(h, view, groupOk ? -1 : g_SelectedBone, willKey, trailDrag && !g_AutoKey ? &g_Move.Pose : nullptr,
+    trailDrag ? g_Move.TrailMirror : -1.0, trailDrag, trail);
+  if (clipOverWindow)
+    for (TrailDot& d : trail.Dots)
+      if (d.Shown && overWindow(d.At))
+        d.Shown = false;
+
+  // Look at's point (2026-11-16): its dot, taken before the bones' (it isn't the pose's: also while the keyframes play)
+  bool lookShown = false;
+  ImVec2 lookAt(0.f, 0.f);
+  if (h.LookMode == Look_Point && h.LookPointOk)
+  {
+    float x = 0.f, y = 0.f;
+    lookShown = ToScreen(view, h.LookPoint, x, y);
+    lookAt = ImVec2(x, y);
+  }
+  if (g_LookDrag.On && (!io.MouseDown[0] || g_LookDrag.Held != g_Active || h.LookMode != Look_Point))
+    g_LookDrag.On = false;
+  if (g_LookDrag.On)
+  {
+    float target[3];
+    if (PlanePoint(view, g_LookDrag.Base, io.MousePos.x + g_LookDrag.Offset[0], io.MousePos.y + g_LookDrag.Offset[1],
+        target) && std::isfinite(target[0] + target[1] + target[2]))
+      memcpy(h.LookPoint, target, sizeof(target));
+  }
+  bool hoverLook = false;
+  if (lookShown && !g_LookDrag.On && !g_Drag.On && !g_Move.Pending && !g_Move.On && !io.WantCaptureMouse &&
+      !overWindow(lookAt))
+  {
+    float dx = lookAt.x - io.MousePos.x, dy = lookAt.y - io.MousePos.y, reach = fontSize * DotReach;
+    hoverLook = dx * dx + dy * dy <= reach * reach;
+    if (hoverLook && io.MouseClicked[0] && !io.MouseDownOwned[0])
+    {
+      g_LookDrag.On = true;
+      g_LookDrag.Held = g_Active;
+      memcpy(g_LookDrag.Base, h.LookPoint, sizeof(g_LookDrag.Base));
+      g_LookDrag.Offset[0] = lookAt.x - io.MousePos.x;
+      g_LookDrag.Offset[1] = lookAt.y - io.MousePos.y;
+      EndTextEdit();
+      io.MouseClicked[0] = false;
+    }
+  }
+
   // What the cursor is on (off the menu's windows): the nearest dot (a
   // bone's or a face group's) first, then a ring. The dots come first: the
   // rings ran across the next joints' dots and took their clicks.
   int hoverRing = -1, hoverSegment = -1, hoverDot = -1, hoverGroup = -1, hoverArrow = -1, hoverWeapon = -1;
-  if (!g_Drag.On && !g_Move.Pending && !g_Move.On && !io.WantCaptureMouse)
+  int hoverTrail = -1;
+  char const* trailRefusal = nullptr;   // why the path dot under the cursor can't be taken now (null: it can)
+  if (!g_Drag.On && !g_Move.Pending && !g_Move.On && !io.WantCaptureMouse && !g_LookDrag.On && !hoverLook)
   {
     float reach = fontSize * DotReach;
     float bestDot = reach * reach;
@@ -5189,7 +12760,53 @@ void pose_editor::DrawOverlay()
         hoverDot = hoverGroup = -1;
       }
     }
+    // A dot of the picked bone's path (2026-11-16): after the dots (the one at the playhead's time is under the bone's
+    // own: that one takes it), before the arrows and the rings; one that can't be taken now (TrailRefusal) leaves the
+    // click to them
     if (hoverDot < 0 && hoverGroup < 0 && hoverWeapon < 0)
+    {
+      float bestTrail = reach * reach;
+      for (size_t n = 0; n < trail.Dots.size(); ++n)
+      {
+        TrailDot const& d = trail.Dots[n];
+        if (!d.Shown)
+          continue;
+        float dx = d.At.x - io.MousePos.x, dy = d.At.y - io.MousePos.y;
+        if (dx * dx + dy * dy <= bestTrail)
+        {
+          bestTrail = dx * dx + dy * dy;
+          hoverTrail = (int)n;
+        }
+      }
+      // Dots on one place (a loop's two ends; a hollow hold's time): the one at the playhead's own time first, then
+      // one that can be taken now (the second review, 2026-11-16: the later one took it, and was refused)
+      if (hoverTrail >= 0)
+      {
+        float limit = sqrtf(bestTrail) + 1.f, reach2 = reach * reach;
+        auto rankOf = [&](size_t n)
+        {
+          double t = trail.Dots[n].Time;
+          return fabs(t - h.Keys.Time) <= pose_keys::TimeEpsilon ? 0 : (TrailRefusal(h, trail.Bone, t) ? 2 : 1);
+        };
+        int rank = rankOf((size_t)hoverTrail);
+        for (size_t n = 0; n < trail.Dots.size() && rank > 0; ++n)
+        {
+          TrailDot const& d = trail.Dots[n];
+          float dx = d.At.x - io.MousePos.x, dy = d.At.y - io.MousePos.y;
+          if (!d.Shown || (int)n == hoverTrail || dx * dx + dy * dy > limit * limit || dx * dx + dy * dy > reach2)
+            continue;
+          int r = rankOf(n);
+          if (r < rank)
+          {
+            rank = r;
+            hoverTrail = (int)n;
+          }
+        }
+      }
+    }
+    if (hoverTrail >= 0)
+      trailRefusal = TrailRefusal(h, trail.Bone, trail.Dots[(size_t)hoverTrail].Time);
+    if (hoverDot < 0 && hoverGroup < 0 && hoverWeapon < 0 && (hoverTrail < 0 || trailRefusal))
     {
       float best = RingReach * fontSize;
       for (int a = 0; a < arrowCount; ++a)
@@ -5221,15 +12838,18 @@ void pose_editor::DrawOverlay()
     }
   }
 
+  // While a clip or the keyframes play nothing is taken (an edit would fight it): pause it
+  bool canGrab = !(h.Clip.On && h.Clip.Playing) && !PlayingKeys(h);
   // A click: on an arrow it moves the bone along it, on a ring it turns the
   // bone (or the group), on a dot it picks it and holds it. The click is the
   // pose's: taken off ImGui's input, so the lights' dots and the camera's
   // track path (drawn after) don't take it too.
-  if (io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverArrow >= 0 && selectedOk)
+  if (canGrab && io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverArrow >= 0 && selectedOk)
   {
     Arrow const& arrow = arrows[hoverArrow];
     g_Move.Pending = true;
     g_Move.On = false;
+    g_Move.Trail = false;
     g_Move.Held = g_Active;
     g_Move.Bone = g_SelectedBone;
     g_Move.Group = -1;
@@ -5250,7 +12870,7 @@ void pose_editor::DrawOverlay()
     EndTextEdit();
     io.MouseClicked[0] = false;
   }
-  else if (io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverRing >= 0)
+  else if (canGrab && io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverRing >= 0)
   {
     Ring const& ring = rings[hoverRing];
     PushUndo(h, SnapshotOf(h));
@@ -5306,10 +12926,11 @@ void pose_editor::DrawOverlay()
       parentOf(g_SelectedBone, g_Drag.Parent);
       memcpy(g_Drag.Turn, h.Turn[g_SelectedBone], sizeof(g_Drag.Turn));
     }
+    g_Drag.Pose = SnapshotOf(h);
     EndTextEdit();
     io.MouseClicked[0] = false;
   }
-  else if (io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverWeapon >= 0)
+  else if (canGrab && io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverWeapon >= 0)
   {
     // A weapon's handle: picked, and held (moved if the cursor goes on)
     HeldWeapon const& w = h.Weapons[hoverWeapon];
@@ -5318,6 +12939,7 @@ void pose_editor::DrawOverlay()
     g_SelectedGroup = -1;
     g_Move.Pending = true;
     g_Move.On = false;
+    g_Move.Trail = false;
     g_Move.Held = g_Active;
     g_Move.Mouse[0] = io.MousePos.x;
     g_Move.Mouse[1] = io.MousePos.y;
@@ -5336,12 +12958,13 @@ void pose_editor::DrawOverlay()
     EndTextEdit();
     io.MouseClicked[0] = false;
   }
-  else if (io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && (hoverDot >= 0 || hoverGroup >= 0))
+  else if (canGrab && io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && (hoverDot >= 0 || hoverGroup >= 0))
   {
     // Picked, and held: moved if the cursor goes on. The drag goes by where
     // the bone (or the group's middle) really is, not where its dot is drawn.
     g_Move.Pending = true;
     g_Move.On = false;
+    g_Move.Trail = false;
     g_Move.Held = g_Active;
     g_Move.Mouse[0] = io.MousePos.x;
     g_Move.Mouse[1] = io.MousePos.y;
@@ -5376,6 +12999,59 @@ void pose_editor::DrawOverlay()
     EndTextEdit();
     io.MouseClicked[0] = false;
   }
+  else if (canGrab && io.MouseClicked[0] && !io.MouseDownOwned[0] && !g_Drag.On && hoverTrail >= 0 && trail.Ok &&
+    trail.Bone >= 0 && trail.Bone < h.Bones && h.InHeld[trail.Bone])
+  {
+    // A dot of the picked bone's path (2026-11-16): the playhead to its time and the pose there at once (a click alone
+    // does only that), then held like the bone's own dot; let go after a drag, the change is keyframed at that time
+    // (endMove). Not when it can't be taken now (TrailRefusal: the click is only taken off ImGui's input).
+    double time = trail.Dots[(size_t)hoverTrail].Time;
+    if (!trailRefusal)
+    {
+      if (fabs(time - h.Keys.Time) > pose_keys::TimeEpsilon)
+        SetPlayhead(h, time);
+      ApplyKeysNow(h);
+      ComposeHeld(h, shown);
+      int bone = trail.Bone;
+      // Held where the dot is, the bone's place at that time as keyed (the review, 2026-11-16: from the bone, a
+      // change not keyframed yet put the drag off the dot): the bone is there, unless a bone of the path has such a
+      // change at the playhead's own time (Auto key on with the Pose window closed: Auto key keyframes them all when
+      // let go; with it off TrailRefusal refuses); then the drag takes it from its pose to where the dot is dragged,
+      // and Bones stop at walls sweeps it from where it really is (PressedPlace, the second review)
+      float place[FloatsPerBone], frame[FloatsPerBone];
+      if (HeldFrame(h, frame))
+        PlaceAt(h, bone, h.Keys.Time, frame, place);
+      else
+        memcpy(place, shown[bone], sizeof(place));
+      g_Move.Pending = true;
+      g_Move.On = false;
+      g_Move.Trail = true;
+      g_Move.TrailMirror = LoopOtherEnd(h, h.Keys.Time);
+      g_Move.Held = g_Active;
+      g_Move.Mouse[0] = io.MousePos.x;
+      g_Move.Mouse[1] = io.MousePos.y;
+      g_Move.Weapon = -1;
+      g_Move.Group = -1;
+      g_Move.Bone = bone;
+      float x = io.MousePos.x, y = io.MousePos.y;
+      if (!ToScreen(view, place, x, y))
+      {
+        x = io.MousePos.x;
+        y = io.MousePos.y;
+      }
+      g_Move.Offset[0] = x - io.MousePos.x;
+      g_Move.Offset[1] = y - io.MousePos.y;
+      memcpy(g_Move.Start, place, sizeof(g_Move.Start));
+      memcpy(g_Move.Base, g_Move.Start, sizeof(g_Move.Base));
+      memcpy(g_Move.PressedPlace, shown[bone], sizeof(g_Move.PressedPlace));
+      g_Move.Pose = SnapshotOf(h);
+      g_Move.TargetOk = false;
+      g_Move.Depth = false;
+      g_Move.OnAxis = false;
+    }
+    EndTextEdit();   // (refused too: the click is taken off ImGui, so a field typed in wouldn't let go; the second review)
+    io.MouseClicked[0] = false;
+  }
 
   ImDrawList* pDrawList = ImGui::GetOverlayDrawList();
   const ImU32 shadow = IM_COL32(0, 0, 0, 160);
@@ -5389,6 +13065,24 @@ void pose_editor::DrawOverlay()
     pDrawList->AddText(ImVec2(at.x + 1.f, at.y + 1.f), shadow, text);
     pDrawList->AddText(at, colour, text);
   };
+  auto labelText = [&](ImVec2 at, ImU32 colour, char const* text)
+  {
+    if (clipOverWindow)
+    {
+      ImVec2 size = ImGui::CalcTextSize(text);
+      if (at.x + size.x >= clipMin.x && at.x <= clipMax.x && at.y + size.y >= clipMin.y && at.y <= clipMax.y)
+        return;
+    }
+    shadowedText(at, colour, text);
+  };
+  // The ghost poses and the picked bone's path under the skeleton (2026-11-16); its dot under the cursor or dragged
+  // bigger, with its time
+  int hotTrail = hoverTrail;
+  if (hotTrail < 0 && (g_Move.On || g_Move.Pending) && g_Move.Trail && g_Move.Held == g_Active)
+    for (size_t n = 0; n < trail.Dots.size() && hotTrail < 0; ++n)
+      if (fabs(trail.Dots[n].Time - h.Keys.Time) <= pose_keys::TimeEpsilon)
+        hotTrail = (int)n;
+  DrawKinTrail(h, view, pDrawList, fontSize, trail, hotTrail);
   // The skeleton's lines, then its dots
   for (int n = 0; n < h.Count; ++n)
   {
@@ -5427,7 +13121,11 @@ void pose_editor::DrawOverlay()
     {
       float x, y;
       if (ToScreen(view, shown[h.GroupMembers[g][k]], x, y))
-        pDrawList->AddCircleFilled(ImVec2(x, y), 2.5f, groupDot, 8);
+      {
+        ImVec2 p(x, y);
+        if (!clipOverWindow || !overWindow(p))
+          pDrawList->AddCircleFilled(p, 2.5f, groupDot, 8);
+      }
     }
   }
   // The dots: the picked one, the one under the cursor and the one being
@@ -5451,6 +13149,36 @@ void pose_editor::DrawOverlay()
   for (int i : { g_SelectedBone, hoverDot, moving })
     if (i >= 0 && i < h.Bones && h.InHeld[i] && dots[i].Shown)
       drawDot(i);
+  // The pins' squares and the look's point over the dots (2026-11-16)
+  DrawKinPins(h, view, pDrawList, fontSize);
+  // The path's dot under the cursor or dragged: its time (and why it can't be taken)
+  if (hotTrail >= 0 && trail.Dots[(size_t)hotTrail].Shown)
+  {
+    TrailDot const& d = trail.Dots[(size_t)hotTrail];
+    char label[160];
+    // (a loop's two ends: both times when their dots are one place, as the drag then keyframes both)
+    double other = LoopOtherEnd(h, d.Time);
+    bool together = false;
+    for (TrailDot const& e : trail.Dots)
+      if (other >= 0.0 && fabs(e.Time - other) <= pose_keys::TimeEpsilon && Distance3(e.Place, d.Place) < 1e-4f)
+        together = true;
+    int used = together ? _snprintf_s(label, sizeof(label), _TRUNCATE, "%.2f s and %.2f s (the loop's ends)",
+      (std::min)(d.Time, other), (std::max)(d.Time, other)) : _snprintf_s(label, sizeof(label), _TRUNCATE, "%.2f s", d.Time);
+    if (hoverTrail >= 0 && trailRefusal && used > 0)
+      _snprintf_s(label + used, sizeof(label) - (size_t)used, _TRUNCATE, ": %s", trailRefusal);
+    labelText(ImVec2(d.At.x + fontSize * 0.5f, d.At.y - fontSize * 1.2f), IM_COL32(255, 210, 150, 230), label);
+  }
+  if (lookShown && !overWindow(lookAt))
+  {
+    bool hot = hoverLook || g_LookDrag.On;
+    float size = fontSize * (hot ? 0.36f : 0.3f);
+    pDrawList->AddCircle(lookAt, size + 1.5f, shadow, 20, 4.f);
+    pDrawList->AddCircle(lookAt, size, IM_COL32(90, 230, 255, 240), 20, 2.f);
+    pDrawList->AddCircleFilled(lookAt, fontSize * 0.08f, IM_COL32(90, 230, 255, 240), 8);
+    if (hot)
+      labelText(ImVec2(lookAt.x + fontSize * 0.5f, lookAt.y - fontSize * 1.2f), IM_COL32(255, 255, 255, 200),
+        "Look at");
+  }
   for (int g = 0; g < FaceGroupCount; ++g)
   {
     if (!groupShown[g])
@@ -5488,8 +13216,9 @@ void pose_editor::DrawOverlay()
   if (g_Move.On)
   {
     ImVec2 at(io.MousePos.x + fontSize * 1.2f, io.MousePos.y + fontSize * 0.9f);
-    shadowedText(at, IM_COL32(255, 255, 255, 210), g_Move.OnAxis ? "Along the arrow   Right click: cancel" :
-      (g_Move.Depth ? "Nearer / farther (let go of Shift: across)" : "Shift: nearer / farther   Right click: cancel"));
+    if (!clipOverWindow || !overWindow(at))
+      shadowedText(at, IM_COL32(255, 255, 255, 210), g_Move.OnAxis ? "Along the arrow   Right click: cancel" :
+        (g_Move.Depth ? "Nearer / farther (let go of Shift: across)" : "Shift: nearer / farther   Right click: cancel"));
   }
   // A moved bone that can't reach where it's wanted: a line to there
   if (g_Move.On && g_Move.TargetOk && g_Move.Bone >= 0 && g_Move.Bone < h.Bones && dots[g_Move.Bone].Shown)
@@ -5499,7 +13228,7 @@ void pose_editor::DrawOverlay()
     {
       ImVec2 at(tx, ty), from = dots[g_Move.Bone].At;
       float dx = at.x - from.x, dy = at.y - from.y;
-      if (dx * dx + dy * dy > 36.f)
+      if (dx * dx + dy * dy > 36.f && (!clipOverWindow || (!overWindow(at) && !overWindow(from))))
       {
         pDrawList->AddLine(from, at, IM_COL32(255, 255, 255, 110), 1.5f);
         pDrawList->AddCircle(at, fontSize * 0.25f, shadow, 12, 3.f);
@@ -5552,31 +13281,99 @@ void pose_editor::DrawOverlay()
   if (weaponLabel)
   {
     ImVec2 at(weaponDraw[g_SelectedWeapon].x + fontSize * 0.6f, weaponDraw[g_SelectedWeapon].y - fontSize * 1.4f);
-    shadowedText(at, picked, h.Weapons[g_SelectedWeapon].Name);
+    labelText(at, picked, h.Weapons[g_SelectedWeapon].Name);
   }
   if (groupLabel)
   {
     ImVec2 at(groupDraw[g_SelectedGroup].x + fontSize * 0.6f, groupDraw[g_SelectedGroup].y - fontSize * 1.4f);
-    shadowedText(at, picked, FaceGroupNames[g_SelectedGroup]);
+    labelText(at, picked, FaceGroupNames[g_SelectedGroup]);
   }
   else if (boneLabel && dots[g_SelectedBone].Shown)
   {
     ImVec2 at(dots[g_SelectedBone].Draw.x + fontSize * 0.6f, dots[g_SelectedBone].Draw.y - fontSize * 1.4f);
-    shadowedText(at, picked, BoneName(h, g_SelectedBone));
+    labelText(at, picked, BoneName(h, g_SelectedBone));
   }
   if (hoverGroup >= 0 && hoverGroup != g_SelectedGroup)
   {
     ImVec2 at(groupDraw[hoverGroup].x + fontSize * 0.5f, groupDraw[hoverGroup].y - fontSize * 1.2f);
-    shadowedText(at, IM_COL32(255, 255, 255, 200), FaceGroupNames[hoverGroup]);
+    labelText(at, IM_COL32(255, 255, 255, 200), FaceGroupNames[hoverGroup]);
   }
   else if (hoverDot >= 0 && hoverDot != g_SelectedBone && dots[hoverDot].Shown)
   {
     ImVec2 at(dots[hoverDot].Draw.x + fontSize * 0.5f, dots[hoverDot].Draw.y - fontSize * 1.2f);
-    shadowedText(at, IM_COL32(255, 255, 255, 200), BoneName(h, hoverDot));
+    labelText(at, IM_COL32(255, 255, 255, 200), BoneName(h, hoverDot));
   }
   else if (hoverWeapon >= 0 && hoverWeapon != g_SelectedWeapon && hoverWeapon < h.WeaponCount && weaponShown[hoverWeapon])
   {
     ImVec2 at(weaponDraw[hoverWeapon].x + fontSize * 0.5f, weaponDraw[hoverWeapon].y - fontSize * 1.2f);
-    shadowedText(at, IM_COL32(255, 255, 255, 200), h.Weapons[hoverWeapon].Name);
+    labelText(at, IM_COL32(255, 255, 255, 200), h.Weapons[hoverWeapon].Name);
   }
+}
+
+void pose_editor::ReadConfig(INIReader* pReader)
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  g_ShowBones = pReader->GetBoolean("Pose", "ShowBones", true);
+  g_ShowFace = pReader->GetBoolean("Pose", "ShowFace", false);
+  g_GroupFace = pReader->GetBoolean("Pose", "GroupFace", true);
+  g_ShowFingers = pReader->GetBoolean("Pose", "ShowFingers", false);
+  g_ShowHelpers = pReader->GetBoolean("Pose", "ShowHelpers", false);
+  long dragBends = pReader->GetInteger("Pose", "DragBends", 2);
+  g_MoveBones = dragBends < 1 ? 1 : (dragBends > 4 ? 4 : (int)dragBends);
+  g_StopAtWalls = pReader->GetBoolean("Pose", "StopAtWalls", true);
+  g_RingsOnBone = pReader->GetBoolean("Pose", "RingsOnBone", true);
+  g_AutoKey = pReader->GetBoolean("Pose", "AutoKey", true);
+  g_KeyAnchors = pReader->GetBoolean("Pose", "KeyAnchors", true);
+  g_SnapKeys = pReader->GetBoolean("Pose", "SnapKeys", true);
+  // The kinematics (2026-11-16)
+  g_JointHinges = pReader->GetBoolean("Pose", "JointHinges", true);
+  g_KeepEndTurn = pReader->GetBoolean("Pose", "KeepEndTurn", true);
+  g_FeetPlanted = pReader->GetBoolean("Pose", "FeetPlanted", true);
+  g_CollarFollows = pReader->GetBoolean("Pose", "CollarFollows", true);
+  g_SpineCurve = pReader->GetBoolean("Pose", "SpineCurve", true);
+  g_FarReach = pReader->GetBoolean("Pose", "FarReach", false);
+  g_HelpersFollow = pReader->GetBoolean("Pose", "HelpersFollow", true);
+  auto unit = [](double value, float fallback)
+  {
+    return std::isfinite(value) ? (value < 0.0 ? 0.f : (value > 1.0 ? 1.f : (float)value)) : fallback;
+  };
+  g_LooseTiming = unit(pReader->GetReal("Pose", "LooseTiming", 0.5), 0.5f);
+  g_FollowThrough = unit(pReader->GetReal("Pose", "FollowThrough", 0.5), 0.5f);
+  g_FootLock = pReader->GetBoolean("Pose", "FootLock", true);
+  g_ShowTrail = pReader->GetBoolean("Pose", "ShowTrail", true);
+  g_ShowGhosts = pReader->GetBoolean("Pose", "ShowGhosts", false);
+}
+
+std::string pose_editor::GetConfig()
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  std::string config = "[Pose]\n";
+  config += std::string("ShowBones = ") + (g_ShowBones ? "true" : "false") + "\n";
+  config += std::string("ShowFace = ") + (g_ShowFace ? "true" : "false") + "\n";
+  config += std::string("GroupFace = ") + (g_GroupFace ? "true" : "false") + "\n";
+  config += std::string("ShowFingers = ") + (g_ShowFingers ? "true" : "false") + "\n";
+  config += std::string("ShowHelpers = ") + (g_ShowHelpers ? "true" : "false") + "\n";
+  config += "DragBends = " + std::to_string(g_MoveBones) + "\n";
+  config += std::string("StopAtWalls = ") + (g_StopAtWalls ? "true" : "false") + "\n";
+  config += std::string("RingsOnBone = ") + (g_RingsOnBone ? "true" : "false") + "\n";
+  config += std::string("AutoKey = ") + (g_AutoKey ? "true" : "false") + "\n";
+  config += std::string("KeyAnchors = ") + (g_KeyAnchors ? "true" : "false") + "\n";
+  config += std::string("SnapKeys = ") + (g_SnapKeys ? "true" : "false") + "\n";
+  config += std::string("JointHinges = ") + (g_JointHinges ? "true" : "false") + "\n";
+  config += std::string("KeepEndTurn = ") + (g_KeepEndTurn ? "true" : "false") + "\n";
+  config += std::string("FeetPlanted = ") + (g_FeetPlanted ? "true" : "false") + "\n";
+  config += std::string("CollarFollows = ") + (g_CollarFollows ? "true" : "false") + "\n";
+  config += std::string("SpineCurve = ") + (g_SpineCurve ? "true" : "false") + "\n";
+  config += std::string("FarReach = ") + (g_FarReach ? "true" : "false") + "\n";
+  config += std::string("HelpersFollow = ") + (g_HelpersFollow ? "true" : "false") + "\n";
+  char number[32];
+  _snprintf_s(number, sizeof(number), _TRUNCATE, "%.3f", g_LooseTiming);
+  config += std::string("LooseTiming = ") + number + "\n";
+  _snprintf_s(number, sizeof(number), _TRUNCATE, "%.3f", g_FollowThrough);
+  config += std::string("FollowThrough = ") + number + "\n";
+  config += std::string("FootLock = ") + (g_FootLock ? "true" : "false") + "\n";
+  config += std::string("ShowTrail = ") + (g_ShowTrail ? "true" : "false") + "\n";
+  config += std::string("ShowGhosts = ") + (g_ShowGhosts ? "true" : "false") + "\n";
+  config += "\n";
+  return config;
 }

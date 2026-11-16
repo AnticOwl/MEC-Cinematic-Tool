@@ -528,6 +528,95 @@ namespace
       return false;
     }
   }
+
+  // What marks every reflection to be captured again: 0x1436FC9E0 sets the
+  // waiting bit (+ 0xC0 |= 4) on each volume of [0x142568CE0] + 0xD8 ..
+  // + 0xE0 (0xD0 each). Its two callers (offline): the sun test above, which
+  // stores the sun (+ 0x70) as it does, and the sky cubemap's capture
+  // (0x1436FAC36 in 0x1436FAB20, with LocalIBLUpdateWithEnlightenSkyBoxChange
+  // on). Read during the catch-up only, to log what starts the reflections
+  // over (VisualsManager::NoteReflectionMarks).
+  const __int64 ReflVolumesRva = 0x2568CE0;
+  const int ReflVolumesBeginOffset = 0xD8;
+  const int ReflVolumesEndOffset = 0xE0;
+  const int ReflVolumeSize = 0xD0;
+  const int ReflVolumeFlagsOffset = 0xC0;
+  const unsigned int ReflVolumeWaiting = 4;
+  const int MarkLogsMax = 8;
+
+  bool ReflectionMarksKnown()
+  {
+    static int known = -1;
+    if (known >= 0)
+      return known == 1;
+    known = 0;
+    BYTE const* base = (BYTE const*)g_gameHandle;
+    // mov rcx, [r8 + 0xd8]; lea rax, [rax + 0xd0]; or dword [rax + rcx - 0x10], 4
+    static const BYTE mark[] = { 0x49, 0x8B, 0x88, 0xD8, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x80, 0xD0, 0x00, 0x00, 0x00, 0x83, 0x4C, 0x08,
+      0xF0, 0x04 };
+    // the sky path: mov rax, [rbx + 0x18]; cmp byte [rax + 0x481], 0; je; call 0x1436FC9E0
+    static const BYTE sky[] = { 0x48, 0x8B, 0x43, 0x18, 0x80, 0xB8, 0x81, 0x04, 0x00, 0x00, 0x00, 0x74, 0x05, 0xE8, 0xA5, 0x1D, 0x00,
+      0x00 };
+    __try
+    {
+      // mov r8, [rip + rel] at 0x1436FC9E0: the volume list
+      int rel;
+      memcpy(&rel, base + 0x36FC9E3, 4);
+      if (ReflectionTestKnown() && base[0x36FC9E0] == 0x4C && base[0x36FC9E1] == 0x8B && base[0x36FC9E2] == 0x05 &&
+          0x36FC9E7 + rel == ReflVolumesRva && !memcmp(base + 0x36FCA18, mark, sizeof(mark)) &&
+          !memcmp(base + 0x36FAC29, sky, sizeof(sky)))
+        known = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return known == 1;
+  }
+
+  // How many reflection volumes are waiting to be captured, of how many
+  bool CountWaitingReflections(int& waiting, int& count)
+  {
+    waiting = count = 0;
+    if (!ReflectionMarksKnown())
+      return false;
+    __try
+    {
+      __int64 list = *(__int64 const*)((__int64)g_gameHandle + ReflVolumesRva);
+      if (!list)
+        return false;
+      __int64 begin = *(__int64 const*)(list + ReflVolumesBeginOffset);
+      __int64 end = *(__int64 const*)(list + ReflVolumesEndOffset);
+      if (!begin || end < begin || (end - begin) % ReflVolumeSize != 0 || (end - begin) / ReflVolumeSize > 20000)
+        return false;
+      count = (int)((end - begin) / ReflVolumeSize);
+      for (int i = 0; i < count; ++i)
+        if (*(unsigned int const*)(begin + (__int64)i * ReflVolumeSize + ReflVolumeFlagsOffset) & ReflVolumeWaiting)
+          ++waiting;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
+
+  // The sun direction the sun test stored last (see RecaptureReflections)
+  bool ReadStoredSun(__int64 worldRenderer, float* sun)
+  {
+    if (!worldRenderer || !ReflectionTestKnown())
+      return false;
+    __try
+    {
+      __int64 p = *(__int64*)(worldRenderer + WrReflectionsOffset);
+      if (!p)
+        return false;
+      for (int i = 0; i < 3; ++i)
+        sun[i] = *(volatile float const*)(p + ReflStoredSunOffset + i * 4);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      return false;
+    }
+  }
 }
 
 VisualsManager::VisualsManager() :
@@ -871,7 +960,7 @@ float* VisualsManager::GetTimeOfDay()
 
 void VisualsManager::UpdateTimeOfDay()
 {
-  if (!m_TodFreeze && !m_TodFix && !m_TrackTodActive && !m_ReplayTodActive) return;
+  if (!m_TodFreeze && !m_TodFix && !m_TrackTodActive && !m_ReplayTodActive && !m_LapseTodActive) return;
   // With MECMP in the game the clock is left as the game has it
   if (util::IsMecmpLoaded()) return;
   if (!IsLevelLoaded()) return;
@@ -879,7 +968,10 @@ void VisualsManager::UpdateTimeOfDay()
   float* pTime = GetTimeOfDay();
   if (!pTime) return;
 
-  if (m_TrackTodActive)
+  // (a time-lapse's frame over everything: see LapseLightAt)
+  if (m_LapseTodActive)
+    *pTime = m_LapseTod;
+  else if (m_TrackTodActive)
     *pTime = m_TrackTod;
   else if (m_ReplayTodActive)
     *pTime = m_ReplayTod;
@@ -904,9 +996,33 @@ void VisualsManager::CatchUpBounceLight()
   ULONGLONG now = GetTickCount64();
   float* pTime = (IsLevelLoaded() && !util::IsMecmpLoaded()) ? GetTimeOfDay() : nullptr;
   bool resets = util::hooks::TodResetAvailable();
+  // CAMERA > Time-lapse running (see LapseLightAt): only its resets, a frame
+  // at a time, with the game's own steps held; its frames' jumps aren't
+  // caught up after (the clock goes on from where it is when it ends)
+  bool lapse = m_LapseOn && pTime;
+  // The level's clock gone or another one (a level loaded): the hook forgets the lighting managers it has seen, so
+  // the new level's starts clean (see util::hooks::ForgetTodManagers)
+  __int64 clockKey = (__int64)GetTimeOfDay();
+  if (!IsLevelLoaded())
+    clockKey = 0;
+  if (m_TodClockKey && clockKey != m_TodClockKey)
+    util::hooks::ForgetTodManagers();
+  m_TodClockKey = clockKey;
   // A time-lapse's light follows it as it runs (the hooks' "Following a clock that runs fast")
-  util::hooks::SetTodFollow(m_BounceCatchUp && pTime);
-  if (pTime && m_BounceCatchUp && *pTime >= 0.f)
+  util::hooks::SetTodFollow(m_BounceCatchUp && pTime && !lapse);
+  util::hooks::SetTodHoldSteps(lapse);
+  if (lapse)
+  {
+    m_LastClock = *pTime;
+    m_LastClockTick = now;
+    m_JumpWindowTick = now;
+    m_JumpWindowClock = *pTime;
+    m_JumpWindowSteps = 0.f;
+    m_ResetAfterJumps = false;
+    m_LastJumpTick = now;
+    m_CatchUpUntil = now + CatchUpMs;
+  }
+  else if (pTime && m_BounceCatchUp && *pTime >= 0.f)
   {
     float clock = *pTime;
     if (m_LastClock >= 0.f)
@@ -987,19 +1103,25 @@ void VisualsManager::CatchUpBounceLight()
     m_ResetAfterJumps = false;
   }
 
-  // The new light is shown (the reset's first passes done): every reflection
-  // captured again with it
-  if (util::hooks::TakeTodResetSettled() && m_BounceCatchUp && pTime && RecaptureReflections(GetStateManager()))
+  // The new light is shown (3 of the reset's first passes done, then all of
+  // them): every reflection captured again with it
+  // (a time-lapse's: once, when its reset is done, see LapseReflections)
+  int passes = 0, of = 0;
+  if (util::hooks::TakeTodResetSettled(passes, of) && m_BounceCatchUp && pTime && !lapse &&
+      RecaptureReflections(GetStateManager()))
   {
     m_ReflectionsUntil = now + RecaptureMs;
-    util::log::Write("Reflections: captured again with the new light");
+    util::log::Write("Reflections: captured again with the new light (%d of the reset's %d passes done)", passes, of);
   }
+  if (lapse)
+    LapseReflections(now);
 
   // On while the passes or the reset go on too (they run on the bigger
-  // budget), but not longer than PassesMaxMs after the last jump
+  // budget), but not longer than PassesMaxMs after the last jump; all the
+  // time while a time-lapse runs
   bool passing = (m_PassesLeft > 0 || m_PassFiled) && now - m_LastJumpTick < PassesMaxMs;
   bool resetting = util::hooks::TodResetBusy() && now - m_LastJumpTick < PassesMaxMs;
-  bool want = m_BounceCatchUp && pTime && (now < m_CatchUpUntil || passing || resetting || now < m_ReflectionsUntil);
+  bool want = (m_BounceCatchUp || lapse) && pTime && (now < m_CatchUpUntil || passing || resetting || now < m_ReflectionsUntil);
   RunBounceLightPasses(now, m_BounceCatchUp && pTime && passing);
   CatchUpExposure(want);
   // Reflections: a whole cubemap captured a frame (see util::hooks::SetReflectionCatchUp)
@@ -1008,7 +1130,11 @@ void VisualsManager::CatchUpBounceLight()
     util::hooks::SetReflectionCatchUp(want);
     m_ReflectionsCaughtUp = want;
     util::log::Write(want ? "Reflections: a whole cubemap captured a frame" : "Reflections: back to the game's faces a frame");
+    m_MarksWatching = false;
+    m_MarksLogged = 0;
   }
+  if (want)
+    NoteReflectionMarks(now);
   if (!want && !m_pEnlightenBoosted)
     return;
   __int64 pSettings = FindEnlightenSettings();
@@ -1040,6 +1166,265 @@ void VisualsManager::CatchUpBounceLight()
     "light probe sources %d, instances %d (the game's)", solveTime, boostedTime, solveTimeLimited, boostedTimeLimited,
     solveTimeMaximum, counts[0], counts[2], counts[3]);
   (void)jobsMaximum;
+}
+
+// During the catch-up (report section 10): when (nearly) every reflection is
+// waiting to be captured again and the tools didn't ask, says which of the
+// game's two did it. Its sun test stores the sun as it marks them (the sun
+// moved); its sky cubemap's capture doesn't (its sky changed). The tools'
+// recapture clears the stored sun, so a mark that stores one over a cleared
+// one is theirs. A rise of at least 3 to within 2 of all of them counts (one
+// may be captured already when it's read).
+void VisualsManager::NoteReflectionMarks(ULONGLONG now)
+{
+  int waiting = 0, count = 0;
+  float sun[3] = {};
+  if (!CountWaitingReflections(waiting, count) || !ReadStoredSun(GetStateManager(), sun) || count <= 0)
+  {
+    m_MarksWatching = false;
+    return;
+  }
+  if (m_MarksWatching && waiting >= count - 2 && waiting - m_MarksWaiting >= 3)
+  {
+    bool sunMoved = memcmp(sun, m_MarksSun, sizeof(sun)) != 0;
+    bool ours = sunMoved && m_MarksSun[0] == 0.f && m_MarksSun[1] == 0.f && m_MarksSun[2] == 0.f;
+    if (!ours && m_MarksLogged < MarkLogsMax && util::DiagnosticsOn())
+    {
+      ++m_MarksLogged;
+      util::log::Write("Reflections: all %d marked to be captured again by the game's %s, %.1f s after the last jump (%d were "
+        "waiting)", count, sunMoved ? "sun test (the sun moved)" : "sky cubemap (its sky changed)", (now - m_LastJumpTick) / 1000.0,
+        m_MarksWaiting);
+    }
+  }
+  m_MarksWatching = true;
+  m_MarksWaiting = waiting;
+  memcpy(m_MarksSun, sun, sizeof(sun));
+}
+
+// A time-lapse's reflections (see LapseLightAt): once its frame's reset is
+// done, every reflection is captured again with that light (the game's sun
+// test marks them all at its next look, see RecaptureReflections); then the
+// game captures the nearest LapseReflNearest one at a time (1.5 - 2.2 frames
+// each, a round of them 1 - 2 s, report section 10), and the ones further away
+// stay waiting until the camera comes near them. So they're taken as captured
+// once all were seen marked and the count waiting has stopped going down for
+// LapseStableMs and LapseStableUpdates of its updates (or nothing went down in
+// LapseNoDropMs: none near enough); at most LapseReflMaxMs.
+namespace
+{
+  const ULONGLONG LapseMarkWaitMs = 1500;
+  const ULONGLONG LapseStableMs = 400;
+  const int LapseStableUpdates = 20;
+  const ULONGLONG LapseNoDropMs = 3000;
+  const ULONGLONG LapseReflMaxMs = 15000;
+  const int LapseReflLogsMax = 2;
+  const int LapseReflWarningsMax = 20;
+  const int LapseQueueEvery = 30;   // a frame's job queue line every so many requests (see LapseLightAt)
+}
+
+void VisualsManager::LapseReflections(ULONGLONG now)
+{
+  if (!m_LapseId)
+    return;
+  float litAt = -1.f;
+  double seconds = 0.0;
+  // A frame's round that didn't go as it should: a warning each time (at most
+  // LapseReflWarningsMax a time-lapse), and the frame's line says how it went
+  auto warn = [&](char const* what, int waiting, int count)
+  {
+    if (m_LapseReflWarnings >= LapseReflWarningsMax)
+      return;
+    if (++m_LapseReflWarnings == LapseReflWarningsMax)
+      util::log::Warning("Time-lapse: reflections %s (%d of %d waiting, %.1f s after the frame's light); no more of these "
+        "lines this time (Time-lapse.txt has every frame's)", what, waiting, count, (now - m_LapseReflTick) / 1000.0);
+    else
+      util::log::Warning("Time-lapse: reflections %s (%d of %d waiting, %.1f s after the frame's light)", what, waiting, count,
+        (now - m_LapseReflTick) / 1000.0);
+  };
+  if (m_LapseReflFor != m_LapseId)
+  {
+    if (util::hooks::TodResetOutcome(m_LapseId, litAt, seconds) != util::hooks::TodOutcome_Done)
+      return;
+    m_LapseReflFor = m_LapseId;
+    m_LapseReflTick = now;
+    m_LapseMarked = false;
+    m_LapseWaiting = -1;
+    m_LapseStableSince = now;
+    m_LapseStableUpdates = 0;
+    int waiting = 0, count = 0;
+    bool known = ReflectionMarksKnown() && CountWaitingReflections(waiting, count);
+    m_LapseReflInfo = { false, waiting, count, 0 };
+    if (!known || !RecaptureReflections(GetStateManager()))
+    {
+      m_LapseRefl = 2;
+      m_LapseReflInfo.Ended = 3;
+      static bool logged = false;
+      if (!logged)
+        util::log::Warning("Time-lapse: the reflections' code isn't what the tools know (or none are loaded): each frame waits a "
+          "fixed time for them instead of seeing them captured");
+      logged = true;
+      return;
+    }
+    m_LapseRefl = 0;
+    return;
+  }
+  if (m_LapseRefl != 0)
+    return;
+  int waiting = 0, count = 0;
+  if (!CountWaitingReflections(waiting, count))
+  {
+    m_LapseRefl = 2;
+    m_LapseReflInfo.Ended = 3;
+    return;
+  }
+  ULONGLONG since = now - m_LapseReflTick;
+  m_LapseReflInfo.Waiting = waiting;
+  m_LapseReflInfo.Count = count;
+  if (count <= 0)
+  {
+    // (none loaded)
+    m_LapseRefl = 1;
+    m_LapseReflInfo.Ended = 1;
+    return;
+  }
+  if (!m_LapseMarked && (waiting >= count - 2 || since >= LapseMarkWaitMs))
+  {
+    m_LapseMarked = true;
+    m_LapseReflInfo.Marked = waiting >= count - 2;
+    m_LapseWaiting = waiting;
+    m_LapseStableSince = now;
+    m_LapseStableUpdates = 0;
+    // (the count when marked: going down from it is the round)
+    m_LapseMarkedAt = waiting;
+    if (!m_LapseReflInfo.Marked)
+      warn("not all seen marked to be captured again: waiting for the count to settle anyway", waiting, count);
+    return;
+  }
+  if (!m_LapseMarked)
+    return;
+  if (waiting != m_LapseWaiting)
+  {
+    m_LapseWaiting = waiting;
+    m_LapseStableSince = now;
+    m_LapseStableUpdates = 0;
+  }
+  else
+    ++m_LapseStableUpdates;
+  bool dropped = waiting < m_LapseMarkedAt;
+  bool stable = now - m_LapseStableSince >= LapseStableMs && m_LapseStableUpdates >= LapseStableUpdates;
+  if (stable && (dropped || since >= LapseNoDropMs))
+  {
+    m_LapseRefl = 1;
+    m_LapseReflInfo.Ended = dropped ? 0 : 1;
+    if (!dropped)
+      warn("none captured in 3 s (none near enough, or they weren't marked)", waiting, count);
+    else if (m_LapseReflLogs < LapseReflLogsMax)
+    {
+      ++m_LapseReflLogs;
+      util::log::Write("Time-lapse: reflections captured again with the frame's light in %.1f s (%d of %d still waiting: the ones "
+        "further away, captured when the camera comes near them)", since / 1000.0, waiting, count);
+    }
+  }
+  else if (since >= LapseReflMaxMs)
+  {
+    m_LapseRefl = 1;
+    m_LapseReflInfo.Ended = 2;
+    warn("still being captured after 15 s: taken as they are", waiting, count);
+  }
+}
+
+bool VisualsManager::LapseAvailable(char* why, size_t size)
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  char const* reason = nullptr;
+  if (util::IsMecmpLoaded())
+    reason = "MECMP (multiplayer) is open: it keeps the time of day in sync";
+  else if (!util::hooks::TodResetAvailable())
+    reason = "the game's time of day lighting isn't the code the tools know (see CT.log)";
+  else if (!IsLevelLoaded() || !GetTimeOfDay())
+    reason = "load a level first";
+  if (reason && why && size)
+    strcpy_s(why, size, reason);
+  return reason == nullptr;
+}
+
+__int64 VisualsManager::ClockKey()
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
+  return (__int64)pTime;
+}
+
+long VisualsManager::LapseLightAt(float seconds, bool quiet)
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  if (util::IsMecmpLoaded() || !util::hooks::TodResetAvailable() || !(seconds >= 0.f) || !(seconds < DaySeconds))
+    return 0;
+  float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
+  if (!pTime)
+    return 0;
+  // How full the game's job queue gets after a frame's reset (diagnostics only, as after jumps): its window closes
+  // 10 s after the last jump, so each frame noted is a line of its own (2026-11-16: one every frame, ~25 s apart with
+  // the whole city). Noted for the run's first frames (not quiet) and every LapseQueueEvery after.
+  float before = *pTime;
+  if (!m_LapseOn)
+  {
+    m_LapseReflLogs = 0;
+    m_LapseReflWarnings = 0;
+    m_LapseQueueCount = 0;
+  }
+  ++m_LapseQueueCount;
+  bool noteQueue = !quiet || m_LapseQueueCount % LapseQueueEvery == 0;
+  m_LapseOn = true;
+  m_LapseTodActive = true;
+  m_LapseTod = seconds;
+  *pTime = seconds;
+  m_ResetAfterJumps = false;
+  // (at once, not at the next visual update: the lighting may update before it)
+  util::hooks::SetTodFollow(false);
+  util::hooks::SetTodHoldSteps(true);
+  m_LapseId = util::hooks::RequestTodReset(seconds, true, quiet);
+  if (noteQueue)
+    util::hooks::NoteTimeJump(before, seconds);
+  m_LapseReflFor = 0;
+  m_LapseRefl = 0;
+  return m_LapseId;
+}
+
+int VisualsManager::LapseLightState(long id, float& litAt, float& clockAt, double& seconds)
+{
+  return util::hooks::TodResetOutcome(id, litAt, seconds, &clockAt);
+}
+
+int VisualsManager::LapseReflectionsState(long id, LapseReflInfo* info)
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  if (!id || m_LapseReflFor != id)
+    return 0;
+  if (info)
+    *info = m_LapseReflInfo;
+  return m_LapseRefl;
+}
+
+void VisualsManager::EndLapse()
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  if (!m_LapseOn && !m_LapseTodActive)
+    return;
+  if (m_LapseTodActive)
+  {
+    // The clock goes on from the last frame's time, or stays there if stopped;
+    // a track let go after it keeps that too (see StopTrackTimeOfDay)
+    m_TodFrozenValue = m_LapseTod;
+    if (m_TrackTodActive)
+      m_TrackTod = m_LapseTod;
+  }
+  m_LapseOn = false;
+  m_LapseTodActive = false;
+  m_LapseId = 0;
+  m_LapseReflFor = 0;
+  m_LapseRefl = 0;
+  util::hooks::SetTodHoldSteps(false);
 }
 
 // The game's own budget back on the settings object that got the bigger one
@@ -1194,7 +1579,8 @@ void VisualsManager::SetTimeOfDay(float seconds)
   std::lock_guard<std::mutex> lock(m_Mutex);
   if (util::IsMecmpLoaded()) return;
   float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
-  if (!pTime || seconds < 0) return;
+  // (not while a time-lapse holds it: see LapseLightAt)
+  if (!pTime || seconds < 0 || m_LapseTodActive) return;
 
   *pTime = seconds;
   m_TodFrozenValue = seconds;
@@ -1208,8 +1594,9 @@ void VisualsManager::SetTrackTimeOfDay(float seconds)
   m_TrackTodActive = true;
 
   // Also right away, the visual environment update may come before or after
+  // (not under a time-lapse's frame: its time wins, see LapseLightAt)
   float* pTime = IsLevelLoaded() ? GetTimeOfDay() : nullptr;
-  if (pTime)
+  if (pTime && !m_LapseTodActive)
     *pTime = seconds;
 }
 
@@ -1244,7 +1631,7 @@ void VisualsManager::SetReplayTimeOfDay(float seconds)
     m_ReplayTodLive = *pTime;
   m_ReplayTod = seconds;
   m_ReplayTodActive = true;
-  if (!m_TrackTodActive)
+  if (!m_TrackTodActive && !m_LapseTodActive)
     *pTime = seconds;
 }
 
@@ -1287,7 +1674,7 @@ void VisualsManager::StopReplayTimeOfDay()
   if (!m_ReplayTodActive) return;
   m_ReplayTodActive = false;
   float* pTime = (IsLevelLoaded() && !util::IsMecmpLoaded()) ? GetTimeOfDay() : nullptr;
-  if (pTime && !m_TrackTodActive && m_ReplayTodLive >= 0.f)
+  if (pTime && !m_TrackTodActive && !m_LapseTodActive && m_ReplayTodLive >= 0.f)
     *pTime = m_ReplayTodLive;
   m_ReplayTodLive = -1.f;
 }
@@ -1312,9 +1699,17 @@ void VisualsManager::DrawTimeOfDayUI()
   }
 
   float time = (m_TodFreeze && !m_TrackTodActive) ? m_TodFrozenValue : *pTime;
-  int seconds = (int)time;
+  int seconds = (int)(m_LapseTodActive ? m_LapseTod : time);
   char label[32];
   sprintf_s(label, "%02d:%02d", (seconds / 3600) % 24, (seconds / 60) % 60);
+
+  // A time-lapse holds it a frame at a time (CAMERA > Time-lapse): shown, not changed here
+  if (m_LapseTodActive)
+  {
+    ImGui::Text("Time of day  %s", label);
+    ImGui::TextDisabled("CAMERA > Time-lapse is setting it, a frame at a time");
+    return;
+  }
 
   if (ImGui::SliderFloat("Time of day", &time, 0.f, 86399.f, label))
   {
@@ -1361,6 +1756,7 @@ void VisualsManager::DrawTimeOfDayUI()
     "keyframes' times are far apart), the light in the shade follows it as it runs, a step at a time each about as "
     "far ahead as the clock goes in one, instead of keeping one time's light for 8 seconds; once it stops, it's "
     "redone once more at the time it stopped at.");
+  ImGui::TextDisabled("Time-lapses with the light worked out for every frame: CAMERA > Time-lapse");
 
   // The stuck clock fix (m_TodFix: the clock stuck at m_TodFixAt is moved
   // ahead by m_TodFixSkip) is always on: not in the menu since 2026-11-01

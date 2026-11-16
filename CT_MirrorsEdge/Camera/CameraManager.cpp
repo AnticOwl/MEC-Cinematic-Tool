@@ -16,6 +16,10 @@
 #include "FaithSize.h"
 #include "PoseEditor.h"
 #include "GroundLevel.h"
+#include "CullingOff.h"
+#include "Bodycam.h"
+#include "Timelapse.h"
+#include "../Visuals/FrameShot.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
@@ -2840,25 +2844,47 @@ namespace
   }
 
   // Every frame from the camera hook, with UpdateShardLod's result (it looks
-  // every 2 s)
+  // every 2 s). Only a burst of lightning reads the tip (weather::SetShardTop),
+  // so the far-away models (two walks through every model group and its
+  // members' names: a 1.2 - 2.5 ms frame every 2 s in the city, CT.log
+  // 2026-11-13) are only looked for while lightning can come
+  // (weather::ShardTopWanted, asked every frame before weather::Update); a
+  // check that left them out is made up for, the far-away models only, as
+  // soon as it can come (the weather makes no burst before that). The real
+  // tower's top is looked at every 2 s as before (the Districts menu shows it).
   void UpdateShardTip(int shardLoaded)
   {
     static ULONGLONG s_last = 0;
     static float s_tip[3] = {};
-    static int s_state = -1;   // 0 none loaded, 1 whole, 2 ruined, 3 both, 4 the real tower without its top, 5 not known, 6 the real tower
+    static int s_state = -1;   // 0 none loaded, 1 whole, 2 ruined, 3 both, 4 the real tower without its top, 5 not known, 6 the real tower, 7 the far-away models not looked for (no lightning)
+    static unsigned int s_leftOut = 0;   // checks that left the far-away models out since they were last looked for
     ULONGLONG now = GetTickCount64();
-    if (now - s_last >= ShardTipCheckMs)
+    bool lightning = weather::ShardTopWanted();
+    bool due = now - s_last >= ShardTipCheckMs;
+    bool makeUp = !due && s_state == 7 && lightning;
+    if (due || makeUp)
     {
-      s_last = now;
+      if (due)
+        s_last = now;
+      bool lookFar = makeUp || shardLoaded == 0;
       int state = shardLoaded == 1 ? 4 : 5;
       float tip[3] = {};
-      if (shardLoaded == 1 && ShardTopLoaded())
+      if (!lookFar && shardLoaded == 1 && ShardTopLoaded())
       {
         memcpy(tip, ShardRealTip, sizeof(tip));
         state = 6;
       }
-      else if (shardLoaded == 0)
+      else if (lookFar && !lightning)
       {
+        state = 7;
+        ++s_leftOut;
+      }
+      else if (lookFar)
+      {
+        if (s_state == 7 && util::DiagnosticsOn())
+          util::log::Write("The Shard's tip for lightning (diagnostic): lightning can come, its far-away models looked for "
+            "again (%u checks left them out before)", s_leftOut);
+        s_leftOut = 0;
         ModelGroupMatch whole[2], ruin[2];
         int w = FindModelGroups(IsShardFarWholeMesh, whole, 2);
         int r = FindModelGroups(IsShardFarRuinMesh, ruin, 2);
@@ -2881,7 +2907,8 @@ namespace
           util::log::Write("The Shard's tip for lightning: %s, at %.2f %.2f %.2f", state == 6 ? "the real tower's antenna" :
             state == 1 ? "its far-away model, whole" : "its far-away model, ruined", tip[0], tip[1], tip[2]);
         else
-          util::log::Write("The Shard's tip for lightning: none (%s)", state == 4 ? "the real tower is drawn without its top, "
+          util::log::Write("The Shard's tip for lightning: none (%s)", state == 7 ? "not looked for while no lightning can "
+            "come" : state == 4 ? "the real tower is drawn without its top, "
             "or its antenna isn't the part measured" : state == 3 ? "both far-away models are loaded" : state == 0 ?
             "no far-away model of it is loaded" : "the real tower's zone isn't known");
       }
@@ -4614,6 +4641,112 @@ namespace
   const char* const LapStreaming = "the streaming foci";
   const char* const LapNearby = "the nearby list";
   const char* const LapBlur = "the motion blur and the field of view";
+  const char* const LapTimelapse = "the time-lapse";
+}
+
+// CAMERA > Time-lapse's link to the rest of the tools (see timelapse::Host), made where it's used (the camera hook,
+// the menu) under the camera manager's lock, from what the manager has then
+namespace
+{
+  // Still: where the camera is held; the camera hook puts it back there every frame (OnCameraUpdate)
+  struct LapseHold
+  {
+    bool On;
+    XMFLOAT3 Position;
+    XMFLOAT4 Rotation;
+    float FieldOfView;
+  };
+  LapseHold g_LapseHold{ false, { 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 1.f }, 60.f };
+
+  class TimelapseLink : public timelapse::Host
+  {
+  public:
+    TimelapseLink(TrackPlayer& track, Camera const& camera, bool cameraOn, bool frozen, bool shakes, float worldScale, bool hud)
+      : m_Track(track), m_Camera(camera), m_CameraOn(cameraOn), m_Frozen(frozen), m_Shakes(shakes), m_WorldScale(worldScale),
+        m_Hud(hud) {}
+    double Now() override
+    {
+      static LARGE_INTEGER frequency = {};
+      if (!frequency.QuadPart)
+        QueryPerformanceFrequency(&frequency);
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      return (double)now.QuadPart / (double)frequency.QuadPart;
+    }
+    bool CameraOn() override { return m_CameraOn; }
+    bool CameraShakes() override { return m_Shakes; }
+    bool TimeFrozen() override { return m_Frozen; }
+    bool GamePaused() override { return gamestate::Paused() || gamestate::Loading(); }
+    float WorldScale() override { return m_WorldScale; }
+    bool WindowHidden() override { return g_gameHwnd && (IsIconic(g_gameHwnd) || !IsWindowVisible(g_gameHwnd)); }
+    bool HudShown() override { return m_Hud; }
+    long long LevelKey() override { return g_mainHandle->GetVisualsManager()->ClockKey(); }
+    float Clock() override
+    {
+      return util::IsMecmpLoaded() ? -1.f : g_mainHandle->GetVisualsManager()->GetCurrentTimeOfDay();
+    }
+    bool LightUsable(char* why, size_t size) override { return g_mainHandle->GetVisualsManager()->LapseAvailable(why, size); }
+    bool StepsHoldable() override { return util::hooks::TodHoldAvailable(); }
+    long long LightSinceUpdateMs() override { return util::hooks::TodSinceUpdateMs(); }
+    void CameraPose(float pose[8]) override
+    {
+      pose[0] = m_Camera.Position.x;
+      pose[1] = m_Camera.Position.y;
+      pose[2] = m_Camera.Position.z;
+      pose[3] = m_Camera.Rotation.x;
+      pose[4] = m_Camera.Rotation.y;
+      pose[5] = m_Camera.Rotation.z;
+      pose[6] = m_Camera.Rotation.w;
+      pose[7] = m_Camera.FieldOfView;
+    }
+    void HoldCamera(bool hold, float const* pose) override
+    {
+      g_LapseHold.On = hold && pose;
+      if (g_LapseHold.On)
+      {
+        g_LapseHold.Position = XMFLOAT3(pose[0], pose[1], pose[2]);
+        g_LapseHold.Rotation = XMFLOAT4(pose[3], pose[4], pose[5], pose[6]);
+        g_LapseHold.FieldOfView = pose[7];
+      }
+    }
+    int TrackKeyframes() override { return m_Track.GetNodeCount(); }
+    double TrackLength() override { return m_Track.GetTrackLength(); }
+    std::string TrackName() override { return m_Track.GetTrackName(); }
+    bool TrackTimeOfDay(double time, float& clock) override { return m_Track.TimeOfDayAt(time, clock); }
+    void TrackHold(double time) override
+    {
+      if (m_Track.IsPlaying() && !m_Track.IsPaused())
+        m_Track.TogglePause();
+      m_Track.Seek(time);
+    }
+    bool TrackHeld(double time) override { return m_Track.IsPaused() && fabs(m_Track.GetPlaybackTime() - time) < 1e-6; }
+    bool TrackPlaying() override { return m_Track.IsPlaying(); }
+    bool TrackSetsTime() override { return m_Track.IsTimeOfDayLocked(); }
+    void TrackRelease() override { m_Track.Stop(); }
+    long LightAt(float clock, bool quiet) override { return g_mainHandle->GetVisualsManager()->LapseLightAt(clock, quiet); }
+    int LightState(long id, float& litAt, float& clockAt, double& seconds) override
+    {
+      return g_mainHandle->GetVisualsManager()->LapseLightState(id, litAt, clockAt, seconds);
+    }
+    int ReflectionsState(long id, ReflectionInfo& info) override
+    {
+      VisualsManager::LapseReflInfo got{ false, 0, 0, 3 };
+      int state = g_mainHandle->GetVisualsManager()->LapseReflectionsState(id, &got);
+      info = { got.Marked, got.Waiting, got.Count, got.Ended };
+      return state;
+    }
+    void LightEnd() override { g_mainHandle->GetVisualsManager()->EndLapse(); }
+    void Shot(std::wstring const& path) override { frameshot::Request(path); }
+    bool ShotBusy() override { return frameshot::Busy(); }
+    void ShotCancel() override { frameshot::Cancel(); }
+
+  private:
+    TrackPlayer& m_Track;
+    Camera const& m_Camera;
+    bool m_CameraOn, m_Frozen, m_Shakes;
+    float m_WorldScale;
+    bool m_Hud;
+  };
 }
 
 void CameraManager::OnCameraUpdate(__int64 pRenderView)
@@ -4756,6 +4889,12 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   if (m_LodFix || m_LodScale > 0 || m_LodSaved)
     ApplyLodSettings();
   ApplyCulling();
+  // GAME > Level streaming > No culling (CullingOff.cpp): its CT.log lines, with the render view's position (its
+  // LinearTransform's translation) for the 10-s line's check that the main view is the camera
+  {
+    XMFLOAT4X4 const* pViewTransform = (XMFLOAT4X4 const*)(pRenderView + RenderViewTransform1);
+    culling_off::FrameUpdate(pViewTransform->_41, pViewTransform->_42, pViewTransform->_43);
+  }
   ApplyShadowDistance();
   perf::Lap(LapSettings);
   WatchInstanceLists();
@@ -4766,6 +4905,15 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   ApplyNearReflections();
   ApplyGameSpeed();
   perf::Lap(LapSettings);
+
+  // CAMERA > Time-lapse: a frame at a time, camera on or off (Timelapse.cpp); before the clock is kept below, and
+  // before the track plays (it holds the track at its frame's place)
+  {
+    TimelapseLink link(m_TrackPlayer, m_Camera, m_CameraEnabled, IsTimeFrozen(), m_ShakeStrength > 0.f ||
+      m_TrackPlayer.IsShakeLocked(), IsTimeFrozen() ? 0.f : GameSpeedNow() * m_GameTimeScale, IsHudVisible());
+    timelapse::Update(link);
+  }
+  perf::Lap(LapTimelapse);
 
   // A track stopped setting the time of day: the clock carries on from there
   if (m_TrackTimeOfDayApplied && !(m_CameraEnabled && m_TrackPlayer.IsPlaying() && m_TrackPlayer.IsTimeOfDayLocked()))
@@ -4807,7 +4955,13 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   // faith_size::Update(GetPlayerSoldier(), m_Replay.IsBusy(), m_CameraEnabled ? 0 : pRenderView);
   // GAME > Pose: the held poses handed to the game's pose override, after the replay's update (they step aside
   // while a replay records or plays: PoseEditor.cpp)
-  pose_editor::Update(GetPlayerSoldier(), m_Replay.IsBusy(), IsTimeFrozen());
+  pose_editor::Update(GetPlayerSoldier(), m_Replay.IsBusy(), IsTimeFrozen(), IsTimeFrozen() ? 0.f : GameSpeedNow() *
+    m_GameTimeScale, m_CameraEnabled && m_TrackPlayer.IsPlaying() ? m_TrackPlayer.GetSequenceTime() : -1.0);
+  // GAME > First person > First camera view > Bodycam: the tools' own bodycam on Faith's body (after the pose
+  // override, so it sees a posed body); in her first-person view with the free camera off, the main view and field
+  // of view are its (Bodycam.cpp). Before the green screen, weather and wet surfaces take the view.
+  bodycam::Update(pRenderView, ReadPointer(m_ppGameRenderSettings), GetPlayerSoldier(), m_CameraEnabled,
+    IsTimeFrozen() ? 0.f : GameSpeedNow() * m_GameTimeScale);
 
   // Motion blur too. With the camera on it's applied after the track has
   // updated the strength below.
@@ -4875,7 +5029,30 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
 
   FollowAttachTarget(dt, trackDt);
   UpdateInput(dt, mouseState);
+  // CAMERA > Time-lapse, still: the camera held where it was when it started (no input, following, orbit or drift),
+  // put back before the move and again after it if anything moved it (TimelapseLink::HoldCamera)
+  if (g_LapseHold.On)
+  {
+    m_Camera.dX = m_Camera.dY = m_Camera.dZ = 0.f;
+    m_Camera.dPitch = m_Camera.dYaw = m_Camera.dRoll = m_Camera.dFov = 0.f;
+    m_Camera.dMousePitch = m_Camera.dMouseYaw = 0.f;
+    m_Velocity = XMFLOAT3(0.f, 0.f, 0.f);
+    m_TurnRates[0] = m_TurnRates[1] = m_TurnRates[2] = 0.f;
+    m_Camera.Position = g_LapseHold.Position;
+    m_Camera.Rotation = g_LapseHold.Rotation;
+    m_Camera.FieldOfView = g_LapseHold.FieldOfView;
+  }
   UpdateCamera(dt, trackDt);
+  // (and the view built from it again, every frame: a held camera has no shake, so every frame is the same view)
+  if (g_LapseHold.On)
+  {
+    m_Camera.Position = g_LapseHold.Position;
+    m_Camera.Rotation = g_LapseHold.Rotation;
+    m_Camera.FieldOfView = g_LapseHold.FieldOfView;
+    XMMATRIX held = XMMatrixRotationQuaternion(XMLoadFloat4(&m_Camera.Rotation));
+    held.r[3] = XMVectorSetW(XMLoadFloat3(&m_Camera.Position), 1.f);
+    XMStoreFloat4x4(&m_Camera.Transform, held);
+  }
   StepTrackWallCheck();
   ProcessOrbitRequests();
   // A playing track's game speed, from this frame's place on it
@@ -6260,6 +6437,8 @@ void CameraManager::DrawOverlay(bool menuOpen)
   if (!pathShown || !menuOpen)
     EndPathDrag();
   DrawTrackPathMenu(pathShown && menuOpen);
+  // GAME > First person > Bodycam's REC overlay and vignette (only while it writes the view: never with this camera)
+  bodycam::DrawOverlay();
   if (!m_CameraEnabled)
     return;
   DrawComposition(playing);
@@ -6271,8 +6450,8 @@ bool CameraManager::WantsOverlay()
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
   bool guides = m_GuideThirds || m_GuideGolden || m_GuideCenter || m_GuideSafe;
-  return m_CameraEnabled && (m_Letterbox > 0 || (guides && (m_GuidesWhilePlaying || !m_TrackPlayer.IsPlaying())) ||
-    (m_PathPreview && !m_TrackPlayer.IsPlaying()));
+  return bodycam::WantsOverlay() || (m_CameraEnabled && (m_Letterbox > 0 ||
+    (guides && (m_GuidesWhilePlaying || !m_TrackPlayer.IsPlaying())) || (m_PathPreview && !m_TrackPlayer.IsPlaying())));
 }
 
 void CameraManager::DrawComposition(bool playing)
@@ -7496,9 +7675,9 @@ bool CameraManager::DrawDistrictList()
     setAll(District_Always);
   // As the renderer's draw batches are now (Room for the whole city)
   ImGui::ItemTooltip(util::hooks::BatchSpread() > 0 ?
-    "Keeps every district in the list loaded. With Room for the whole city on, the renderer's draw batch has room "
-    "for all of it; at the game's other limits some of it can still be held back." :
-    "Keeps every district in the list loaded as far as there's room. With Room for the whole city off, the "
+    "Keeps every district in the list loaded. The renderer's draw batch has room for all of it (Room for the whole "
+    "city); at the game's other limits some of it can still be held back." :
+    "Keeps every district in the list loaded as far as there's room. Until Room for the whole city is on, the "
     "renderer's draw batch holds only part of the city, and the rest is held back.");
   ImGui::SameLine();
   if (ImGui::Button("All to Never##Districts"))
@@ -7850,11 +8029,71 @@ namespace
     }
   }
 
+  // The same, and whether the read was an access violation (caught)
+  __int64 ReadQwordOrZero(__int64 address, bool& violation)
+  {
+    violation = false;
+    if (address < 0x10000 || address > 0x7FFFFFFF0000)
+      return 0;
+    __try
+    {
+      return *(__int64*)address;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+      violation = GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION;
+      return 0;
+    }
+  }
+
   struct HairCloth
   {
     __int64 Entity;  // the ClothEntity
     __int64 Data;    // its ClothEntityData
   };
+
+  // Many of the component's values aren't pointers, and reading one that points
+  // nowhere is an access violation caught (1.5-1.8 microseconds each, measured
+  // outside the game; with her body shown, "the game's settings applied", where
+  // the hair fix is timed, took 0.05-0.23 ms a frame, 2026-11-13). A
+  // value whose read was one is remembered at its offset. While the offset keeps
+  // that value, Windows is asked (VirtualQuery) whether its page is still free,
+  // reserved or no-access, and only then the value isn't read: the read would be
+  // that access violation again. Otherwise it's read as before, so a cloth is
+  // found the frame it's readable, as before. The camera hook's thread only.
+  struct HairLook
+  {
+    __int64 Unreadable[0x800 / 8];    // per offset, the value there whose read was an access violation (0: none)
+    // CT.log's 10-s line (diagnostics only)
+    ULONGLONG LoggedAt;
+    unsigned Frames, Violations, Skipped, Queries;
+  };
+  HairLook g_HairLook{};
+  const int NowhereRuns = 16;         // runs of such pages kept during one look
+
+  // Whether reading this address would be an access violation now: its page is
+  // free, reserved or no-access. The runs of such pages found in this look are
+  // kept in from/to (up to NowhereRuns), so one question covers every value in
+  // them.
+  bool PointsNowhere(__int64 address, __int64* from, __int64* to, int& runs)
+  {
+    for (int r = 0; r < runs; ++r)
+      if (address >= from[r] && address < to[r])
+        return true;
+    ++g_HairLook.Queries;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((void*)address, &mbi, sizeof(mbi)) != sizeof(mbi))
+      return false;
+    bool nowhere = mbi.State == MEM_FREE || mbi.State == MEM_RESERVE ||
+      (mbi.State == MEM_COMMIT && (mbi.Protect & 0xFF) == PAGE_NOACCESS);
+    if (nowhere && runs < NowhereRuns)
+    {
+      from[runs] = (__int64)mbi.BaseAddress;
+      to[runs] = (__int64)mbi.BaseAddress + (__int64)mbi.RegionSize;
+      ++runs;
+    }
+    return nowhere;
+  }
 
   // Each cloth Faith's customization component holds, with its ClothEntityData
   // (two cloths can share one)
@@ -7869,10 +8108,32 @@ namespace
       __int64 pComponent = ReadQwordOrZero(pCollection + 0x20 + entry * 0x20);
       if (!pComponent || ReadQwordOrZero(pComponent) != base + CustomizationComponentVTableRva)
         continue;
+      // The values whose read was an access violation (see HairLook)
+      HairLook& look = g_HairLook;
+      __int64 nowhereFrom[NowhereRuns], nowhereTo[NowhereRuns];
+      int nowhereRuns = 0;
+      ++look.Frames;
       for (int off = 0; off < 0x800 && count < max; off += 8)
       {
         __int64 pCloth = ReadQwordOrZero(pComponent + off);
-        if (!pCloth || pCloth == pComponent || ReadQwordOrZero(pCloth) != base + ClothEntityVTableRva)
+        // Still that value, and its page still isn't there: still no cloth
+        __int64& unreadable = look.Unreadable[off / 8];
+        if (pCloth && pCloth == unreadable && PointsNowhere(pCloth, nowhereFrom, nowhereTo, nowhereRuns))
+        {
+          ++look.Skipped;
+          continue;
+        }
+        unreadable = 0;
+        if (!pCloth || pCloth == pComponent)
+          continue;
+        bool violation;
+        __int64 vtable = ReadQwordOrZero(pCloth, violation);
+        if (violation)
+        {
+          unreadable = pCloth;
+          ++look.Violations;
+        }
+        if (vtable != base + ClothEntityVTableRva)
           continue;
         __int64 pData = ReadQwordOrZero(pCloth + ClothEntityDataOffset);
         if (!pData || ReadQwordOrZero(pData) != base + ClothEntityDataVTableRva)
@@ -7886,6 +8147,34 @@ namespace
       break;
     }
     return count;
+  }
+
+  // Her body no longer shown: the 10-s line below starts again once it is
+  void RestartHairLookLine()
+  {
+    g_HairLook.LoggedAt = 0;
+  }
+
+  // Every 10 s while her body is shown, in CT.log (diagnostics only): the
+  // component's values that point nowhere, read (each an access violation) and
+  // not read (Windows asked instead)
+  void LogHairLook()
+  {
+    HairLook& look = g_HairLook;
+    if (!util::DiagnosticsOn())
+      return;
+    ULONGLONG now = GetTickCount64();
+    if (!look.LoggedAt || now - look.LoggedAt >= 10000)
+    {
+      if (look.LoggedAt && look.Frames)
+        util::log::Write("Faith's hair (diagnostic): her customization component looked through in %u frames in %.0f s; "
+          "values that point nowhere: %.1f a frame read (an access violation caught each), %.1f a frame not read "
+          "(Windows said their memory still isn't there, %.1f questions a frame)", look.Frames,
+          (now - look.LoggedAt) / 1000.0, (double)look.Violations / look.Frames, (double)look.Skipped / look.Frames,
+          (double)look.Queries / look.Frames);
+      look.LoggedAt = now;
+      look.Frames = look.Violations = look.Skipped = look.Queries = 0;
+    }
   }
 
   void WriteFloats(__int64 address, float const* values, int count)
@@ -7916,6 +8205,8 @@ void CameraManager::ApplyHairFix()
   // While Faith's body is shown her hair cloth is kept on, see above
   static bool s_supported = IsKnownBuild();
   bool wanted = s_supported && m_CameraEnabled && m_ThirdPersonApplied;
+  if (!wanted)
+    RestartHairLookLine();
   if (!wanted && m_HairSavedCount == 0 && m_HairInstanceCount == 0)
     return;
 
@@ -7946,6 +8237,7 @@ void CameraManager::ApplyHairFix()
   HairCloth cloths[MaxHairCloths];
   __int64 pSoldier = GetPlayerSoldier();
   int count = pSoldier ? FindHairCloths(pSoldier, cloths, MaxHairCloths) : 0;
+  LogHairLook();
 
   // The cloth is switched on near the camera; out to 100 km it's always on
   const float wide[8] = { 100000.f, 100000.f, 100000.f, 100000.f, 99000.f, 99000.f, 99000.f, 99000.f };
@@ -8728,6 +9020,12 @@ void CameraManager::DrawStatusBar()
     ImGui::TextColored(on, "Game speed %.2fx", GameSpeedNow());
   }
 
+  if (timelapse::Running())
+  {
+    separator();
+    ImGui::TextColored(active, "Making a time-lapse");
+  }
+
   char replay[96];
   if (m_Replay.GetStatus(replay, sizeof(replay))[0])
   {
@@ -8816,6 +9114,12 @@ void CameraManager::DrawGameUI()
   sprintf_s(label, "Show HUD  (%s)", pInput->GetKeyName(Action::ToggleHUD).c_str());
   if (ImGui::Checkbox(label, &hudVisible))
     ToggleHudVisibility();
+
+  // Default or the tools' own bodycam (Bodycam.cpp)
+  ImGui::SectionHeading("First person");
+  ImGui::PushID("FirstCameraView");
+  configChanged |= bodycam::DrawUI();
+  ImGui::PopID();
 
   ImGui::SectionHeading("Faith");
   // In the menu's order: Runner (the game's own), Prologue, Prologue with gridlink
@@ -9022,6 +9326,8 @@ void CameraManager::DrawGameUI()
   ImGui::PopItemWidth();
 
   ImGui::SectionHeading("Level streaming");
+  // No culling: the main view draws every loaded mesh (CullingOff.cpp; not tied to the zone streamer)
+  configChanged |= culling_off::DrawUI();
   if (m_pAddZoneFocus && m_pRemoveZoneFocus)
   {
     // Room for the whole city: the renderer's draw batches spread (see
@@ -9029,44 +9335,12 @@ void CameraManager::DrawGameUI()
     // there or with every renderer's category 0 still in its first batch and
     // well short of where the picking changes (BatchSpreadSwitchSafe, see
     // WatchInstanceLists)
+    // Always on since 2026-11-14, no tick (a config's 0 counts as on too, see
+    // ReadConfig); only what it's doing is shown
     if (m_BatchSpreadMissing)
-    {
-      // The room as it is: without the wider handle the first 1024 chunks'
-      // share, with it but the add not hooked one batch's 1748 (CategoryRoom)
-      char missingHelp[512];
-      sprintf_s(missingHelp, "The renderer's draw batches can't be spread with this game build (the tools couldn't widen "
-        "its batch handle or don't know its add), so it keeps the game's one batch, room for %d instances: with more "
-        "of the city than that the camera's extra zones and the Always districts are held back.", CategoryRoom(0));
       ImGui::TextDisabled("Room for the whole city: not with this game build");
-      ImGui::HelpMarker(missingHelp);
-    }
-    else
-    {
-      bool spreadOn = m_BatchSpreadWanted > 0;
-      if (ImGui::Checkbox("Room for the whole city", &spreadOn))
-      {
-        m_BatchSpreadWanted = spreadOn ? m_BatchSpreadOn : 0;
-        configChanged = true;
-        if (m_BatchSpreadWanted == util::hooks::BatchSpread())
-          util::log::Write("Room for the whole city %s in the menu: as it is now", spreadOn ? "on" : "off");
-        else
-          util::log::Write("Room for the whole city %s in the menu: switched once the renderer's draw batches allow it",
-            spreadOn ? "on" : "off");
-      }
-      ImGui::HelpMarker("The renderer files what it draws in draw batches. The game only ever uses the first of the "
-        "nine it has, with room for 111872 instances: far less than the whole city needs, so the tools hold the "
-        "camera's extra zones and the Always districts back well before it's full. On, what doesn't fit there goes "
-        "on into the other eight. Off, as the game has it.\n"
-        "Switched on or off, it takes effect only while the renderer's first draw batch is still well short of where "
-        "the spread starts and its other batches have never been used: the tools check when the game starts and again "
-        "while it runs, and CT.log says when it's switched. (Whether a level load starts the batches over "
-        "isn't known.)");
-      if (m_BatchSpreadWanted != util::hooks::BatchSpread())
-      {
-        ImGui::SameLine();
-        ImGui::TextDisabled(spreadOn ? "(on once the draw batches allow it)" : "(off once the draw batches allow it)");
-      }
-    }
+    else if (m_BatchSpreadWanted != util::hooks::BatchSpread())
+      ImGui::TextDisabled("Room for the whole city: on once the renderer's draw batches allow it");
 
     bool streamAroundCamera = m_StreamAroundCamera;
     if (ImGui::Checkbox("Load the world around the camera", &streamAroundCamera))
@@ -9293,6 +9567,14 @@ void CameraManager::DrawUI()
     ImGui::TreePop();
   }
 
+  // A time-lapse made a frame at a time, the light worked out for each (Timelapse.cpp)
+  ImGui::SectionHeading("Time-lapse");
+  {
+    TimelapseLink link(m_TrackPlayer, m_Camera, m_CameraEnabled, IsTimeFrozen(), m_ShakeStrength > 0.f ||
+      m_TrackPlayer.IsShakeLocked(), IsTimeFrozen() ? 0.f : GameSpeedNow() * m_GameTimeScale, IsHudVisible());
+    configChanged |= timelapse::DrawUI(link);
+  }
+
   ImGui::SectionHeading("Motion blur");
   configChanged |= ImGui::Checkbox("Control motion blur", &m_MotionBlurOverride);
   if (m_MotionBlurOverride)
@@ -9485,6 +9767,8 @@ void CameraManager::ReadConfig(INIReader* pReader)
   m_SoundAtCamera = true;
   m_SpotSounds = true;
   m_PlaybackFps = (float)pReader->GetReal("Camera", "PlaybackFps", 0.0);
+  // CAMERA > Time-lapse's settings ([Camera] Timelapse*)
+  timelapse::ReadConfig(pReader);
   m_PlayerControlDuringPlayback = pReader->GetBoolean("Camera", "FaithControlDuringPlayback", true);
   m_KbmDisabled = pReader->GetBoolean("Camera", "FreezeFaith", true);
   m_GamepadDisabled = pReader->GetBoolean("Camera", "GamepadMovesCamera", true);
@@ -9637,6 +9921,10 @@ void CameraManager::ReadConfig(INIReader* pReader)
   m_NoFallDeath = false;   // no setting since 2026-11-04
   ground::SetSolidStreet(m_SolidStreet);
   ground::SetNoFallDeath(m_NoFallDeath);
+  culling_off::SetEnabled(pReader->GetBoolean("Misc", "NoCulling", false));
+  culling_off::SetViewMargin((float)pReader->GetReal("Misc", "NoCullingViewMargin", 20.0));
+  culling_off::SetSmallRange((float)pReader->GetReal("Misc", "NoCullingSmallRange", 2000.0));
+  bodycam::ReadConfig(pReader);
   m_StreamDistance = (float)pReader->GetReal("Misc", "StreamDistance", 0.0);
   if (m_StreamDistance < 0) m_StreamDistance = 0;
   float maxStreamDistance = m_StreamInView ? MaxStreamDistanceInView : MaxStreamDistance;
@@ -9649,7 +9937,8 @@ void CameraManager::ReadConfig(INIReader* pReader)
   // Read once, when the tools load (Main::LoadConfig, after the hooks).
   {
     int spread = (int)pReader->GetInteger("Misc", "BatchSpreadChunks", BatchSpreadDefault);
-    if (spread < 0) spread = 0;
+    // Always on since 2026-11-14 (no tick): 0 (off) or less is the default
+    if (spread <= 0) spread = BatchSpreadDefault;
     if (spread > BatchFillRoomChunks) spread = BatchFillRoomChunks;
     m_BatchSpreadOn = spread > 0 ? spread : BatchSpreadDefault;
     m_BatchSpreadWanted = spread;
@@ -9739,6 +10028,7 @@ const std::string CameraManager::GetConfig()
   config += std::string("ThirdPersonBody = ") + (m_ThirdPersonToggle ? "true" : "false") + "\n";
   config += "ThirdPersonBodyWay = " + std::to_string(m_BodyWay) + "\n";
   config += "PlaybackFps = " + std::to_string(m_PlaybackFps) + "\n";
+  timelapse::WriteConfig(config);
   config += std::string("FaithControlDuringPlayback = ") + (m_PlayerControlDuringPlayback ? "true" : "false") + "\n";
   config += std::string("FreezeFaith = ") + (m_KbmDisabled ? "true" : "false") + "\n";
   config += std::string("GamepadMovesCamera = ") + (m_GamepadDisabled ? "true" : "false") + "\n";
@@ -9832,6 +10122,11 @@ const std::string CameraManager::GetConfig()
   for (int part = 0; part < faith_outfit::Part_Count; ++part)
     config += std::string(faith_outfit::PartSetting(part)) + " = " + (faith_outfit::GetPart(part) ? "true" : "false") + "\n";
   config += std::string("SolidStreet = ") + (m_SolidStreet ? "true" : "false") + "\n";
+  config += std::string("NoCulling = ") + (culling_off::GetEnabled() ? "true" : "false") + "\n";
+  config += "NoCullingViewMargin = " + std::to_string(culling_off::GetViewMargin()) + "\n";
+  config += "NoCullingSmallRange = " + std::to_string(culling_off::GetSmallRange()) + "\n";
+  // FirstCameraView and the bodycam's look and settings (Bodycam.cpp)
+  bodycam::WriteConfig(config);
   config += "StreamDistance = " + std::to_string(m_StreamDistance) + "\n";
   // Room for the whole city: only when it isn't the default (so the default
   // can change), what was chosen even before it's switched (with no level

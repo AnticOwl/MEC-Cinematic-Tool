@@ -1,5 +1,6 @@
 #include "InputSystem.h"
 #include "../Main.h"
+#include "../Camera/PoseEditor.h"
 #include "../Util/Util.h"
 #include "../Util/ImGuiEXT.h"
 #include <chrono>
@@ -466,6 +467,7 @@ void InputSystem::HotkeyUpdate()
       g_mainHandle->GetUI()->Toggle();
 
     g_mainHandle->GetCameraManager()->HotkeyUpdate();
+    pose_editor::HotkeyUpdate();
   }
 }
 

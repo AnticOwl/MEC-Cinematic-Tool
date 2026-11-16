@@ -64,6 +64,20 @@ enum Action
   Track_Undo,
   Track_Redo,
 
+  // The Pose window's keyframes and its Undo (PoseEditor.cpp, PoseHotkeys: while the window is open). By default on
+  // the numpad keys the camera's actions and the game's saved binds don't use (its default keys aren't known;
+  // 2026-11-15).
+  Pose_Play,
+  Pose_KeyChanges,
+  Pose_KeyWholePose,
+  Pose_RemoveKey,
+  Pose_PreviousKey,
+  Pose_NextKey,
+  Pose_FrameBack,
+  Pose_FrameOn,
+  Pose_Undo,
+  Pose_Redo,
+
   ActionCount
 };
 
@@ -170,7 +184,17 @@ static const std::map<Action, std::string> ActionStringMap =
   { Camera_SaveBookmark8, "Camera_SaveBookmark8" },
   { Camera_SaveBookmark9, "Camera_SaveBookmark9" },
   { Track_Undo, "Track_UndoKeyframe" },
-  { Track_Redo, "Track_RedoKeyframe" }
+  { Track_Redo, "Track_RedoKeyframe" },
+  { Pose_Play, "Pose_Play" },
+  { Pose_KeyChanges, "Pose_KeyChanges" },
+  { Pose_KeyWholePose, "Pose_KeyWholePose" },
+  { Pose_RemoveKey, "Pose_RemoveKey" },
+  { Pose_PreviousKey, "Pose_PreviousKey" },
+  { Pose_NextKey, "Pose_NextKey" },
+  { Pose_FrameBack, "Pose_FrameBack" },
+  { Pose_FrameOn, "Pose_FrameOn" },
+  { Pose_Undo, "Pose_Undo" },
+  { Pose_Redo, "Pose_Redo" }
 };
 
 
@@ -218,7 +242,17 @@ static const std::map<Action, std::string> ActionUIStringMap =
   { Camera_SaveBookmark8, "Save camera bookmark 8" },
   { Camera_SaveBookmark9, "Save camera bookmark 9" },
   { Track_Undo, "Undo a keyframe change" },
-  { Track_Redo, "Redo a keyframe change" }
+  { Track_Redo, "Redo a keyframe change" },
+  { Pose_Play, "Pose: play / pause its keyframes" },
+  { Pose_KeyChanges, "Pose: keyframe the changes" },
+  { Pose_KeyWholePose, "Pose: keyframe the whole pose" },
+  { Pose_RemoveKey, "Pose: remove the picked bone's keyframe" },
+  { Pose_PreviousKey, "Pose: to the keyframe before" },
+  { Pose_NextKey, "Pose: to the next keyframe" },
+  { Pose_FrameBack, "Pose: one frame back" },
+  { Pose_FrameOn, "Pose: one frame on" },
+  { Pose_Undo, "Pose: undo" },
+  { Pose_Redo, "Pose: redo" }
 };
 
 
@@ -269,7 +303,17 @@ static const std::map<Action, int> DefaultKeyboardMap =
   { Camera_SaveBookmark8, (VK_SHIFT << 8) | '8' },
   { Camera_SaveBookmark9, (VK_SHIFT << 8) | '9' },
   { Track_Undo, VK_BACK },
-  { Track_Redo, (VK_SHIFT << 8) | VK_BACK }
+  { Track_Redo, (VK_SHIFT << 8) | VK_BACK },
+  { Pose_Play, VK_NUMPAD0 },
+  { Pose_KeyChanges, VK_NUMPAD8 },
+  { Pose_KeyWholePose, VK_NUMPAD2 },
+  { Pose_RemoveKey, VK_DECIMAL },
+  { Pose_PreviousKey, VK_NUMPAD4 },
+  { Pose_NextKey, VK_NUMPAD6 },
+  { Pose_FrameBack, VK_NUMPAD7 },
+  { Pose_FrameOn, VK_NUMPAD9 },
+  { Pose_Undo, VK_DIVIDE },
+  { Pose_Redo, (VK_SHIFT << 8) | VK_DIVIDE }
 };
 
 static const std::map<Action, GamepadKey> DefaultGamepadMap =
@@ -316,5 +360,15 @@ static const std::map<Action, GamepadKey> DefaultGamepadMap =
   { Camera_SaveBookmark8, GamepadKey::None },
   { Camera_SaveBookmark9, GamepadKey::None },
   { Track_Undo, GamepadKey::None },
-  { Track_Redo, GamepadKey::None }
+  { Track_Redo, GamepadKey::None },
+  { Pose_Play, GamepadKey::None },
+  { Pose_KeyChanges, GamepadKey::None },
+  { Pose_KeyWholePose, GamepadKey::None },
+  { Pose_RemoveKey, GamepadKey::None },
+  { Pose_PreviousKey, GamepadKey::None },
+  { Pose_NextKey, GamepadKey::None },
+  { Pose_FrameBack, GamepadKey::None },
+  { Pose_FrameOn, GamepadKey::None },
+  { Pose_Undo, GamepadKey::None },
+  { Pose_Redo, GamepadKey::None }
 };

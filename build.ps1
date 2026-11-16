@@ -84,6 +84,12 @@ if ($LASTEXITCODE -ne 0) { throw 'CT_MirrorsEdge build failed, see the MSBuild o
   /p:Configuration=$Configuration /p:Platform=x64 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Loader build failed, see the MSBuild output above' }
 
+# 3b. EmotionHelper.exe, for the optional emotion model (Pose window > Voice > From the voice). The model itself,
+#     emotion_feel.onnx (about 660 MB, CC BY-NC-SA 4.0), isn't built here: see tools\emotion_model\README.md
+& $msbuild (Join-Path $root 'EmotionHelper\EmotionHelper.vcxproj') /nologo /v:minimal `
+  /p:Configuration=$Configuration /p:Platform=x64 | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'EmotionHelper build failed, see the MSBuild output above' }
+
 # 4. Everything that goes into the game folder
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $dist | Out-Null
@@ -91,7 +97,16 @@ Copy-Item (Join-Path $root "CT_MirrorsEdge\x64\$Configuration\CT_MirrorsEdge.dll
 Copy-Item (Join-Path $root "Loader\x64\$Configuration\usp10.dll") $dist -Force
 # The old version.dll loader, which the game never picks up
 Remove-Item (Join-Path $dist 'version.dll') -ErrorAction SilentlyContinue
+# The optional download's folder (Cinematic Tools\EmotionModel): the helper, its README and the model's licence;
+# emotion_feel.onnx is added to it by hand (tools\emotion_model\README.md)
+$emotion = Join-Path $dist 'EmotionModel'
+New-Item -ItemType Directory -Force $emotion | Out-Null
+Copy-Item (Join-Path $root "EmotionHelper\x64\$Configuration\EmotionHelper.exe") $emotion -Force
+Copy-Item (Join-Path $root 'tools\emotion_model\README_EmotionModel.txt') $emotion -Force
+Copy-Item (Join-Path $root 'tools\emotion_model\LICENSE.txt') $emotion -Force
+Copy-Item (Join-Path $root 'THIRD_PARTY_NOTICES.md') $emotion -Force
 
 Write-Host ""
 Write-Host "Built $dist\CT_MirrorsEdge.dll and $dist\usp10.dll"
 Write-Host "Copy both next to MirrorsEdgeCatalyst.exe."
+Write-Host "The optional emotion model's folder: $emotion (add emotion_feel.onnx; it goes in Cinematic Tools\EmotionModel)"

@@ -82,6 +82,37 @@ public:
   // Camera hook, every rendered frame: the stopped clock (or a track's time)
   // is written then too, so the clock can't creep on between visual updates
   void KeepClock();
+  // CAMERA > Time-lapse (Camera/Timelapse.cpp), camera hook. LapseLightAt: the
+  // time of day held at seconds (over a track's, a replay's and the stopped
+  // clock) and the game's own reset of its lighting asked for there, forced
+  // (see util::hooks::RequestTodReset; quiet: without its log lines); while
+  // the time-lapse runs the catch-up stays on (the bigger budget, the
+  // exposure at once, reflections a whole cubemap a frame), the game's own
+  // steps are held, the following and the jump resets are off, and once the
+  // reset is done every reflection is captured again. Returns the request (0:
+  // can't, see LapseAvailable). LapseLightState: a util::hooks::TodOutcome
+  // (litAt, seconds: the time lit, how long its reset took).
+  // LapseReflectionsState: 0 being captured, 1 the nearest ones captured (the
+  // count waiting has stopped going down), 2 can't be told (their code isn't
+  // the tools'). EndLapse lets go: the clock goes on from the last time (or
+  // stays there, stopped), the steps, following and resets come back.
+  // (clockAt: the lighting's own clock when its reset was done. info: how the
+  // reflections' round went, see LapseReflInfo)
+  struct LapseReflInfo
+  {
+    bool Marked;     // all were seen marked to be captured again
+    int Waiting;     // still waiting when taken as captured (the ones further away), of Count
+    int Count;
+    int Ended;       // 0 the count stopped going down, 1 none went down in 3 s, 2 15 s went by, 3 can't be told
+  };
+  bool LapseAvailable(char* why, size_t size);
+  // Which clock the time of day is (its address: another level, another one;
+  // 0 without one)
+  __int64 ClockKey();
+  long LapseLightAt(float seconds, bool quiet);
+  int LapseLightState(long id, float& litAt, float& clockAt, double& seconds);
+  int LapseReflectionsState(long id, LapseReflInfo* info);
+  void EndLapse();
   // CAMERA > Around the focus > Auto-focus, from the camera hook every frame: the
   // depth of field override's distances (focus, Simple and Sprite near and
   // far) moved so the set-up made for its own focus distance is at this one
@@ -224,6 +255,29 @@ private:
   bool m_ReplayTodActive{ false };
   float m_ReplayTod{ 0 };
   float m_ReplayTodLive{ -1.f };
+  // A time-lapse running (see LapseLightAt): its clock (over everything else),
+  // its request, and its reflections (see LapseReflections): the request
+  // they were captured again for, their state, since when, whether all were
+  // marked to be captured, the count waiting as last seen and how long it
+  // hasn't changed
+  __int64 m_TodClockKey{ 0 };   // the level's clock last seen (CatchUpBounceLight: another one, the managers forgotten)
+  bool m_LapseOn{ false };
+  bool m_LapseTodActive{ false };
+  float m_LapseTod{ 0.f };
+  long m_LapseId{ 0 };
+  long m_LapseReflFor{ 0 };
+  int m_LapseRefl{ 0 };
+  ULONGLONG m_LapseReflTick{ 0 };
+  bool m_LapseMarked{ false };
+  int m_LapseMarkedAt{ 0 };
+  int m_LapseWaiting{ -1 };
+  ULONGLONG m_LapseStableSince{ 0 };
+  int m_LapseStableUpdates{ 0 };
+  int m_LapseReflLogs{ 0 };
+  int m_LapseReflWarnings{ 0 };
+  int m_LapseQueueCount{ 0 };   // the run's requests so far (its job queue lines, see LapseLightAt)
+  LapseReflInfo m_LapseReflInfo{ false, 0, 0, 0 };
+  void LapseReflections(ULONGLONG now);
   // A playing replay's weather (see SetReplayWeatherLook): Clouds then Wind
   size_t m_CloudsIndex{ (size_t)-1 }, m_WindIndex{ (size_t)-1 };
   std::vector<BYTE> m_ReplayLookA, m_ReplayLookB;
@@ -257,6 +311,14 @@ private:
   // RecaptureMs)
   bool m_ResetAfterJumps{ false };
   ULONGLONG m_ReflectionsUntil{ 0 };
+  // What marks every reflection again during the catch-up (see
+  // NoteReflectionMarks): the last look's waiting count and stored sun, and
+  // how many were logged this time
+  void NoteReflectionMarks(ULONGLONG now);
+  bool m_MarksWatching{ false };
+  int m_MarksWaiting{ 0 };
+  float m_MarksSun[3]{};
+  int m_MarksLogged{ 0 };
   // The extra bounce light passes: still to file, done, the one filed (its
   // request id and the manager it's in), when the last jump was
   ULONGLONG m_LastJumpTick{ 0 };

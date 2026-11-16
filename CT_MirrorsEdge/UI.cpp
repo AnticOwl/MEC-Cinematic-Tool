@@ -29,8 +29,11 @@ namespace
   const float g_textSizes[] = { 15.f, 17.f, 20.f, 24.f };
   const int g_textSizeCount = 4;
 
-  // Latin-1 plus dashes, bullets, the ellipsis and arrows
-  const ImWchar g_glyphRanges[] = { 0x0020, 0x00FF, 0x2013, 0x2014, 0x2022, 0x2022, 0x2026, 0x2026, 0x2190, 0x2193, 0 };
+  // Latin-1 and Greek (file names in the menus' lists: a letter the font has no shape for is drawn as "?"), plus
+  // dashes, bullets, the ellipsis and arrows. With Greek the font picture is at most as large as before at the
+  // largest text size and twice as high at the middle ones (512 x 512 at 17 px; built offline at every size).
+  const ImWchar g_glyphRanges[] = { 0x0020, 0x00FF, 0x0370, 0x03FF, 0x2013, 0x2014, 0x2022, 0x2022, 0x2026, 0x2026,
+    0x2190, 0x2193, 0 };
 
   ImVec4 WithAlpha(ImVec4 color, float alpha)
   {
@@ -485,6 +488,8 @@ void UI::Draw()
   }
 
   ImGui_ImplDX11_NewFrame();
+  // A press that came as the Pose window's file window closed isn't taken by anything below (2026-11-16)
+  pose_editor::QuietMouse();
 
   // Over the picture, under the menu's windows (see CameraManager::DrawOverlay);
   // the lights' dots first, so a click on a dot isn't also the track path's
@@ -576,6 +581,7 @@ void UI::Draw()
   } ImGui::End();
 
   g_mainHandle->GetInputSystem()->DrawUI();
+  pose_editor::DrawWindow();
 
   ImGui::Render();
   ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

@@ -18,6 +18,7 @@
 // the game neither walks it nor turns a shown walker away from it (its avoidance goes by 3D distance).
 #include "RoadTrafficCore.h"
 #include "WalkersWalls.h"
+#include "WalkersFloors.h"
 #include <algorithm>
 
 namespace walkers_core
@@ -141,6 +142,7 @@ namespace walkers_core
     long long DensityHidden = 0, DensityShown = 0, Sidesteps = 0, Ghosts = 0, StuckUnseen = 0;
     long long FarCorners = 0;  // corner targets far off the path put back on it (After)
     long long WallPulled = 0, WallRefused = 0, WallTargets = 0, WallFound = 0, WallMissing = 0;   // the walls rule
+    long long FloorTargets = 0, FloorSet = 0;   // corner targets set to the street's height; walkers put on it appearing
   };
 
   struct Slot
@@ -330,6 +332,26 @@ namespace walkers_core
         ++s.Counts.WallTargets;
       }
 
+      // on the street (2026-11-15, the user: "make sure that every car and traffic in general are actually on the
+      // ground"): the game's height runs straight from a walker to its corner target, at its To node's height, and on
+      // the street a fifth of the walking nodes are off the drawn pavement Faith stands on (whole placements 16 cm in
+      // it, one loop 1 m under it, some up to 1.1 m over it). A target there takes the street's height
+      // (WalkersFloors.h), so the walker walks straight between street heights; elsewhere (roofs, walkways: no floor
+      // data) it's the game's
+      for (int i = 0; i < in.Count; ++i)
+      {
+        if (in.Flags[i] & DespawnedFlag) continue;
+        Record& r = rec[i];
+        int g = WallSegment(s, in, i, r.From, r.To);
+        if (g < 0) continue;
+        float h = NodeFloor(g, (float const*)(in.Nodes + (size_t)r.To * NodeSize));
+        if (h > -1e29f && r.Target[1] != h)
+        {
+          r.Target[1] = h;
+          ++s.Counts.FloorTargets;
+        }
+      }
+
       // who's there, and where each was before the step
       for (int i = 0; i < in.Count; ++i)
       {
@@ -353,10 +375,18 @@ namespace walkers_core
           m.Wait = 0.f;
           m.Ghost = 0.f;
           m.Hidden = respawned ? 1 : 0;
+          // on the street's height where its leg has one (see the targets above), from its first step
+          float fy = rec[i].Pos[1] > -9000.f ? rec[i].Pos[1] : b.Pos[1];
+          float fx = rec[i].Pos[1] > -9000.f ? rec[i].Pos[0] : b.Pos[0], fz = rec[i].Pos[1] > -9000.f ? rec[i].Pos[2] : b.Pos[2];
+          if (LegFloor(s, in, i, rec[i], fx, fz, fy))
+          {
+            ++s.Counts.FloorSet;
+            if (!respawned && rec[i].Pos[1] > -9000.f) rec[i].Pos[1] = fy;
+          }
           if (respawned)
           {
             ++s.Counts.Respawned;
-            Unsee(s, rec, i, rec[i].Pos[1] > -9000.f ? rec[i].Pos[1] : b.Pos[1], 1);
+            Unsee(s, rec, i, fy, 1);
           }
         }
         s.Visible[i] = m.Hidden == 0 ? 1 : 0;
@@ -695,6 +725,36 @@ namespace walkers_core
     // Walker i at (x, y, z), going along (ux, uz), would be too close to another shown walker (Closeness): one it was
     // already that close to blocks only a move that brings them closer
     // The walls segment of walker i's leg a -> b (cached per walker while its leg stays the same), -1 none
+    // The street's height at a node of walls segment g (WalkersFloors.h, its end A or B by position), or NoFloor
+    static float NodeFloor(int g, float const* node)
+    {
+      walkers_walls::Segment const& S = walkers_walls::Segments[g];
+      walkers_floors::Ends const& F = walkers_floors::Floor[g];
+      if (std::fabs(S.Ax - node[0]) < 0.02f && std::fabs(S.Ay - node[1]) < 0.02f && std::fabs(S.Az - node[2]) < 0.02f)
+        return F.A;
+      if (std::fabs(S.Bx - node[0]) < 0.02f && std::fabs(S.By - node[1]) < 0.02f && std::fabs(S.Bz - node[2]) < 0.02f)
+        return F.B;
+      return walkers_floors::NoFloor;
+    }
+
+    // Its leg's height at (x, z) with the street's at either end where it has one (else the node's): false where
+    // neither end has one (the game's own height is left)
+    bool LegFloor(Slot& s, StepInput const& in, int i, Record const& r, float x, float z, float& y)
+    {
+      int g = WallSegment(s, in, i, r.From, r.To);
+      if (g < 0) return false;
+      float const* p = (float const*)(in.Nodes + (size_t)r.From * NodeSize);
+      float const* q = (float const*)(in.Nodes + (size_t)r.To * NodeSize);
+      float hp = NodeFloor(g, p), hq = NodeFloor(g, q);
+      if (!(hp > -1e29f) && !(hq > -1e29f)) return false;
+      if (!(hp > -1e29f)) hp = p[1];
+      if (!(hq > -1e29f)) hq = q[1];
+      float dx = q[0] - p[0], dz = q[2] - p[2], l2 = dx * dx + dz * dz;
+      float t = l2 > 1e-6f ? Clamp(((x - p[0]) * dx + (z - p[2]) * dz) / l2, 0.f, 1.f) : 1.f;
+      y = hp + (hq - hp) * t;
+      return true;
+    }
+
     int WallSegment(Slot& s, StepInput const& in, int i, unsigned a, unsigned b)
     {
       if (!Walls.Built || a >= (unsigned)in.NodeCount || b >= (unsigned)in.NodeCount || a == b) return -1;

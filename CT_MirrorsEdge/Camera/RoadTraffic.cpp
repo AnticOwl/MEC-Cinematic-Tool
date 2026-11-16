@@ -1,6 +1,7 @@
 #include "RoadTraffic.h"
 #include "RoadTrafficCore.h"
 #include "WalkersCore.h"
+#include "GroundLevel.h"
 #include "../Main.h"
 #include "../Util/Util.h"
 #include "../Util/Perf.h"
@@ -1129,6 +1130,7 @@ namespace
         w.FarCorners += s.Counts.FarCorners;
         w.WallPulled += s.Counts.WallPulled; w.WallRefused += s.Counts.WallRefused; w.WallTargets += s.Counts.WallTargets;
         w.WallFound += s.Counts.WallFound; w.WallMissing += s.Counts.WallMissing;
+        w.FloorTargets += s.Counts.FloorTargets; w.FloorSet += s.Counts.FloorSet;
       }
     if (g_IdleSlots)
       for (int k = 0; k < IdleSlotCount; ++k)
@@ -1149,7 +1151,8 @@ namespace
       "calls, %.2f ms in all (%.3f ms the longest); so far %lld walkers appeared (%lld of them respawns), %lld walker-steps held back, %lld "
       "sidesteps, %lld put back, %lld corner targets far off their way put back on it, walls: %lld walker-steps pulled "
       "out, %lld not (another walker in the way), %lld corner targets moved out (path segments found %lld, not found "
-      "%lld), %lld made to wait unseen, %lld "
+      "%lld), on the street's height: %lld corner targets set, %lld walkers as they appeared, %lld made to wait unseen, "
+      "%lld "
       "shown again, stuck: %lld walked through, %lld waited "
       "unseen; %lld walker steps with no slot free or on another thread, %lld unseen walkers shown again because the "
       "rules couldn't step them. Standing crowds: %d placements, %lld updates. The time of day %s%02d:%02d, the view %s: "
@@ -1158,7 +1161,7 @@ namespace
       "held back %lld times. More by day: %lld crowds' room and %lld placements raised so far (%lld members more)",
       walkPlacements, wcalls, wms, 1000.0 * (double)wmost / (double)g_Freq.QuadPart, gameWalkMs, gameWalkMost, updates,
       updateMs, updateMost, w.Appeared, w.Respawned, w.Held,
-      w.Sidesteps, w.Reverted, w.FarCorners, w.WallPulled, w.WallRefused, w.WallTargets, w.WallFound, w.WallMissing,
+      w.Sidesteps, w.Reverted, w.FarCorners, w.WallPulled, w.WallRefused, w.WallTargets, w.WallFound, w.WallMissing, w.FloorTargets, w.FloorSet,
       w.Waiting, w.Revealed, w.Ghosts, w.StuckUnseen, g_WalkBusySteps.load(),
       g_WalkReleased.load(), idlePlacements, g_IdleCalls.load(),
       clock >= 0.f ? "" : "unknown ", (seconds / 3600) % 24, (seconds / 60) % 60,
@@ -1198,6 +1201,115 @@ namespace
     else
       util::log::Write("Road traffic: a car placement (%d nodes, centroid %.1f, %.1f; %d cars) is route %d of the table: "
         "no route limit", in.NodeCount, s.RouteX, s.RouteZ, in.Count, s.RouteRow);
+  }
+
+  // ---- The ground check (diagnostics; 2026-11-15, Research section 16): every 10 s the cars and walkers shown near
+  // Faith against the road data under them (Resources\GroundRoads.bin, GroundLevel's: the drawn street, and with Solid
+  // street what she stands on there), and her own feet against it. One CT.log line. ----
+  std::atomic<long long> g_GroundCheckAt{ 0 };
+  const float GroundCarsNear = 80.f;      // m round Faith
+  const float GroundWalkersNear = 40.f;
+  const float GroundSameLevel = 1.5f;     // a road this far under / over is the one it's on (else no road data at its height)
+
+  struct GroundTally
+  {
+    int Shown = 0, OverRoad = 0, Over5 = 0;
+    double SumAbs = 0.0;
+    float Most = 0.f, MostX = 0.f, MostZ = 0.f;
+    void Add(float x, float y, float z)
+    {
+      ++Shown;
+      float h = 0.f;
+      if (!ground::RoadHeightUnder(x, z, y + GroundSameLevel, h) || y - h > GroundSameLevel)
+        return;
+      float d = y - h;
+      ++OverRoad;
+      SumAbs += std::fabs(d);
+      if (std::fabs(d) > 0.05f) ++Over5;
+      if (std::fabs(d) > std::fabs(Most)) { Most = d; MostX = x; MostZ = z; }
+    }
+    void Say(char* out, size_t size) const
+    {
+      if (!OverRoad)
+        snprintf(out, size, "-");
+      else
+        snprintf(out, size, "their height over the road %.3f m on average, %d more than 5 cm off, the most %+.2f m (at %.0f, %.0f)",
+          SumAbs / OverRoad, Over5, Most, MostX, MostZ);
+    }
+  };
+
+  void GroundCheck(double now)
+  {
+    float feet[3];
+    if (!ground::LastFeet(feet))
+      return;
+    GroundTally cars, walkers;
+    static Published carPub[MaxMembers];          // (one check at a time: g_GroundCheckAt)
+    for (int k = 0; k < SlotCount; ++k)
+    {
+      Slot const& o = g_Slots[k];
+      if (!o.Key || now - o.LastTime > 1.0)        // a placement not stepped (culled): left out
+        continue;
+      long seq = o.Seq;
+      if (seq & 1)
+        continue;
+      int n = o.PubCount < MaxMembers ? o.PubCount : MaxMembers, got = 0;
+      for (int j = 0; j < n; ++j)
+      {
+        Published p = o.Pub[j];
+        float dx = p.X - feet[0], dz = p.Z - feet[2];
+        if (dx * dx + dz * dz <= GroundCarsNear * GroundCarsNear)
+          carPub[got++] = p;
+      }
+      if (o.Seq != seq)                           // it changed while read
+        continue;
+      for (int j = 0; j < got; ++j)
+        cars.Add(carPub[j].X, carPub[j].Y, carPub[j].Z);
+    }
+    static wk::Published walkPub[wk::MaxMembers];
+    for (int k = 0; g_WalkSlots && k < WalkSlotCount; ++k)
+    {
+      wk::Slot const& o = g_WalkSlots[k];
+      if (!o.Key || now - o.LastTime > 1.0)
+        continue;
+      long seq = o.Seq;
+      if (seq & 1)
+        continue;
+      int n = o.PubCount < wk::MaxMembers ? o.PubCount : wk::MaxMembers, got = 0;
+      for (int j = 0; j < n; ++j)
+      {
+        wk::Published p = o.Pub[j];
+        float dx = p.X - feet[0], dz = p.Z - feet[2];
+        if (dx * dx + dz * dz <= GroundWalkersNear * GroundWalkersNear)
+          walkPub[got++] = p;
+      }
+      if (o.Seq != seq)
+        continue;
+      for (int j = 0; j < got; ++j)
+        walkers.Add(walkPub[j].X, walkPub[j].Y, walkPub[j].Z);
+    }
+    float under = 0.f;
+    char faith[128], carText[192], walkText[192];
+    if (ground::RoadHeightUnder(feet[0], feet[2], feet[1] + 0.5f, under) && feet[1] - under <= GroundSameLevel)
+      snprintf(faith, sizeof faith, "the road under her at %.2f, her feet %+.2f m from it", under, feet[1] - under);
+    else
+      snprintf(faith, sizeof faith, "no road data at her height");
+    cars.Say(carText, sizeof carText);
+    walkers.Say(walkText, sizeof walkText);
+    util::log::Write("Road traffic: the ground at Faith (%.1f, %.2f, %.1f; %s): %d cars shown within %.0f m, %d of them "
+      "over road data: %s; %d walkers shown within %.0f m, %d of them over road data: %s", feet[0], feet[1], feet[2], faith,
+      cars.Shown, GroundCarsNear, cars.OverRoad, carText, walkers.Shown, GroundWalkersNear, walkers.OverRoad, walkText);
+  }
+
+  void MaybeGroundCheck()
+  {
+    if (!util::DiagnosticsOn())
+      return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    long long last = g_GroundCheckAt.load(std::memory_order_relaxed);
+    if (now.QuadPart - last > 10 * g_Freq.QuadPart && g_GroundCheckAt.compare_exchange_strong(last, now.QuadPart))
+      GroundCheck((double)now.QuadPart / (double)g_Freq.QuadPart);
   }
 
   void __fastcall hCarStep(__int64 behaviour, __int64 params)
@@ -1290,6 +1402,7 @@ namespace
     long long most = g_MaxTicks.load(std::memory_order_relaxed);
     while (ticks > most && !g_MaxTicks.compare_exchange_weak(most, ticks)) {}
     MaybeLog();
+    MaybeGroundCheck();
   }
 }
 
@@ -1317,8 +1430,8 @@ void road_traffic::Init()
     g_Rules.Index.Build();
     g_On = util::hooks::CreateGameHook("RoadTrafficCarStep", Base() + CarStepRva, (PVOID)hCarStep, (LPVOID*)&oCarStep);
     if (g_On)
-      util::log::Write("Road traffic: the road cars keep to their lanes and their gaps (%d road segments' lanes)",
-        road_traffic_lanes::SegmentCount);
+      util::log::Write("Road traffic: the road cars keep to their lanes and their gaps, on the drawn road's height (%d "
+        "road segments' lanes, %d heights along them)", road_traffic_lanes::SegmentCount, road_traffic_heights::FineTotal);
     else
       util::log::Warning("Road traffic: its hook isn't in: the road cars are left as they are");
   }
@@ -1336,8 +1449,9 @@ void road_traffic::Init()
         (LPVOID*)&oWalkerStep);
     if (g_WalkOn)
       util::log::Write("Road traffic: the walking people keep a body apart, step aside for each other and show where "
-        "there's room, and are kept out of the walls beside their paths (%d path segments, %d samples)",
-        walkers_walls::SegmentCount, walkers_walls::SampleCount);
+        "there's room, are kept out of the walls beside their paths (%d path segments, %d samples) and walk on the "
+        "street's height (%d walking nodes off it)", walkers_walls::SegmentCount, walkers_walls::SampleCount,
+        walkers_floors::NodesCorrected);
     else
       util::log::Warning("Road traffic: the walkers' hook isn't in: the walking people are left as they are");
   }

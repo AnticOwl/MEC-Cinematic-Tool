@@ -83,6 +83,8 @@
       <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
+      <!-- ufbx's asserts off: the C assert() would put the build folder's path in the DLL -->
+      <PreprocessorDefinitions>UFBX_NO_ASSERT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(MinHookDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -97,6 +99,8 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <!-- ufbx's asserts off: the C assert() would put the build folder's path in the DLL -->
+      <PreprocessorDefinitions>UFBX_NO_ASSERT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(MinHookDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -112,6 +116,8 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
+      <!-- ufbx's asserts off: the C assert() would put the build folder's path in the DLL -->
+      <PreprocessorDefinitions>UFBX_NO_ASSERT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(MinHookDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -130,6 +136,8 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <!-- ufbx's asserts off: the C assert() would put the build folder's path in the DLL -->
+      <PreprocessorDefinitions>UFBX_NO_ASSERT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(MinHookDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -150,10 +158,30 @@
     <ClCompile Include="Camera\FaithSize.cpp" />
     <ClCompile Include="Camera\PoseEditor.cpp" />
     <ClCompile Include="Camera\PausedHair.cpp" />
+    <ClCompile Include="Camera\PoseClips.cpp" />
+    <ClCompile Include="Camera\PoseKeys.cpp" />
+    <ClCompile Include="Camera\PoseSkeletonLive.cpp" />
+    <ClCompile Include="Camera\Voice.cpp" />
+    <ClCompile Include="Camera\VoiceFace.cpp" />
+    <ClCompile Include="Camera\VoiceLife.cpp" />
+    <ClCompile Include="Camera\VoiceLifeFace.cpp" />
+    <ClCompile Include="Camera\VoiceAlive.cpp" />
+    <ClCompile Include="Camera\VoiceFeel.cpp" />
+    <ClCompile Include="Camera\VoiceFeelFace.cpp" />
+    <ClCompile Include="Camera\VoiceGaze.cpp" />
+    <ClCompile Include="Camera\VoiceEmotion.cpp" />
+    <ClCompile Include="Camera\VoiceDecode.cpp" />
+    <ClCompile Include="Camera\VoiceMouth.cpp" />
+    <ClCompile Include="Camera\VoicePlayer.cpp" />
+    <ClCompile Include="Camera\PoseClipsUnity.cpp" />
     <ClCompile Include="Camera\GroundLevel.cpp" />
     <ClCompile Include="Camera\DogenDoor.cpp" />
     <ClCompile Include="Camera\DogenGlow.cpp" />
     <ClCompile Include="Camera\RoadTraffic.cpp" />
+    <ClCompile Include="Camera\CullingOff.cpp" />
+    <ClCompile Include="Camera\Bodycam.cpp" />
+    <ClCompile Include="Camera\BodycamMotion.cpp" />
+    <ClCompile Include="Camera\Timelapse.cpp" />
     <ClCompile Include="Camera\ReplayModels.cpp" />
     <ClCompile Include="Camera\ReplayAudio.cpp" />
     <ClCompile Include="Camera\ReplayShapes.cpp" />
@@ -170,6 +198,7 @@
     <ClCompile Include="imgui\imgui_impl_dx11.cpp" />
     <ClCompile Include="inih\cpp\INIReader.cpp" />
     <ClCompile Include="inih\ini.c" />
+    <ClCompile Include="ufbx\ufbx.c" />
     <ClCompile Include="Input\InputSystem.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="UI.cpp" />
@@ -211,10 +240,32 @@
     <ClInclude Include="Camera\PoseEditor.h" />
     <ClInclude Include="Camera\PausedHair.h" />
     <ClInclude Include="Camera\PoseSkeletons.h" />
+    <ClInclude Include="Camera\PoseClips.h" />
+    <ClInclude Include="Camera\PoseKeys.h" />
+    <ClInclude Include="Camera\PoseSkeletonLive.h" />
+    <ClInclude Include="Camera\Voice.h" />
+    <ClInclude Include="Camera\VoiceFace.h" />
+    <ClInclude Include="Camera\VoiceLife.h" />
+    <ClInclude Include="Camera\VoiceLifeFace.h" />
+    <ClInclude Include="Camera\VoiceAlive.h" />
+    <ClInclude Include="Camera\VoiceFeel.h" />
+    <ClInclude Include="Camera\VoiceFeelFace.h" />
+    <ClInclude Include="Camera\VoiceFeelTables.h" />
+    <ClInclude Include="Camera\VoiceGaze.h" />
+    <ClInclude Include="Camera\VoiceEmotion.h" />
+    <ClInclude Include="Camera\VoiceDecode.h" />
+    <ClInclude Include="Camera\VoiceMouth.h" />
+    <ClInclude Include="Camera\VoicePlayer.h" />
+    <ClInclude Include="Camera\PoseClipsUnityData.h" />
+    <ClInclude Include="Camera\PoseRest.h" />
     <ClInclude Include="Camera\GroundLevel.h" />
     <ClInclude Include="Camera\DogenDoor.h" />
     <ClInclude Include="Camera\DogenGlow.h" />
     <ClInclude Include="Camera\RoadTraffic.h" />
+    <ClInclude Include="Camera\CullingOff.h" />
+    <ClInclude Include="Camera\Bodycam.h" />
+    <ClInclude Include="Camera\BodycamMotion.h" />
+    <ClInclude Include="Camera\Timelapse.h" />
     <ClInclude Include="Camera\RoadTrafficCore.h" />
     <ClInclude Include="Camera\RoadTrafficLanes.h" />
     <ClInclude Include="Camera\WalkersCore.h" />
@@ -242,6 +293,7 @@
     <ClInclude Include="imgui\stb_truetype.h" />
     <ClInclude Include="inih\cpp\INIReader.h" />
     <ClInclude Include="inih\ini.h" />
+    <ClInclude Include="ufbx\ufbx.h" />
     <ClInclude Include="Input\ActionDefs.h" />
     <ClInclude Include="Input\InputSystem.h" />
     <ClInclude Include="Main.h" />

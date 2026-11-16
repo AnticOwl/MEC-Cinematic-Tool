@@ -872,6 +872,13 @@ namespace
   // Thunder and lightning, under g_Mutex
   ULONGLONG g_NextStrike = 0;
   bool g_StrikeNow = false;
+  // Whether lightning could come at the last update (its storm), and whether
+  // the camera hook asked weather::ShardTopWanted since, with lightning able
+  // to come: the Shard's tip is only looked for then, so a burst waits for an
+  // update it was asked before (a storm begun, or Strike now pressed, after
+  // the camera hook asked: the next frame)
+  bool g_StormWas = false;
+  bool g_ShardTopAsked = false;
   // While the game is paused or its loading screen is up (gamestate, read
   // each update): since when (0: it isn't). Nothing of the weather goes on
   // meanwhile, as the game's own world doesn't (2026-10-26, the user: "find
@@ -3724,6 +3731,12 @@ void weather::Update(__int64 pRenderView)
       storm = g_RainOn && stormy > 0.05f;
       stormEvery /= (std::max)(0.25f, stormy);
     }
+    // The Shard's tip is only looked for while lightning can come (see
+    // g_ShardTopAsked): a burst due when the camera hook didn't ask for it
+    // before this update waits for the next one
+    bool tipAsked = g_ShardTopAsked;
+    g_ShardTopAsked = false;
+    g_StormWas = storm;
     // Paused or loading: none of it goes on; after, what was due waits as
     // long as the pause lasted (see g_HeldSince)
     if (held && !g_HeldSince)
@@ -3750,7 +3763,7 @@ void weather::Update(__int64 pRenderView)
     {
       if (!g_NextStrike)
         g_NextStrike = now + (ULONGLONG)(1000.f * stormEvery * (0.3f + 0.7f * Chance()));
-      if (g_StrikeNow || now >= g_NextStrike)
+      if ((g_StrikeNow || now >= g_NextStrike) && tipAsked)
       {
         g_StrikeNow = false;
         // The next burst after this one's last strike
@@ -3761,7 +3774,7 @@ void weather::Update(__int64 pRenderView)
     else
     {
       g_NextStrike = 0;
-      if (g_StrikeNow && haveCamera && !g_shutdown)
+      if (g_StrikeNow && haveCamera && !g_shutdown && tipAsked)
       {
         // Strike now, with thunder and lightning off (or no rain for it): a burst anyway
         g_StrikeNow = false;
@@ -4911,6 +4924,13 @@ void weather::SetShardTop(bool known, float const* top)
   g_ShardTopKnown = known && top;
   if (g_ShardTopKnown)
     memcpy(g_ShardTop, top, sizeof(g_ShardTop));
+}
+
+bool weather::ShardTopWanted()
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  g_ShardTopAsked = g_StormWas || g_StrikeNow;
+  return g_ShardTopAsked;
 }
 
 bool weather::GetShelter(std::vector<float>& cells, int& count, float& size, float& cornerX, float& cornerZ,

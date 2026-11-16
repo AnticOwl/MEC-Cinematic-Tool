@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <wrl/client.h>
@@ -21,6 +22,8 @@ namespace
   };
   std::mutex g_Mutex;
   Params g_Params{};                     // under g_Mutex
+  Params g_Bodycam{};                    // under g_Mutex: the bodycam's fisheye, when g_Params is off
+  std::chrono::steady_clock::time_point g_BodycamSetAt;   // under g_Mutex: when the camera hook last set it
   std::atomic<bool> g_Failed{ false };   // its shaders or states couldn't be made: never drawn
 
   // Render thread only
@@ -40,7 +43,9 @@ namespace
   Params Read()
   {
     std::lock_guard<std::mutex> lock(g_Mutex);
-    return g_Params;
+    // (the bodycam's only while the camera hook keeps setting it: nothing would turn it off if the hook stopped)
+    bool bodycam = g_Bodycam.On && std::chrono::steady_clock::now() - g_BodycamSetAt < std::chrono::milliseconds(250);
+    return (!g_Params.On && bodycam) ? g_Bodycam : g_Params;
   }
 
   bool Active(Params const& p)
@@ -168,6 +173,13 @@ void lensdistortion::Set(bool on, float gain, float cubicGain)
 {
   std::lock_guard<std::mutex> lock(g_Mutex);
   g_Params = { on, gain, cubicGain };
+}
+
+void lensdistortion::SetBodycam(bool on, float gain)
+{
+  std::lock_guard<std::mutex> lock(g_Mutex);
+  g_Bodycam = { on, gain, 0.f };
+  g_BodycamSetAt = std::chrono::steady_clock::now();
 }
 
 void lensdistortion::Apply(IDXGISwapChain* pSwapChain, ID3D11Device* pDevice, ID3D11DeviceContext* pContext)

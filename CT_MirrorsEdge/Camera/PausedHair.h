@@ -28,4 +28,33 @@ namespace paused_hair
 
   // For the menu: what it did last ("" when nothing yet)
   void Status(char* out, size_t size);
+
+  // Every frame on the game's thread: her hair reset when a clip jumps
+  // (2026-11-11: a looping root-motion clip moved her head up to 3 m in one
+  // frame, and her simulated hair trailed after it). jumpNow: the pose jumped
+  // this frame. The game's own cloth reset flag (+ 0x18A, what its reset
+  // method sets) is held on her cloths for 120 ms, so the game's next cloth
+  // step puts the hair at its skinned places, still, before it simulates on.
+  // gameScale: the game's time scale (the hold is as long in game time
+  // when it's under 1; frozen, 0: the tools' own step runs in real time).
+  void KeepReset(__int64 soldier, bool jumpNow, float gameScale);
+
+  // A read-only log of her hair cloths while she's posed, with [Debug]
+  // Diagnostics = true only (2026-11-11: on the 24 fps clips her hair "doesn't
+  // really follow"): per cloth, its detail, its off and reset flags, how often
+  // its root moves and how fast, the EA step's time; next to how far her posed
+  // head moved. Once a second while a clip is on, every 5 s otherwise, and when
+  // the clip changes; nothing while she isn't posed (or her pose isn't handed).
+  struct PoseState
+  {
+    bool Held = false;            // Faith is posed
+    bool ClipOn = false;          // a clip makes the pose
+    bool Playing = false;
+    char File[96] = "";
+    double Fps = 0.0;
+    double Time = 0.0;            // s into the clip
+    bool HeadOk = false;
+    float Head[3] = {};           // her head's place as posed (model frame)
+  };
+  void Watch(__int64 soldier, bool timeFrozen, PoseState const& pose);
 }

@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <string>
+
+class INIReader;
 
 // GAME > Pose: Faith, KrugerSec and other people posed bone by bone in the
 // game (Research_Pose_Editor_2026-11-08.md).
@@ -25,10 +28,17 @@
 // ghost's).
 namespace pose_editor
 {
+  // At the tools' start, on the init thread with their other hooks (Main::Init): the game's pose blend hooked
+  // ahead (it only passes on until a pose is taken), so the first Take doesn't make the hook mid-frame
+  void Init();
+
   // Every frame from the camera hook on the main view, on the game's thread,
   // after the replay's update: Faith's soldier (0: none), whether a replay
-  // records or plays, whether time is frozen (for the log)
-  void Update(__int64 soldier, bool replayBusy, bool timeFrozen);
+  // records or plays, whether time is frozen (for the log), the game's time
+  // scale now (0 frozen; Game speed and its own slow motion in it) and the
+  // camera track's time (seconds, -1 while no track plays): the animation
+  // clips' clocks
+  void Update(__int64 soldier, bool replayBusy, bool timeFrozen, float gameTimeScale, double trackTime);
 
   // From the camera hook for every render view, after the free camera is
   // written: the main view, for the bones' dots (only while the menu is open)
@@ -37,7 +47,24 @@ namespace pose_editor
   // GAME > Pose (inside the GAME tab, at Present)
   void DrawUI();
 
+  // The Pose window, at Present after the Hotkeys window (its own g_Mutex lock)
+  void DrawWindow();
+
+  // The Pose window's hotkeys (keyframes, Undo / Redo), from the input's thread right after it read the keys
+  // (InputSystem::HotkeyUpdate, with the game's window in front); only while the tools' menu and the Pose window
+  // are open (its own g_Mutex lock)
+  void HotkeyUpdate();
+
+  // Main's config, the [Pose] section
+  void ReadConfig(INIReader* pReader);
+  std::string GetConfig();
+
   // The held pose's bones and turning rings over the picture, with the menu
   // open (before the lights' dots: a click on a bone is the pose's)
   void DrawOverlay();
+
+  // Right after ImGui's NewFrame, before any overlay (2026-11-16): a press that
+  // came as the Pose window's file window closed (a double-click on a file in
+  // it) is taken off ImGui's input until the buttons are up
+  void QuietMouse();
 }

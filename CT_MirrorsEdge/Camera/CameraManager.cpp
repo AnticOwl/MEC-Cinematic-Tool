@@ -4562,10 +4562,152 @@ CameraManager::~CameraManager()
 
 }
 
+igcs::capture::Pose CameraManager::GetIgcsPose() const
+{
+  igcs::capture::Pose pose;
+  pose.position = { m_Camera.Position.x, m_Camera.Position.y, m_Camera.Position.z };
+  pose.rotation = { m_Camera.Rotation.x, m_Camera.Rotation.y, m_Camera.Rotation.z, m_Camera.Rotation.w };
+  pose.fovDegrees = m_Camera.FieldOfView;
+  return pose;
+}
+
+void CameraManager::ApplyIgcsPose(igcs::capture::Pose const& pose)
+{
+  igcs::capture::Basis basis;
+  if (!igcs::capture::BuildBasis(pose.rotation, basis))
+    return;
+
+  m_Camera.Position = XMFLOAT3(pose.position.x, pose.position.y, pose.position.z);
+  m_Camera.Rotation = XMFLOAT4(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w);
+  m_Camera.FieldOfView = pose.fovDegrees;
+  m_Camera.Transform = XMFLOAT4X4(
+    basis.right.x, basis.right.y, basis.right.z, 0.f,
+    basis.up.x, basis.up.y, basis.up.z, 0.f,
+    basis.forward.x, basis.forward.y, basis.forward.z, 0.f,
+    pose.position.x, pose.position.y, pose.position.z, 1.f);
+}
+
+void CameraManager::ClearCameraDeltas()
+{
+  m_Camera.dX = m_Camera.dY = m_Camera.dZ = 0.f;
+  m_Camera.dPitch = m_Camera.dYaw = m_Camera.dRoll = m_Camera.dFov = 0.f;
+  m_Camera.dMousePitch = m_Camera.dMouseYaw = 0.f;
+}
+
+void CameraManager::ResetIgcsTransientState()
+{
+  ClearCameraDeltas();
+  m_HasLastFrame = false;
+  m_AttachHasLast = false;
+  m_AttachValid = false;
+  m_AttachTrackActive = false;
+  m_AttachRequest = AttachRequest_None;
+  m_AttachPickRequest = AttachRequest_None;
+  m_AttachPicking = false;
+  m_AttachPickRemaining = 0;
+  m_AttachScan.reset();
+  m_AttachListRequested = false;
+  m_AttachPlaceRequested = false;
+  m_StreamHasLast = false;
+  m_StreamVelocity = XMFLOAT3(0, 0, 0);
+}
+
+int CameraManager::StartIgcsSession(std::uint8_t type)
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  if (type != 1) return 4;
+  if (m_IgcsSession.IsActive()) return 3;
+  if (!m_CameraEnabled) return 1;
+  if (m_TrackPlayer.IsPlaying()) return 2;
+  if (!m_IgcsViewReady || !GetPlayerSoldier()) return 5;
+
+  int result = m_IgcsSession.Start(type, m_CameraEnabled, false, GetIgcsPose());
+  if (result != 0) return result;
+
+  ApplyIgcsPose(m_IgcsSession.GetCurrent());
+  ResetIgcsTransientState();
+  m_IgcsRestoreFrame = false;
+  m_IgcsSessionActive = true;
+  try { util::log::Write("IGCS capture started; End or Cancel in ReShade releases the camera"); }
+  catch (...) {}
+  return 0;
+}
+
+void CameraManager::EndIgcsSession()
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  igcs::capture::Pose restored;
+  if (!m_IgcsSession.End(restored)) return;
+
+  ApplyIgcsPose(restored);
+  ResetIgcsTransientState();
+  m_IgcsRestoreFrame = true;
+  m_IgcsSessionActive = false;
+  try { util::log::Write("IGCS capture ended; camera restored"); }
+  catch (...) {}
+}
+
+void CameraManager::MoveIgcsCamera(float horizontal, float vertical, float fovDegrees, bool fromStartPosition)
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  if (m_IgcsSession.Move(horizontal, vertical, fovDegrees, fromStartPosition))
+    ApplyIgcsPose(m_IgcsSession.GetCurrent());
+}
+
+igcs::CameraData CameraManager::GetIgcsCameraData()
+{
+  std::lock_guard<std::mutex> lock(m_Mutex);
+  igcs::CameraData data{};
+  igcs::capture::Pose pose = GetIgcsPose();
+  igcs::capture::Basis basis;
+  if (!igcs::capture::IsValidPose(pose) || !igcs::capture::BuildBasis(pose.rotation, basis))
+    return data;
+
+  data.cameraEnabled = m_CameraEnabled && m_IgcsViewReady ? 1 : 0;
+  data.cameraMovementLocked = m_IgcsSession.IsActive() ? 1 : 0;
+  data.fov = pose.fovDegrees;
+  data.coordinates[0] = pose.position.x;
+  data.coordinates[1] = pose.position.y;
+  data.coordinates[2] = pose.position.z;
+  double length = std::sqrt((double)pose.rotation.x * pose.rotation.x + (double)pose.rotation.y * pose.rotation.y +
+    (double)pose.rotation.z * pose.rotation.z + (double)pose.rotation.w * pose.rotation.w);
+  data.lookQuaternion[0] = (float)(pose.rotation.x / length);
+  data.lookQuaternion[1] = (float)(pose.rotation.y / length);
+  data.lookQuaternion[2] = (float)(pose.rotation.z / length);
+  data.lookQuaternion[3] = (float)(pose.rotation.w / length);
+  data.rotationMatrixRightVector[0] = basis.right.x;
+  data.rotationMatrixRightVector[1] = basis.right.y;
+  data.rotationMatrixRightVector[2] = basis.right.z;
+  data.rotationMatrixUpVector[0] = basis.up.x;
+  data.rotationMatrixUpVector[1] = basis.up.y;
+  data.rotationMatrixUpVector[2] = basis.up.z;
+  data.rotationMatrixForwardVector[0] = basis.forward.x;
+  data.rotationMatrixForwardVector[1] = basis.forward.y;
+  data.rotationMatrixForwardVector[2] = basis.forward.z;
+
+  float sinPitch = -basis.forward.y;
+  if (sinPitch < -1.f) sinPitch = -1.f;
+  if (sinPitch > 1.f) sinPitch = 1.f;
+  data.pitch = asinf(sinPitch);
+  if (cosf(data.pitch) > 0.0001f)
+  {
+    data.yaw = atan2f(basis.forward.x, basis.forward.z);
+    data.roll = atan2f(basis.right.y, basis.up.y);
+  }
+  else
+  {
+    data.yaw = atan2f(-basis.right.z, basis.right.x);
+    data.roll = 0.f;
+  }
+  return data;
+}
+
 void CameraManager::HotkeyUpdate()
 {
   InputSystem* pInput = g_mainHandle->GetInputSystem();
   std::lock_guard<std::mutex> lock(m_Mutex);
+
+  if (m_IgcsSession.IsActive()) return;
 
   if (pInput->WentDown(Action::ToggleCamera))
     ToggleCamera();
@@ -4967,6 +5109,7 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   // updated the strength below.
   if (!m_CameraEnabled)
   {
+    m_IgcsViewReady = false;
     PublishListener(false, 0.0);
     panini::Set(false, 0.f, 0.f, 0.f, 0.f);
     g_mainHandle->GetVisualsManager()->SetAutoFocus(false, 0.f);
@@ -5027,37 +5170,50 @@ void CameraManager::OnCameraUpdate(__int64 pRenderView)
   if (m_ThirdPersonApplied)
     KeepViewModeBody();
 
-  FollowAttachTarget(dt, trackDt);
-  UpdateInput(dt, mouseState);
-  // CAMERA > Time-lapse, still: the camera held where it was when it started (no input, following, orbit or drift),
-  // put back before the move and again after it if anything moved it (TimelapseLink::HoldCamera)
-  if (g_LapseHold.On)
+  if (m_IgcsSession.IsActive())
   {
-    m_Camera.dX = m_Camera.dY = m_Camera.dZ = 0.f;
-    m_Camera.dPitch = m_Camera.dYaw = m_Camera.dRoll = m_Camera.dFov = 0.f;
-    m_Camera.dMousePitch = m_Camera.dMouseYaw = 0.f;
-    m_Velocity = XMFLOAT3(0.f, 0.f, 0.f);
-    m_TurnRates[0] = m_TurnRates[1] = m_TurnRates[2] = 0.f;
-    m_Camera.Position = g_LapseHold.Position;
-    m_Camera.Rotation = g_LapseHold.Rotation;
-    m_Camera.FieldOfView = g_LapseHold.FieldOfView;
+    ApplyIgcsPose(m_IgcsSession.GetCurrent());
   }
-  UpdateCamera(dt, trackDt);
-  // (and the view built from it again, every frame: a held camera has no shake, so every frame is the same view)
-  if (g_LapseHold.On)
+  else if (m_IgcsRestoreFrame)
   {
-    m_Camera.Position = g_LapseHold.Position;
-    m_Camera.Rotation = g_LapseHold.Rotation;
-    m_Camera.FieldOfView = g_LapseHold.FieldOfView;
-    XMMATRIX held = XMMatrixRotationQuaternion(XMLoadFloat4(&m_Camera.Rotation));
-    held.r[3] = XMVectorSetW(XMLoadFloat3(&m_Camera.Position), 1.f);
-    XMStoreFloat4x4(&m_Camera.Transform, held);
+    ApplyIgcsPose(m_IgcsSession.GetOrigin());
+    m_IgcsRestoreFrame = false;
   }
-  StepTrackWallCheck();
-  ProcessOrbitRequests();
-  // A playing track's game speed, from this frame's place on it
-  ApplyGameSpeed();
+  else
+  {
+    FollowAttachTarget(dt, trackDt);
+    UpdateInput(dt, mouseState);
+    // CAMERA > Time-lapse, still: the camera held where it was when it started (no input, following, orbit or drift),
+    // put back before the move and again after it if anything moved it (TimelapseLink::HoldCamera)
+    if (g_LapseHold.On)
+    {
+      m_Camera.dX = m_Camera.dY = m_Camera.dZ = 0.f;
+      m_Camera.dPitch = m_Camera.dYaw = m_Camera.dRoll = m_Camera.dFov = 0.f;
+      m_Camera.dMousePitch = m_Camera.dMouseYaw = 0.f;
+      m_Velocity = XMFLOAT3(0.f, 0.f, 0.f);
+      m_TurnRates[0] = m_TurnRates[1] = m_TurnRates[2] = 0.f;
+      m_Camera.Position = g_LapseHold.Position;
+      m_Camera.Rotation = g_LapseHold.Rotation;
+      m_Camera.FieldOfView = g_LapseHold.FieldOfView;
+    }
+    UpdateCamera(dt, trackDt);
+    // (and the view built from it again, every frame: a held camera has no shake, so every frame is the same view)
+    if (g_LapseHold.On)
+    {
+      m_Camera.Position = g_LapseHold.Position;
+      m_Camera.Rotation = g_LapseHold.Rotation;
+      m_Camera.FieldOfView = g_LapseHold.FieldOfView;
+      XMMATRIX held = XMMatrixRotationQuaternion(XMLoadFloat4(&m_Camera.Rotation));
+      held.r[3] = XMVectorSetW(XMLoadFloat3(&m_Camera.Position), 1.f);
+      XMStoreFloat4x4(&m_Camera.Transform, held);
+    }
+    StepTrackWallCheck();
+    ProcessOrbitRequests();
+    // A playing track's game speed, from this frame's place on it
+    ApplyGameSpeed();
+  }
   WriteToGameCamera(pRenderView);
+  m_IgcsViewReady = GetPlayerSoldier() != 0;
   // The free camera, written for the frame, for the green screen
   greenplane::SetView(pRenderView);
   perf::Lap(LapCamera);
@@ -5117,6 +5273,17 @@ void CameraManager::PublishStreamingFocus(double dt)
 
   XMVECTOR position = XMLoadFloat3((XMFLOAT3*)&m_Camera.Transform.m[3][0]);
   XMVECTOR forward = XMLoadFloat3((XMFLOAT3*)&m_Camera.Transform.m[2][0]);
+  float streamingFovY = m_ViewFovY;
+  if (m_IgcsSession.IsActive())
+  {
+    // Multishot aperture samples are not camera travel. Keep streaming centred
+    // on the capture origin for the duration of the render.
+    auto const& origin = m_IgcsSession.GetOrigin();
+    auto const& basis = m_IgcsSession.GetBasis();
+    position = XMVectorSet(origin.position.x, origin.position.y, origin.position.z, 1.f);
+    forward = XMVectorSet(basis.forward.x, basis.forward.y, basis.forward.z, 0.f);
+    streamingFovY = XMConvertToRadians(origin.fovDegrees);
+  }
   for (int i = 0; i < MaxStreamingFoci; ++i)
     XMStoreFloat3((XMFLOAT3*)results[i].Direction, forward);
 
@@ -5128,7 +5295,7 @@ void CameraManager::PublishStreamingFocus(double dt)
   // playback starting) reset the speed instead of throwing it far away.
   XMVECTOR last = XMLoadFloat3(&m_StreamLastPosition);
   float moved = XMVectorGetX(XMVector3Length(position - last));
-  if (!m_StreamHasLast || dt <= 0 || moved > 50.f)
+  if (m_IgcsSession.IsActive() || !m_StreamHasLast || dt <= 0 || moved > 50.f)
     m_StreamVelocity = XMFLOAT3(0, 0, 0);
   else
   {
@@ -5154,7 +5321,7 @@ void CameraManager::PublishStreamingFocus(double dt)
   // everything around counts as in view.
   XMFLOAT3 cameraPosition;
   XMStoreFloat3(&cameraPosition, position);
-  float lookX = -m_Camera.Transform.m[2][0], lookZ = -m_Camera.Transform.m[2][2];
+  float lookX = -XMVectorGetX(forward), lookZ = -XMVectorGetZ(forward);
   float lookLength = sqrtf(lookX * lookX + lookZ * lookZ);
   bool hasLook = lookLength > 0.1f;
   float minDot = -2.f;
@@ -5163,7 +5330,7 @@ void CameraManager::PublishStreamingFocus(double dt)
   {
     lookX /= lookLength;
     lookZ /= lookLength;
-    float halfWidth = atanf(tanf(m_ViewFovY * 0.5f) * m_ViewAspect) + ViewConeMargin;
+    float halfWidth = atanf(tanf(streamingFovY * 0.5f) * m_ViewAspect) + ViewConeMargin;
     if (halfWidth > 1.5707963f) halfWidth = 1.5707963f;
     minDot = cosf(halfWidth);
     keepMinDot = cosf(halfWidth + GridKeepAngle);
@@ -7850,6 +8017,11 @@ void CameraManager::DrawReplayUI()
 void CameraManager::DrawFollowUI()
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
+  if (m_IgcsSession.IsActive())
+  {
+    ImGui::TextWrapped("IGCS DoF is using the camera. End or cancel the session in ReShade to change follow settings.");
+    return;
+  }
   bool configChanged = false;
 
   InputSystem* pInput = g_mainHandle->GetInputSystem();
@@ -9001,6 +9173,12 @@ void CameraManager::DrawStatusBar()
 
   ImGui::TextColored(m_CameraEnabled ? on : off, m_CameraEnabled ? "Camera on" : "Camera off");
 
+  if (m_IgcsSession.IsActive())
+  {
+    separator();
+    ImGui::TextColored(active, "IGCS capture active - End / Cancel in ReShade");
+  }
+
   separator();
   if (m_TrackPlayer.IsPlaying())
     ImGui::TextColored(active, "%s %s  %.1f / %.1f s", m_TrackPlayer.IsPaused() ? "Paused" : "Playing",
@@ -9508,6 +9686,14 @@ void CameraManager::DrawGameUI()
 void CameraManager::DrawUI()
 {
   std::lock_guard<std::mutex> lock(m_Mutex);
+  ImGui::Text("IGCS Connector: %s", m_IgcsConnected ? "connected" : "not connected");
+  if (m_IgcsSession.IsActive())
+  {
+    ImGui::TextWrapped("IGCS DoF is using the camera. Camera controls and follow are held until you end or cancel the session in ReShade, including after rendering has finished.");
+    return;
+  }
+  if (m_IgcsConnected)
+    ImGui::TextWrapped("For IGCS DoF: enable the camera, stop any camera track, and freeze time before starting in ReShade. Use Stop the clock if the time of day still moves.");
   bool configChanged = false;
 
   InputSystem* pInput = g_mainHandle->GetInputSystem();
@@ -10825,15 +11011,7 @@ void CameraManager::UpdateCamera(double dt, double trackDt)
   rotMatrix.r[3] = XMVectorSetW(viewPosition, 1.0f);
   XMStoreFloat4x4(&m_Camera.Transform, rotMatrix);
 
-  m_Camera.dX = 0;
-  m_Camera.dY = 0;
-  m_Camera.dZ = 0;
-  m_Camera.dPitch = 0;
-  m_Camera.dYaw = 0;
-  m_Camera.dRoll = 0;
-  m_Camera.dFov = 0;
-  m_Camera.dMousePitch = 0;
-  m_Camera.dMouseYaw = 0;
+  ClearCameraDeltas();
 }
 
 void CameraManager::UpdateInput(double dt, XMFLOAT3 const& mouseState)
@@ -11240,6 +11418,8 @@ bool CameraManager::DrawCameraMovesUI()
 
 void CameraManager::ToggleCamera()
 {
+  if (m_IgcsSession.IsActive()) return;
+
   // A short debounce so one press (or a click and a press) can't toggle twice
   ULONGLONG now = GetTickCount64();
   if (now - m_LastToggleTime < 300)
@@ -11276,6 +11456,8 @@ void CameraManager::ToggleCamera()
     }
 
     m_FirstEnable = false;
+    m_IgcsViewReady = false;
+    m_IgcsRestoreFrame = false;
     m_HasLastFrame = false;
     m_AttachHasLast = false;
     m_AttachTrackActive = false;
@@ -11291,6 +11473,8 @@ void CameraManager::ToggleCamera()
     m_LastCameraPosition = m_Camera.Position;
     m_LastCameraRotation = m_Camera.Rotation;
     m_CameraEnabled = false;
+    m_IgcsViewReady = false;
+    m_IgcsRestoreFrame = false;
     // Picks and clicks that weren't done yet would happen when it's on again
     m_AttachRequest = AttachRequest_None;
     m_AttachPicking = false;
@@ -11349,6 +11533,8 @@ void CameraManager::DrawMoveToReplayedFaith(float width)
 
 void CameraManager::MoveToPlayer()
 {
+  if (m_IgcsSession.IsActive()) return;
+
   // The entity the original tools read (+0x40) holds zeros on this build,
   // the soldier transform is where Faith actually is (at her feet)
   XMFLOAT4X4A transform;

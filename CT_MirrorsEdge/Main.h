@@ -6,6 +6,7 @@
 #include "UI.h"
 
 #include "inih/cpp/INIReader.h"
+#include <atomic>
 #include <memory>
 #include <Windows.h>
 
@@ -59,7 +60,7 @@ public:
   void operator=(Main const&) = delete;
 };
 
-extern bool g_shutdown;
+extern std::atomic<bool> g_shutdown;
 
 extern bool g_hasFocus;
 

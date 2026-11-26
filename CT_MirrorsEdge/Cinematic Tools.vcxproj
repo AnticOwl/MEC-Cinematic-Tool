@@ -153,6 +153,7 @@
     <ClCompile Include="Camera\AttachTargets.cpp" />
     <ClCompile Include="Camera\CameraCollision.cpp" />
     <ClCompile Include="Camera\CameraManager.cpp" />
+    <ClCompile Include="Camera\IgcsBridge.cpp" />
     <ClCompile Include="Camera\FaithReplay.cpp" />
     <ClCompile Include="Camera\FaithOutfit.cpp" />
     <ClCompile Include="Camera\FaithSize.cpp" />
@@ -233,6 +234,9 @@
     <ClInclude Include="Camera\AttachTargets.h" />
     <ClInclude Include="Camera\CameraCollision.h" />
     <ClInclude Include="Camera\CameraManager.h" />
+    <ClInclude Include="Camera\IgcsBridge.h" />
+    <ClInclude Include="Camera\IgcsCameraData.h" />
+    <ClInclude Include="Camera\IgcsSession.h" />
     <ClInclude Include="Camera\CameraStructs.h" />
     <ClInclude Include="Camera\FaithReplay.h" />
     <ClInclude Include="Camera\FaithOutfit.h" />

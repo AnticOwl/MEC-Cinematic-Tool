@@ -11,6 +11,8 @@ A rebuild of Hattiwatti's Mirror's Edge Catalyst cinematic tools on his
 - **load the city around the camera**, so a far-away camera isn't surrounded by missing props
 - time freeze, HUD toggle, time of day, Fix LOD, draw and shadow distance, motion blur, visual
   effects (color, DoF, grain, light, tonemap, vignette, fog with a greenscreen) and lights
+- **native IGCS DoF integration** for the standard IGCS Connector; this implementation still
+  needs in-game validation
 - a **pose editor** for Faith and other characters: bone by bone, keyframes, animation clips and
   voices with lip sync
 
@@ -31,6 +33,15 @@ voice* needs it.
 
 Settings are saved in `Cinematic Tools\config.ini`, the log in `Cinematic Tools\CT.log` (the
 previous one is kept as `CT.previous.log`, with `[CRASH]` lines at the end if the game crashed).
+
+## IGCS DoF
+
+The native camera interface lets [IGCS Connector](https://github.com/FransBouma/IgcsConnector)
+move this camera during a DoF capture, then restore the starting pose and FOV when the session
+ends or is cancelled. Install the standard addon and its DoF shader/texture separately, using
+the [installation and test guide](docs/IGCS_DOF.md). Only multishot sessions are implemented;
+panorama is not supported. Disable IGCS Relay or another IGCS camera provider while using this
+native provider. In-game capture behavior still needs validation.
 
 ## Building
 

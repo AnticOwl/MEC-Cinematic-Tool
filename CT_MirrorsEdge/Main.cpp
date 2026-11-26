@@ -19,6 +19,7 @@
 #include "Camera/ReplayGameDraws.h"
 #include "Camera/ReplayStore.h"
 #include "Camera/PoseEditor.h"
+#include "Camera/IgcsBridge.h"
 #include "Util/Perf.h"
 #include "Util/GameState.h"
 #include <algorithm>
@@ -41,7 +42,7 @@ HINSTANCE g_dllHandle = NULL;
 HINSTANCE g_gameHandle = NULL;
 HWND g_gameHwnd = NULL;
 WNDPROC g_origWndProc = 0;
-bool g_shutdown = false;
+std::atomic<bool> g_shutdown{ false };
 bool g_hasFocus = true;
 
 ID3D11DeviceContext* g_d3d11Context = nullptr;
@@ -932,6 +933,7 @@ Main::Main() :
 
 Main::~Main()
 {
+  igcs::Shutdown();
 }
 
 bool Main::Initialize()
@@ -1009,6 +1011,7 @@ bool Main::Initialize()
   // frame took 45 - 53 ms, CT.log 2026-11-13; that making the hook, which freezes every thread, is why is inferred).
   // Last, so everything before the first level is made as early as before
   pose_editor::Init();
+  igcs::Initialize(m_pCameraManager.get());
   return true;
 }
 
@@ -1020,6 +1023,7 @@ void Main::Run()
   double dtPresentCheck = 1.0;
   while (!g_shutdown)
   {
+    igcs::PollConnection();
     auto now = std::chrono::steady_clock::now();
     std::chrono::duration<double> dt = now - lastUpdate;
     lastUpdate = now;
@@ -1069,6 +1073,7 @@ void Main::Run()
   // a game that doesn't close shows how far the tools got (the hang watch
   // writes where its threads are if it's still running ExitSeconds later)
   auto exitStart = std::chrono::steady_clock::now();
+  igcs::Shutdown();
   util::log::Write("Exit: the tools stop (their config saved, their hooks off; nothing else is freed or put back while "
     "the game closes)");
   SaveConfig();
@@ -1138,6 +1143,7 @@ void Main::OnPresent(IDXGISwapChain* pSwapChain)
     // A picture of the finished frame when one is asked for (VISUALS > Depth
     // of field's test pictures), before the menu goes over it
     frameshot::OnPresent(pSwapChain, g_d3d11Device, g_d3d11Context);
+    igcs::PublishCameraData();
     {
       perf::Scope timing(perf::SectionMenu);
       perf::GpuBegin(g_d3d11Context, 1);
@@ -1249,6 +1255,10 @@ void Main::SaveConfig()
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK Main::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+  if (g_shutdown)
+    return g_origWndProc ? CallWindowProc(g_origWndProc, hwnd, uMsg, wParam, lParam)
+      : DefWindowProc(hwnd, uMsg, wParam, lParam);
+
   if (g_mainHandle && g_mainHandle->m_pUI)
     UpdateCursorVisibility();
 
